@@ -182,9 +182,9 @@ jobs:
           },
           "nix": {
             "dst": "tuwunel.drv.tar.zst",
-            "src": "/opt/tuwunel/tuwunel.drv"
+            "src": "/opt/tuwunel/tuwunel.drv",
             "mime": "application/zstd",
-            "zstd": 6,
+            "zstd": 6
           }
         }
 
