@@ -260,6 +260,7 @@ jobs:
           {"cargo_profile": "release", "rust_toolchain": "nightly"},
           {"rust_target": "aarch64-unknown-linux-gnu", "feat_set": "default"},
           {"rust_target": "aarch64-unknown-linux-gnu", "feat_set": "logging"},
+          {"rust_target": "aarch64-unknown-linux-gnu", "bake_target": "nix"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v1-linux-gnu"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v2-linux-gnu"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v3-linux-gnu"},
@@ -270,12 +271,15 @@ jobs:
           {"sys_target": "x86_64-v2-linux-gnu", "machine": "ARM64"},
           {"sys_target": "x86_64-v2-linux-gnu", "feat_set": "default"},
           {"sys_target": "x86_64-v2-linux-gnu", "feat_set": "logging"},
+          {"sys_target": "x86_64-v2-linux-gnu", "bake_target": "nix"},
           {"sys_target": "x86_64-v3-linux-gnu", "machine": "ARM64"},
           {"sys_target": "x86_64-v3-linux-gnu", "feat_set": "default"},
           {"sys_target": "x86_64-v3-linux-gnu", "feat_set": "logging"},
+          {"sys_target": "x86_64-v3-linux-gnu", "bake_target": "nix"},
           {"sys_target": "x86_64-v4-linux-gnu", "machine": "ARM64"},
           {"sys_target": "x86_64-v4-linux-gnu", "feat_set": "default"},
           {"sys_target": "x86_64-v4-linux-gnu", "feat_set": "logging"},
+          {"sys_target": "x86_64-v4-linux-gnu", "bake_target": "nix"},
         ]
 
   publish:
