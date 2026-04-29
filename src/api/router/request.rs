@@ -12,9 +12,14 @@ use tuwunel_service::Services;
 pub(super) struct QueryParams {
 	pub(super) access_token: Option<String>,
 	pub(super) user_id: Option<UserId>,
+
+	// MSC4326: device masquerading for appservices (originally MSC3202).
+	#[serde(alias = "org.matrix.msc3202.device_id")]
+	pub(super) device_id: Option<DeviceId>,
 }
 
 pub(super) type UserId = SmallString<[u8; 48]>;
+pub(super) type DeviceId = SmallString<[u8; 24]>;
 
 #[derive(Debug)]
 pub(super) struct Request {
