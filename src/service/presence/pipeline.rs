@@ -18,7 +18,10 @@ use tuwunel_core::{
 	utils::{future::OptionFutureExt, option::OptionExt},
 };
 
-use super::{Service, TimerFired, aggregate};
+use super::{
+	Service, TimerFired,
+	aggregate::{self, StatusMsg},
+};
 
 impl Service {
 	fn device_key(device_id: Option<&DeviceId>, is_remote: bool) -> aggregate::DeviceKey {
@@ -94,10 +97,11 @@ impl Service {
 		state: &PresenceState,
 		currently_active: Option<bool>,
 		last_active_ago: Option<UInt>,
-		status_msg: Option<String>,
+		status_msg: StatusMsg,
 		refresh_window_ms: Option<u64>,
 	) -> Result {
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
+		let preserve_status = matches!(status_msg, StatusMsg::Unchanged);
 		// 1) Capture per-device presence snapshot for aggregation.
 		debug!(
 			?user_id,
@@ -189,11 +193,17 @@ impl Service {
 				);
 		}
 
-		// 6) Persist the aggregated presence, preserving last non-empty status.
-		let fallback_status = last_event
-			.and_then(|event| event.content.status_msg)
-			.filter(|msg| !msg.is_empty());
-		let status_msg = aggregated.status_msg.or(fallback_status);
+		// 6) Unchanged preserves the last non-empty status; explicit None clears it.
+		let fallback_status = || {
+			last_event
+				.and_then(|event| event.content.status_msg)
+				.filter(|msg| !msg.is_empty())
+		};
+
+		let status_msg = aggregated
+			.status_msg
+			.or_else(|| preserve_status.then(fallback_status).flatten());
+
 		let last_active_ago =
 			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
 
@@ -235,7 +245,7 @@ impl Service {
 			new_state,
 			Some(currently_active),
 			UInt::new(0),
-			None,
+			StatusMsg::Unchanged,
 			Some(REFRESH_TIMEOUT),
 		);
 
@@ -261,7 +271,7 @@ impl Service {
 			state,
 			Some(currently_active),
 			None,
-			status_msg,
+			StatusMsg::Set(status_msg),
 			None,
 		)
 		.await
@@ -282,7 +292,7 @@ impl Service {
 			state,
 			Some(currently_active),
 			Some(last_active_ago),
-			status_msg,
+			StatusMsg::Set(status_msg),
 			None,
 		)
 		.await
