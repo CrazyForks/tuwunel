@@ -397,15 +397,20 @@ pub async fn mark_device_key_update(&self, user_id: &UserId) {
 	};
 
 	let count = self.services.globals.next_count();
-	let key = (user_id, *count);
+	let user_key = (user_id, *count);
 
-	self.db.keychangeid_userid.put_raw(key, user_id);
+	self.db
+		.keychangeid_userid
+		.put_raw(user_key, user_id);
 	self.services
 		.state_cache
 		.rooms_joined(user_id)
 		.filter(|room_id| all_or_is_encrypted(*room_id))
-		.ready_for_each(|_| {
-			self.db.keychangeid_userid.put_raw(key, user_id);
+		.ready_for_each(|room_id| {
+			let room_key = (room_id, *count);
+			self.db
+				.keychangeid_userid
+				.put_raw(room_key, user_id);
 		})
 		.await;
 }
