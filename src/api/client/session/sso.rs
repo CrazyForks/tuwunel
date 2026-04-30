@@ -141,9 +141,13 @@ async fn handle_sso_login(
 	redirect_url: String,
 	login_token: Option<String>,
 ) -> Result<sso_login_with_provider::v3::Response> {
-	let Ok(redirect_url) = redirect_url.parse::<Url>() else {
-		return Err!(Request(InvalidParam("Invalid redirect_url")));
-	};
+	let redirect_url: Url = redirect_url.parse().map_err(|e| {
+		err!(Request(InvalidParam(debug_warn!(
+			?e,
+			?redirect_url,
+			"Failed to parse redirect_url.",
+		))))
+	})?;
 
 	let provider = services.oauth.providers.get(&idp_id).await?;
 	let sess_id = utils::random_string(SESSION_ID_LENGTH);
