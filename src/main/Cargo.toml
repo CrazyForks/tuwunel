@@ -172,6 +172,7 @@ sentry_telemetry = [
 	"dep:sentry",
 	"dep:sentry-tracing",
 	"dep:sentry-tower",
+	"dep:reqwest",
 	"tuwunel-core/sentry_telemetry",
 	"tuwunel-router/sentry_telemetry",
 ]
@@ -219,6 +220,8 @@ opentelemetry.optional = true
 opentelemetry.workspace = true
 opentelemetry_sdk.optional = true
 opentelemetry_sdk.workspace = true
+reqwest.optional = true
+reqwest.workspace = true
 sentry-tower.optional = true
 sentry-tower.workspace = true
 sentry-tracing.optional = true

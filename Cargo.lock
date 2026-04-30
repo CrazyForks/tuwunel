@@ -5542,6 +5542,7 @@ dependencies = [
  "maplit",
  "opentelemetry",
  "opentelemetry_sdk",
+ "reqwest 0.13.1",
  "sentry",
  "sentry-tower",
  "sentry-tracing",

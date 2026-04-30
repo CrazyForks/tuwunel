@@ -5,8 +5,10 @@ use std::{
 	sync::{Arc, OnceLock},
 };
 
+use reqwest::{Certificate, Client, ClientBuilder, Proxy};
 use sentry::{
-	Breadcrumb, ClientOptions, Level,
+	Breadcrumb, ClientOptions, Level, Transport,
+	transports::ReqwestHttpTransport,
 	types::{
 		Dsn,
 		protocol::v7::{Context, Event},
@@ -51,8 +53,43 @@ fn options(config: &Config) -> ClientOptions {
 		attach_stacktrace: config.sentry_attach_stacktrace,
 		before_send: Some(Arc::new(before_send)),
 		before_breadcrumb: Some(Arc::new(before_breadcrumb)),
+		transport: Some(Arc::new(build_transport)),
 		..Default::default()
 	}
+}
+
+// Sentry's default reqwest transport builds a Client with no extra roots,
+// which fails on minimal images where `rustls-platform-verifier` finds an
+// empty system store. Mirror `service::client::base()` and merge webpki
+// roots so the verifier has at least one source of trust.
+fn build_transport(options: &ClientOptions) -> Arc<dyn Transport> {
+	let webpki = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+		.iter()
+		.map(|der| Certificate::from_der(der).expect("certificate must be valid der encoding"));
+
+	let proxies = [
+		options
+			.http_proxy
+			.as_ref()
+			.and_then(|url| Proxy::http(url.as_ref()).ok()),
+		options
+			.https_proxy
+			.as_ref()
+			.and_then(|url| Proxy::https(url.as_ref()).ok()),
+	];
+
+	let builder = Client::builder()
+		.tls_certs_merge(webpki)
+		.danger_accept_invalid_certs(options.accept_invalid_certs);
+
+	let client = proxies
+		.into_iter()
+		.flatten()
+		.fold(builder, ClientBuilder::proxy)
+		.build()
+		.expect("reqwest client must build for sentry transport");
+
+	Arc::new(ReqwestHttpTransport::with_client(options, client))
 }
 
 fn before_send(event: Event<'static>) -> Option<Event<'static>> {
