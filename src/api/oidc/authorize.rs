@@ -45,10 +45,11 @@ pub(crate) async fn authorize_route(
 		return Err!(Request(InvalidParam("Only response_type=code is supported")));
 	}
 
-	// Only the "query" response mode is implemented. Reject anything else
-	// so discovery (response_modes_supported: ["query"]) matches behavior.
-	if params.response_mode.as_deref().unwrap_or("query") != "query" {
-		return Err!(Request(InvalidParam("Only response_mode=query is supported")));
+	let response_mode = params.response_mode.as_deref().unwrap_or("query");
+	if !matches!(response_mode, "query" | "fragment") {
+		return Err!(Request(InvalidParam(
+			"Only response_mode=query or response_mode=fragment is supported"
+		)));
 	}
 
 	validate_redirect_uri(&services, &params).await?;
@@ -72,6 +73,7 @@ pub(crate) async fn authorize_route(
 		// Record which IdP authenticated the user so it can be tagged on the
 		// device at token exchange time and used for UIAA SSO provider binding.
 		idp_id: Some(idp_id.clone()),
+		response_mode: params.response_mode,
 		created_at: now,
 		expires_at: now
 			.checked_add(AUTH_REQUEST_LIFETIME)

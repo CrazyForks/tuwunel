@@ -1,10 +1,12 @@
+use std::iter::once;
+
 use axum::{
 	extract::State,
 	response::{IntoResponse, Redirect},
 };
 use serde::Deserialize;
 use tuwunel_core::{Result, err};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompleteParams {
@@ -38,10 +40,22 @@ pub(crate) async fn complete_route(
 	let redirect_url = Url::parse(&auth_req.redirect_uri)
 		.map_err(|_| err!(Request(InvalidParam("Invalid redirect_uri"))))
 		.map(|mut url| {
-			url.query_pairs_mut().append_pair("code", &code);
-			if let Some(state) = &auth_req.state {
-				url.query_pairs_mut().append_pair("state", state);
+			let pairs = once(("code", code.as_str()))
+				.chain(auth_req.state.as_deref().map(|s| ("state", s)));
+
+			match auth_req.response_mode.as_deref() {
+				| Some("fragment") => {
+					let body = form_urlencoded::Serializer::new(String::new())
+						.extend_pairs(pairs)
+						.finish();
+
+					url.set_fragment(Some(&body));
+				},
+				| _ => {
+					url.query_pairs_mut().extend_pairs(pairs);
+				},
 			}
+
 			url
 		})?;
 

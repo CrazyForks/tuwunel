@@ -27,6 +27,8 @@ pub struct AuthRequest {
 	/// at token exchange time and used for UIAA SSO provider binding.
 	pub idp_id: Option<String>,
 
+	pub response_mode: Option<String>,
+
 	pub created_at: SystemTime,
 
 	pub expires_at: SystemTime,
