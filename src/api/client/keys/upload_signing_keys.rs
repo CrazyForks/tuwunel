@@ -15,7 +15,7 @@ use tuwunel_core::{
 	utils,
 	utils::{BoolExt, OptionExt},
 };
-use tuwunel_service::{Services, users::parse_master_key};
+use tuwunel_service::{Services, uiaa::SESSION_ID_LENGTH, users::parse_master_key};
 
 use crate::{Ruma, router::auth_uiaa};
 
@@ -110,7 +110,7 @@ fn create_oauth_uiaa(
 	sender_user: &UserId,
 	body: &Ruma<upload_signing_keys::v3::Request>,
 ) -> Result<UiaaInfo> {
-	let session = utils::random_string(tuwunel_service::uiaa::SESSION_ID_LENGTH);
+	let session = utils::random_string(SESSION_ID_LENGTH);
 	let base = services
 		.config
 		.well_known
