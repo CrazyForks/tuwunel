@@ -350,6 +350,7 @@ fn update_cache_typing(request: &Typing, cached: &mut Typing) {
 #[implement(Connection)]
 fn update_cache_to_device(request: &ToDevice, cached: &mut ToDevice) {
 	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
+	cached.since.clone_from(&request.since);
 }
 
 #[implement(Connection)]
