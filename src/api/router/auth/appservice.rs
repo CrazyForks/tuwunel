@@ -30,11 +30,7 @@ pub(super) async fn auth_appservice(
 	}
 
 	// MSC4326: appservices may assert a device_id alongside user_id.
-	let sender_device = request
-		.query
-		.device_id
-		.as_deref()
-		.map(OwnedDeviceId::from);
+	let sender_device = request.query.device_id().map(OwnedDeviceId::from);
 
 	if let Some(device_id) = sender_device.as_deref()
 		&& !services

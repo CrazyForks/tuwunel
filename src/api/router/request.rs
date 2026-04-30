@@ -11,11 +11,21 @@ use tuwunel_service::Services;
 #[derive(Debug, Deserialize)]
 pub(super) struct QueryParams {
 	pub(super) access_token: Option<String>,
+
 	pub(super) user_id: Option<UserId>,
 
-	// MSC4326: device masquerading for appservices (originally MSC3202).
-	#[serde(alias = "org.matrix.msc3202.device_id")]
 	pub(super) device_id: Option<DeviceId>,
+
+	#[serde(rename = "org.matrix.msc3202.device_id")]
+	pub(super) msc3202_device_id: Option<DeviceId>,
+}
+
+impl QueryParams {
+	pub(super) fn device_id(&self) -> Option<&str> {
+		self.device_id
+			.as_deref()
+			.or(self.msc3202_device_id.as_deref())
+	}
 }
 
 pub(super) type UserId = SmallString<[u8; 48]>;
