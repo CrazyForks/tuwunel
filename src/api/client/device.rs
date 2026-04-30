@@ -98,7 +98,7 @@ pub(crate) async fn update_device_route(
 				.create_device(
 					sender_user,
 					Some(&body.device_id),
-					(Some(&appservice.registration.as_token), None),
+					(None, None),
 					None,
 					body.display_name.as_deref(),
 					Some(client),
