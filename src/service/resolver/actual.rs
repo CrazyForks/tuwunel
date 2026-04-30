@@ -123,7 +123,12 @@ impl super::Service {
 	async fn actual_dest_2(&self, dest: &ServerName, cache: bool, pos: usize) -> Result<FedDest> {
 		debug!("2: Hostname with included port");
 		let (host, port) = dest.as_str().split_at(pos);
-		self.conditional_query_and_cache(host, port.parse::<u16>().unwrap_or(8448), cache)
+		let port_num = port
+			.trim_start_matches(':')
+			.parse::<u16>()
+			.unwrap_or(8448);
+
+		self.conditional_query_and_cache(host, port_num, cache)
 			.await?;
 
 		Ok(FedDest::Named(
@@ -166,7 +171,12 @@ impl super::Service {
 	async fn actual_dest_3_2(&self, cache: bool, delegated: &str, pos: usize) -> Result<FedDest> {
 		debug!("3.2: Hostname with port in .well-known file");
 		let (host, port) = delegated.split_at(pos);
-		self.conditional_query_and_cache(host, port.parse::<u16>().unwrap_or(8448), cache)
+		let port_num = port
+			.trim_start_matches(':')
+			.parse::<u16>()
+			.unwrap_or(8448);
+
+		self.conditional_query_and_cache(host, port_num, cache)
 			.await?;
 
 		Ok(FedDest::Named(
