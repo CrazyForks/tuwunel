@@ -17,7 +17,7 @@ ARG mrsdk_ref="tuwunel-changes"
 ARG mrsdk_test_args=""
 ARG mrsdk_test_opts=""
 ARG mrsdk_skip_list=""
-ARG mrsdk_parallel=2
+ARG mrsdk_parallel=1
 ARG mrsdk_startup_delay="10s"
 ARG mrsdk_testee="/usr/bin/tuwunel"
 
