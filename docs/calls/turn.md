@@ -4,6 +4,17 @@ In order to make or receive legacy calls in Matrix, a TURN server is required.
 Tuwunel suggests using [Coturn](https://github.com/coturn/coturn) for this
 purpose, which is also available as a Docker image.
 
+> [!NOTE]
+> If you are setting up MatrixRTC and only need a TURN server to improve
+> Livekit call reliability (not legacy calling), Livekit ships its own
+> built-in TURN server. See
+> [Using the Livekit Built-In TURN Server](matrix_rtc.md#using-the-livekit-built-in-turn-server)
+> in the MatrixRTC documentation. The instructions on this page are for a
+> standalone Coturn deployment used by legacy Matrix calls; if you run both,
+> review
+> [External TURN Integration](matrix_rtc.md#external-turn-integration) for
+> the port allocation considerations.
+
 ### Configuration
 
 Create a configuration file called `coturn.conf` containing:

@@ -1,5 +1,13 @@
 # MatrixRTC/Element Call Setup
 
+MatrixRTC is the modern Matrix calling framework used by Element Call and
+other recent clients. The media itself is carried by a Selective Forwarding
+Unit (SFU); Tuwunel does not embed an SFU, so an external one is required.
+[Livekit](https://github.com/livekit/livekit) is the SFU implementation
+supported here, paired with the
+[lk-jwt-service](https://github.com/element-hq/lk-jwt-service) which issues
+the access tokens clients use to join Livekit rooms.
+
 This guide shows you how to deploy MatrixRTC/Element Call using Docker and
 Docker Compose, as Livekit only provides prebuilt Docker images. It is
 possible to run Livekit using their installation script, however this method
