@@ -53,28 +53,41 @@ curl https://your.server.name:8448/_tuwunel/server_version
 ```
 ## Caddy and .well-known
 
-Caddy can serve `.well-known/matrix/client` and `.well-known/matrix/server` instead
-of `tuwunel`. This can be done by using the `respond` directive in your caddyfile. 
+Caddy can serve `.well-known/matrix/client` and `.well-known/matrix/server`
+instead of `tuwunel`. This is useful when delegating a root domain such as
+`example.com` to a subdomain like `matrix.example.com`, where Caddy on the root
+domain has no Tuwunel upstream of its own.
 
-Useful if you want to delegate a domain such as `example.com` -> `matrix.example.com`. 
+In this configuration Caddy bypasses Tuwunel's CORS layer, so the
+[CORS headers recommended by the Matrix specification](https://spec.matrix.org/v1.17/client-server-api/#well-known-uris)
+must be added explicitly.
 
-> [!info]
-> Note the use of \` (backtick) in the respond directive to escape JSON that
-> contains \" (double quotes).
+> [!NOTE]
+> Caddyfile uses backticks as an alternative string quote so the inline JSON
+> body (which contains double quotes) does not need escaping. Field names and
+> values inside a `header` block are space-separated; do not place a colon
+> after the field name.
 
 ```caddyfile
-your.server.name, your.server.name:8848 {
-
+example.com {
 	@matrix path /.well-known/matrix/*
-        #Recommended CORS headers (https://spec.matrix.org/v1.17/client-server-api/#well-known-uris) 
 	header @matrix {
-                        Access-Control-Allow-Origin: *
-                        Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
-                        Access-Control-Allow-Headers: X-Requested-With, Content-Type, Authorization
-        }
-        respond /.well-known/matrix/client `{"m.homeserver": {"base_url":"https://<your.server.name>"}, "org.matrix.msc4143.rtc_foci": [{"type": "livekit", "livekit_service_url": "https://<your.matrix-rtc-jwt.server>"}]} `
-        respond /.well-known/matrix/server `{"m.server": "<your.server.name>:443"}`
+		Access-Control-Allow-Origin "*"
+		Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+		Access-Control-Allow-Headers "X-Requested-With, Content-Type, Authorization"
+		Content-Type "application/json"
+	}
+	respond /.well-known/matrix/client `{"m.homeserver":{"base_url":"https://matrix.example.com"}}`
+	respond /.well-known/matrix/server `{"m.server":"matrix.example.com:443"}`
 }
+```
+
+To advertise a MatrixRTC focus (MSC4143) for Element Call, extend the client
+response with an `org.matrix.msc4143.rtc_foci` array pointing at your LiveKit
+JWT service:
+
+```caddyfile
+respond /.well-known/matrix/client `{"m.homeserver":{"base_url":"https://matrix.example.com"},"org.matrix.msc4143.rtc_foci":[{"type":"livekit","livekit_service_url":"https://rtc.example.com"}]}`
 ```
 
 
