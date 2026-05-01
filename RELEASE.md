@@ -1,71 +1,105 @@
-# Tuwunel 1.6.0
+# Tuwunel 1.6.1
 
-April 9, 2026
+May 1, 2026
 
 ### New Features & Enhancements
 
-- **Next-Gen Auth OIDC** server enhancing ElementX and SchildiNext has arrived! It all began only a month ago with (#342), a large draft PR by @lytedev assessed by the Tuwunel team to be several months away. What happened next was truly extraordinary. Starting with @chbgdn and followed by @siennathesane, @DonPrus and @shaba an entire project within this project assembled to test and iterate this branch at a rapid clip. The OIDC server now builds on existing infrastructure in Tuwunel previously used for SSO. If you have an Identity Provider configured already for use with SSO then the OIDC server Just Works. Huge thanks to everyone involved. (Implements MSC2964/2965/2966/2967)
+- **Next-gen OIDC account management**, courtesy of @shaba in (#407), implements MSC2965 and provides the in-browser session list, session-end flows, and profile page for users authenticated via OIDC. The same PR fixes URL-encoding of `idp_id` in the SSO redirect path and adds the SSO/OIDC bypass path through User-Interactive Authentication so that users without a password can complete UIAA-protected actions. This closes (#433) opened by @jonathanmajh. Thank you!
 
-- **S3 Storage support** is now available! Starting from (#362) graciously developed by @exodrifter, Tuwunel now introduces multiple media backends with configurable sections. Support currently includes S3 endpoints and local filesystem directories. The existing media directory is now itself a configurable storage provider implied by the section `[global.storage_provider.media.local]`. See the examples under `[global.storage_provider.<ID>.S3]` to configure your own S3 provider. Then list it in `media_storage_providers` to download media from it, and `store_media_on_providers` for uploading media to it. Experimental migration support is available with the `!admin query storage sync` command. SPECIAL UPDATE: Thanks to testing by @utop-top large uploads (~200 MiB) may not work for some S3 providers until additional support is added in 1.6.1. We apologize for this limitation.
+- **Appservices with `receive_ephemeral` now receive EDUs scoped to their namespaces** in (#406), shipped by @chbgdn and closing (#382). `m.typing` and `m.receipt` now route to subscribed bridges and bots. Confirmation testing was provided by @gymnae, thank you both!
 
-- User-Interactive Authentication for SSO accounts (MSC2454) has been made possible thanks to @chbgdn in (#389). Accounts no longer require setting a password to use features protected by UIAA flows. Users wishing to disable password authentication on their account altogether may do so by changing it to a single asterisk '*' character (use the admin room commands if your client refuses this password change).
+- **systemd watchdog keep-alive pings** were graciously added by @VlaDexa in (#415). Unit files declare `WatchdogSec=30` and the runtime pings systemd, so an unresponsive process is restarted automatically; previously-tolerated long stalls (e.g., pathological state-resolution) may now trigger restarts.
 
-- User-Interactive Authentication for Next-gen OIDC (MSC4312) was implemented by serial auth-system contributor @chbgdn in (#405). This provides cross-signing/identity reset functionality for ElementX and co.
+- **Spoofing-resistant client-IP resolution** with a configurable `ip_source` was contributed by @theredspoon as a security finding (#427), implemented and landed across (#428) and (#429). The new `ConfiguredIpSource` extension and `ClientIp` extractor replace `axum_client_ip::InsecureClientIp` across the API, restoring trust in client IPs for rate-limiting and audit logging. Default behavior is unchanged for existing deployments; operators behind a trusted proxy should set `ip_source` to opt in.
 
-- Asynchronous media uploads for appservices was implemented thanks to @donjuanplatinum (MSC2246) in (#347).
+- **MSC3030 (`/timestamp_to_event`) is implemented** (experimental), contributed by @donjuanplatinum in (#413). Clients can now jump to a specific point in time within a room. This is the third Matrix Spec Change @donjuanplatinum has shipped to Tuwunel and we are very grateful for the consistent contributions.
 
-- Thanks to @dasha-uwu the `appservice_dir` can be configured to a directory containing all your appservice yaml files.
+- **MSC3824 (delegated authentication / refresh-token capability)** is advertised on `/versions` and `LoginType::Sso` includes `delegated_oidc_compatibility`. The config key `sso_aware_preferred` is renamed to `oidc_aware_preferred`, with the old name accepted as alias.
 
-- @donjuanplatinum implemented the server-side for fast-joins (MSC3706) in (#349). Thank you!
+- Thanks to @rexbron, who contributed extensive operational documentation in (#354) and (#438): a `testmatrix` example in the troubleshooting section, podman-quadlet examples, an OIDC Keycloak provider example, refactored troubleshooting links, and clarification of how to obtain `provider_id` for the user admin commands. Thorough work!
 
-- Thanks to @ventureoo we support sockets managed by systemd after (#360) (issue #355).
+- @valentimarco wrote a complete Authelia authentication page in (#278), closing their own (#274) on the OIDC token endpoint. Thank you!
 
-- @vladexa prevented duplicate reactions from being sent by a client to maintain spec compliance with (#353), thank you!
+- Thanks to @winyadepla for reorganizing the calling chapter in (#431), clarifying TURN vs MatrixRTC and the rationale for Docker-only deployment. This addresses (#348) opened by @MadMan247. Thank you both!
 
-- Thank you @alametti for adding delegation examples (e.g. example.com to matrix.example.com) to the documentation in (#352).
+- Thank you @alametti for adding an Authentik provider section in (#437).
 
-- Thanks to @Lama-Thematique the admin room user registration notice was improved in (#387).
+- Configuration values that name byte sizes now accept SI/IEC unit strings (`64MiB`, `2GB`, etc.) in addition to raw integers.
 
-- Thank you @dasha-uwu for implementing the MSC4143 endpoint.
+- A persistent LRU cache was added for `userdevicesessionid_uiaainfo` to keep ongoing UIA sessions alive across restarts.
 
-- Thank you @dasha-uwu for removing the report score per MSC4277.
+- Performance: appservice EDU conditions reworked for concurrent lazy serialization; lazy-loading witness write-back gained a mode argument; the legacy spacehierarchy runtime cache was replaced by a database-backed path (config key `roomid_spacehierarchy_cache_capacity` → `spacehierarchy_cache_ttl_min`/`spacehierarchy_cache_ttl_max`).
 
-- Thank you @dasha-uwu for removing v1 send_join/leave as per MSC4376.
+- Admin: new commands to dump PDUs to the filesystem, query the RocksDB sequence number, and force/override or bypass database migrations.
 
-- RocksDB compaction details are logged for the curious in verbose logging builds.
+- Bootstrap stamps a `server_name` marker into the global column family (backfilled on first boot for pre-existing databases) so a misconfigured `server_name` pointed at the wrong database is caught on every start.
 
-- Numerous performance optimizations including JSON deserialization and allocator optimizations.
+- The `media_storage_providers` config option now validates that named providers exist; an explicit empty provider list defaults to all configured providers.
 
-- Sliding-sync no longer persists subscriptions across requests.
+- New documentation chapters: Authentication Systems overview, JWT auth, LDAP auth, multimedia and storage, storage-provider environment variables. Identity-linking semantics for trusted vs. untrusted IdPs are now documented. The development chapter links hosted rustdocs (newly deployed via CI) and a Testing section was added. (#324) opened by @TheButlah on the NixOS Module documentation is closed.
 
-- Configuration option `allowed_remote_server_names_experimental` added as exclusive federation allow-listing. NOTE: the `_experimental` suffix was added to indicate the logic of this feature will change in an upcoming release and the suffix will be removed. We sincerely regret this inconvenience.
+- OCI image labels now include accurate `org.opencontainers.image.version` and related metadata derived from the package, closing (#356) opened by @rexbron. Thank you for the detailed write-up!
 
 ### Bug Fixes
 
-- Thank you @jameskimmel for fixing the nginx configuration for http/2 support. (#391)
+- **OIDC server-contract hardening**: `/_tuwunel/oidc/userinfo` rejects plain Matrix access tokens (with `WWW-Authenticate: Bearer` on `401`); the token endpoint returns `400`/`invalid_grant` instead of `500` on client errors and emits `Cache-Control: no-store`; PKCE `plain` is no longer accepted (only `S256`); the `m.oauth` UIA flow routes through `/login/sso/redirect` when no specific IdP is selected.
 
-- @exodrifter fixed various errors and typos in documentation (#343), some reported by @RhenCloud in (#338). Thank you both!
+- **Storage-provider variant naming is now consistent**, with appreciation to @yonzilch for (#414). Both sub-tables use lowercase identifiers (`[global.storage_provider.<ID>.s3]`), unblocking environment-variable configuration. Existing `S3` configurations are still accepted.
 
-- @vladexa fixed systemd reloading by sending monotonic time after consultation with @rexbron. (#359) Thank you both!
+- **OpenBSD startup is fixed** in (#422), tip of the hat to @Hukadan. `core_affinity_rs` misreports CPU counts on OpenBSD; Tuwunel now uses `num_cpus` there. Thank you for picking this up!
 
-- Thanks to @exodrifter the media delete range commands now have improved verbiage as of (#375).
+- @alaviss reported a 1.6.0 regression in (#432) where inline `[global.appservice.<ID>]` config no longer worked. Fixed in (9d10230ba); the appservice ID from the toml section is honored again. Sincere apologies for the inconvenience.
 
-- @yefimg fixed the UIA password flow not being advertised to LDAP users due to regression (#378). Special thanks for this!
+- Multiple users reported the room-spaces hierarchy endpoint returning incomplete or invalid results: @vrisalab in (#344) and @foxing-quietly in (#399). The hierarchy unit was refactored, optimized, and corrected (including discarding `m.space.child` events with empty content per MSC1772/MSC2946). Special thanks to @TheBrigandier for testing and confirming the fixes on both threads.
 
-- Thank you @proximalriver for fixing the missing `server` keyword in the nginx example. (#383)
+- Thanks to @utop-top, who reported in (#411) that S3 uploads to Cloudflare R2 timed out for large media (~200 MiB+). Multipart uploads now kick in above a configurable `multipart_threshold` (default `100 MiB`). We appreciate the patient testing!
 
-- @chbgdn fixed the m.change_password capability not being set based on `login_with_password`. (#388) Thank you!
+- Thank you @utop-top for also reporting in (#401) that appservice E2EE was broken because `/whoami` wasn't returning a `device_id` per MSC3202, crashing matrix-hookshot on startup. Tuwunel now accepts and asserts the appservice-supplied `device_id` per MSC4326. Confirmation testing was provided by @Domoel, thanks to you both!
 
-- Thank you @centromere for reporting cross-platform build regressions in #357 which were fixed.
+- @BVollmerhaus reported in (#327) that mautrix bridges (e.g., mautrix-signal) couldn't upload device keys via MSC4190, blocking Element's upcoming mandatory device verification rollout. The MSC4190 path no longer stores `as_token` as the access token, and honors the appservice-asserted `device_id` on create. Special thanks to @1matin, @Domoel, and @gymnae for active testing across the thread.
 
-- Thank you @Ada-lave for reporting a regression with admin startup commands in #320 which we fixed.
+- Sliding-sync long-polls now release on client disconnect, credit to @chocycat for (#386). Refreshing a client no longer leaves the previous poll holding the connection mutex for the full timeout. Supplemented by task-detach and shutdown-timeout abstractions on main.
 
-- @0x1af2aec8f957 reported the new systemd-friendly listener system required reuse-address flags to be set (#374). Thank you for reporting!
+- Thanks to @kodazavr for the immediate report in (#444): Tuwunel failed to start with Sentry integration enabled because the Sentry transport was missing a TLS backend. The reqwest transport is now built with merged webpki roots.
 
-- Thank you @Batmaev for reporting non-compliant minimum timeout was imposed on sliding-sync in (#402) which was corrected.
+- Thank you @dennisoderwald for catching in (#443) that OIDC discovery advertised `response_mode=fragment` while the authorize endpoint only accepted `query`. Both modes are now implemented through the authorize/complete path.
 
-- @dasha-uwu fixed admin room upgrade to work as expected. @dfuchss inspired with (#361) among many other informal reports. We appreciate the effort of everyone involved on this!
+- @dennisoderwald also reported in (#434) that S3 storage worked over HTTP but not HTTPS. The missing `tls-webpki-roots` feature was added to the `object_store` dependency. Confirmation testing was provided by @ZoftTy and @kodazavr, thank you all!
 
-- @tycrek reported the conduit user is involved in `force-join-all-local-users` commands (#373) which was fixed thanks to @dasha-uwu.
+- Thanks to @dlford for the report in (#403) that clearing the presence status message had no effect. Now implemented with correct state transitions.
 
-- Thanks to @dasha-uwu bugs and compliance regarding `initial_state` during room creation were addressed.
+- Thank you @oly-nittka for the careful diagnosis in (#385) that federation with `matrix.org` was failing: a stale SRV cache entry overrode the .well-known delegation, producing port `8443` instead of `443`. The `actual_dest_2`/`actual_dest_3_2` resolver paths now parse explicit ports from delegated hosts.
+
+- @native4don reported in (#377) that `device_lists.changed` was missing from `/sync` after cross-signing key uploads or device-key changes. The per-room device-key-change row was restored and the sync path updated. Confirmation testing was provided by @rexbron and @x86pup, thank you all!
+
+- Thanks to @Giwayume for spotting in (#376) that `GET /_matrix/client/v3/devices` returned `null` for `display_name` and was not spec-compliant. The Ruma `Device` type now skips serializing optional fields when absent.
+
+- Thank you @foxing-quietly for the report in (#372) that `GET /room_keys/version` returned `500` instead of `404` for stored backups predating the `algorithm` field. A backup-algorithm serializer now migrates legacy records on the fly.
+
+- @kuhnchris reported in (#435) that AppService regex matching was case-inconsistent. User and alias namespaces now use case-insensitive comparisons, matching how MXIDs are normalized. Thank you!
+
+- @Himura2la updated the LiveKit configuration documentation to the modern form in (#420), addressing (#400) reported by @Morgan-SL-PUP. Thank you both!
+
+- Thanks to @grinapo for noting in (#317) that the Caddy `.well-known` example used incorrect CORS syntax. The example was corrected.
+
+- Thank you @jameskimmel for correcting the Docker port mapping in the example to match the listener (#393).
+
+- A regression in `state_cache` where the per-user transit step was wiping the room-wide invite-via cache was fixed in (efd36ddf2).
+
+- The `base_path` option for S3 bucket paths was fixed in (85688e5a2) (regression from 73d110727).
+
+- The UIAA flow for `m.oauth` and other non-SSO flows was corrected in (de8e2a1f3) so password and other flows still advertise correctly alongside SSO/OIDC.
+
+- Device `last_seen_ip` is now updated from the relevant client handlers in (e90272795).
+
+- The `device_list` update is now included in `/sync` for plaintext rooms (0adec1e3a), matching the spec. Operators can revert to 1.6.0 behavior with `device_key_update_encrypted_rooms_only=true`.
+
+- @dasha-uwu landed several spec-compliance and cleanup fixes: legacy media endpoints removed (a1bb05e5f), correct error code returned when OIDC is not configured to silence Element Web's warning (dfbab637c), `M_UNRECOGNIZED` status code changed from 405 to 404 to stop breaking CORS preflight (b926cd939), proper 405 returned for bad methods (e3b2ce6e1), the spurious "skipping presence update" log line removed (287140748), and HTML template fixes (a1742ac3). Thank you, dasha!
+
+### Honorable Mentions
+
+- @theredspoon's client-IP work warrants a second mention: a self-reported issue, a clean two-PR refactor for the fix, and willingness to coordinate the change across every handler in the API crate. This is exactly the kind of contribution every project hopes to receive.
+
+- @rexbron is now a serial documentation contributor and operations-focused thinker. Between the testmatrix example, the podman-quadlet content, the Keycloak guide, and the OCI image-label report, this release was meaningfully better for it.
+
+- @donjuanplatinum has now shipped MSC3030, MSC3706, and MSC2246 to Tuwunel across recent releases. Thank you for the steady stream of spec implementations.
