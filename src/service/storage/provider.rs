@@ -1,7 +1,14 @@
 pub mod local;
 pub mod s3;
 
-use std::{iter::once, ops::Range, sync::Arc};
+#[cfg(test)]
+mod tests;
+
+use std::{
+	iter::{from_fn, once},
+	ops::Range,
+	sync::Arc,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -16,6 +23,7 @@ use tuwunel_core::{
 	derivative::Derivative,
 	err, error, extract_variant, implement, info, trace,
 	utils::{
+		BoolExt,
 		result::FlatOk,
 		stream::{IterStream, TryReadyExt},
 	},
@@ -135,13 +143,16 @@ where
 		return self.put_single(path, payload).await;
 	}
 
+	let part_size = self.multipart_part_size();
+
 	debug!(
 		len = ?payload.content_length(),
 		threshold = ?self.multipart_threshold(),
+		?part_size,
 		"Selecting multi-part upload..."
 	);
 
-	self.put_multi(path, once(payload).try_stream())
+	self.put_multi(path, chunked(payload, part_size).try_stream())
 		.await
 }
 
@@ -507,4 +518,22 @@ fn multipart_threshold(&self) -> usize {
 		.map(TryInto::try_into)
 		.flat_ok()
 		.unwrap_or_default()
+}
+
+#[implement(Provider)]
+fn multipart_part_size(&self) -> usize {
+	extract_variant!(&self.config, StorageProvider::s3)
+		.map(|config| config.multipart_part_size.as_u64())
+		.map(TryInto::try_into)
+		.flat_ok()
+		.unwrap_or(usize::MAX)
+}
+
+fn chunked(payload: PutPayload, part_size: usize) -> impl Iterator<Item = PutPayload> {
+	let mut buf: Bytes = payload.into();
+	from_fn(move || {
+		buf.is_empty()
+			.is_false()
+			.then(|| buf.split_to(part_size.min(buf.len())).into())
+	})
 }

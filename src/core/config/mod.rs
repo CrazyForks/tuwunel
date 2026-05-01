@@ -3106,7 +3106,7 @@ pub enum StorageProvider {
 	local(StorageProviderLocal),
 	#[expect(non_camel_case_types)]
 	#[serde(rename = "s3", alias = "S3")]
-	s3(StorageProviderS3),
+	s3(Box<StorageProviderS3>),
 	#[default]
 	None,
 }
@@ -3215,6 +3215,18 @@ pub struct StorageProviderS3 {
 	/// default: 100 MiB
 	#[serde(default = "default_multipart_threshold")]
 	pub multipart_threshold: ByteSize,
+
+	/// (expert use) Size of each individual part within a Multi-part upload.
+	/// Once an upload exceeds `multipart_threshold` the payload is split into
+	/// parts of this size, each sent as a separate HTTP PUT. Smaller values
+	/// keep individual requests under per-request timeouts on slow uplinks at
+	/// the cost of more round-trips. S3 requires every part except the last
+	/// to be at least 5 MiB. The value is a parsed string allowing SI or IEC
+	/// units for convenience.
+	///
+	/// default: 10 MiB
+	#[serde(default = "default_multipart_part_size")]
+	pub multipart_part_size: ByteSize,
 
 	/// (developer use) Allows relaxing default requirement forcing HTTPS.
 	///
@@ -3805,6 +3817,8 @@ fn default_redaction_retention_seconds() -> u64 { 5_184_000 }
 fn default_media_storage_providers() -> BTreeSet<String> { ["media".to_owned()].into() }
 
 fn default_multipart_threshold() -> ByteSize { ByteSize::mib(100) }
+
+fn default_multipart_part_size() -> ByteSize { ByteSize::mib(10) }
 
 #[allow(clippy::ref_option)]
 fn fmt_redacted_opt(value: &Option<String>, f: &mut fmt::Formatter<'_>) -> fmt::Result {

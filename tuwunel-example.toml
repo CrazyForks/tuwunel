@@ -2711,6 +2711,16 @@
 #
 #multipart_threshold = 100 MiB
 
+# (expert use) Size of each individual part within a Multi-part upload.
+# Once an upload exceeds `multipart_threshold` the payload is split into
+# parts of this size, each sent as a separate HTTP PUT. Smaller values
+# keep individual requests under per-request timeouts on slow uplinks at
+# the cost of more round-trips. S3 requires every part except the last
+# to be at least 5 MiB. The value is a parsed string allowing SI or IEC
+# units for convenience.
+#
+#multipart_part_size = 10 MiB
+
 # (developer use) Allows relaxing default requirement forcing HTTPS.
 #
 #use_https = true
