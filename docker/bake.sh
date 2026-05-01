@@ -84,9 +84,6 @@ package_version="${package_version:-${git_semantic:-$cargo_semantic}}"
 package_revision="${package_revision:-$(git rev-parse HEAD 2>/dev/null || true)}"
 package_last_modified="${package_last_modified:-$(git show -s --format=%cI HEAD 2>/dev/null || true)}"
 
-# override the source position with another ref
-git_checkout="${git_checkout:-HEAD}"
-
 # other options
 rustdoc_base_path="${rustdoc_base_path:-}"
 rocksdb_opt_level=3

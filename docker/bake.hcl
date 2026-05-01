@@ -143,11 +143,6 @@ variable "docker_dir" {
     default = "."
 }
 
-# Override the project checkout
-variable "git_checkout" {
-    default = "HEAD"
-}
-
 variable "rustdoc_base_path" {
 	default = ""
 }
@@ -1686,9 +1681,6 @@ target "source" {
     ]
     contexts = {
         input = elem("target:builder", [sys_name, sys_version, sys_target])
-    }
-    args = {
-        git_checkout = "${git_checkout}"
     }
 }
 

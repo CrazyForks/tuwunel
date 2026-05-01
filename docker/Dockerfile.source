@@ -1,17 +1,8 @@
 # syntax = docker/dockerfile:1.11-labs
 
 FROM input AS source
-ARG git_checkout
 
-ADD --link --keep-git-dir . /usr/src/tuwunel
-WORKDIR /usr/src/tuwunel
-RUN <<EOF
-    set -eux
-    git reset \
-        --hard \
-        --no-recurse-submodules \
-        ${git_checkout}
-EOF
+ADD --link . /usr/src/tuwunel
 
 
 FROM input AS ingredients
