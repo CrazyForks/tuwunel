@@ -57,9 +57,9 @@ ENV CARGO_PROFILE_RELEASE_DEBUGINFO_LTO="${CARGO_PROFILE_RELEASE_DEBUGINFO_LTO}"
 ENV CARGO_BUILD_RUSTFLAGS="${CARGO_BUILD_RUSTFLAGS}"
 ENV CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
 RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
+--mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -eux
     ulimit -n 65535
@@ -107,9 +107,9 @@ SHELL ["/bin/bash", "-c"]
 ENV VALGRINDFLAGS="${VALGRINDFLAGS}"
 ENV TUWUNEL_DB_POOL_MAX_WORKERS="${VALGRIND_MAX_WORKERS}"
 RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
+--mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -eux
     ulimit -n 65535
