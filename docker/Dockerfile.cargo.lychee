@@ -12,9 +12,6 @@ ARG lychee_args="/usr/src/tuwunel/docs /usr/src/tuwunel/*.md"
 
 WORKDIR /usr/src/
 RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
 --mount=type=cache,dst=lychee,sharing=locked \
 <<EOF
     set -eux

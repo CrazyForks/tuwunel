@@ -11,8 +11,6 @@ docker/
 .idea
 *.iml
 
-.
-
 # Git folder
 .git
 #.gitea

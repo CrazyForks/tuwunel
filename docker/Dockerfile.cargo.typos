@@ -7,11 +7,7 @@ ARG CARGO_HOME
 ARG typos_args=""
 
 WORKDIR /usr/src/tuwunel
-RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
-<<EOF
+RUN <<EOF
     set -eux
     rustup run ${rust_toolchain} \
         typos \
