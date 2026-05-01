@@ -18,5 +18,7 @@ RUN \
             --color always \
             --exclude docker \
             --exclude nix \
+            --exclude RELEASE.md \
+            --exclude 'tests/complement/*.jsonl' \
             ${typos_args}
 EOF
