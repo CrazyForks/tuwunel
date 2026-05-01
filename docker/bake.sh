@@ -73,6 +73,17 @@ rust_nightly="${rust_nightly:-nightly}"
 toolchain_toml="$docker_dir/../rust-toolchain.toml"
 rust_msrv=$(grep "channel = " "$toolchain_toml" | cut -d'=' -f2 | sed 's/\s"\|"$//g')
 
+# Package metadata for OCI image labels/annotations. Mirrors the priority
+# used by src/core/info/version.rs::semantic(): `git describe --tags` falling
+# back to the workspace Cargo.toml version. Existing envs take precedence.
+git_semantic="$(git describe --tags --abbrev=1 2>/dev/null || true)"
+git_semantic="${git_semantic#v}"
+git_semantic="${git_semantic%-*-g*}"
+cargo_semantic="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+package_version="${package_version:-${git_semantic:-$cargo_semantic}}"
+package_revision="${package_revision:-$(git rev-parse HEAD 2>/dev/null || true)}"
+package_last_modified="${package_last_modified:-$(git show -s --format=%cI HEAD 2>/dev/null || true)}"
+
 # override the source position with another ref
 git_checkout="${git_checkout:-HEAD}"
 
