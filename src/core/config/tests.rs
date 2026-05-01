@@ -215,6 +215,31 @@ ip_source = "rightmost_x_forwarded_for"
 }
 
 #[test]
+fn s3_storage_provider_debug_masks_credentials() {
+	let config = StorageProviderS3 {
+		key: Some("AKIAIOSFODNN7EXAMPLE".to_owned()),
+		secret: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned()),
+		token: Some("session-token".to_owned()),
+		kms: Some("kms-material".to_owned()),
+		..Default::default()
+	};
+
+	let dump = format!("{config:?}");
+
+	assert!(!dump.contains("AKIAIOSFODNN7EXAMPLE"), "key leaked in Debug: {dump}");
+	assert!(!dump.contains("wJalrXUtnFEMI"), "secret leaked in Debug: {dump}");
+	assert!(!dump.contains("session-token"), "token leaked in Debug: {dump}");
+	assert!(!dump.contains("kms-material"), "kms leaked in Debug: {dump}");
+
+	for field in ["key", "secret", "token", "kms"] {
+		assert!(
+			dump.contains(&format!("{field}: Some(<redacted>)")),
+			"{field} should appear as Some(<redacted>): {dump}"
+		);
+	}
+}
+
+#[test]
 fn reload_accepts_unchanged_none_and_unchanged_some() {
 	let none = config_from_toml("[global]\n").unwrap();
 	let some = config_from_toml(

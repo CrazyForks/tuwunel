@@ -10,6 +10,7 @@ mod tests;
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fmt,
 	net::IpAddr,
 	path::{Path, PathBuf},
 };
@@ -34,7 +35,9 @@ use self::{
 	proxy::ProxyConfig,
 };
 use crate::{
-	Err, Result, err,
+	Err, Result,
+	derivative::Derivative,
+	err,
 	utils::{
 		self,
 		bytes::{deserialize_bytesize_u64, deserialize_bytesize_usize},
@@ -3139,7 +3142,8 @@ pub struct StorageProviderLocal {
 	pub startup_check: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Derivative)]
+#[derivative(Debug)]
 #[config_example_generator(
 	filename = "tuwunel-example.toml",
 	section = "global.storage_provider.<ID>.s3"
@@ -3160,6 +3164,7 @@ pub struct StorageProviderS3 {
 
 	/// Your amazon IAM Key ID with access granted to this bucket.
 	/// e.g. "ABCDEFG1X1ZZYYXXWWVV"
+	#[derivative(Debug(format_with = "fmt_redacted_opt"))]
 	pub key: Option<String>,
 
 	/// The secret key component which is approx 40 characters of base64.
@@ -3167,6 +3172,7 @@ pub struct StorageProviderS3 {
 	/// default:
 	/// display: sensitive
 	#[serde(skip_serializing)]
+	#[derivative(Debug(format_with = "fmt_redacted_opt"))]
 	pub secret: Option<String>,
 
 	/// Optional path prefix within the bucket where all our operations will
@@ -3188,11 +3194,13 @@ pub struct StorageProviderS3 {
 	/// display: sensitive
 	/// default:
 	#[serde(skip_serializing)]
+	#[derivative(Debug(format_with = "fmt_redacted_opt"))]
 	pub token: Option<String>,
 
 	/// (expert use) Associated SSE-KMS key material.
 	///
 	/// display: sensitive
+	#[derivative(Debug(format_with = "fmt_redacted_opt"))]
 	pub kms: Option<String>,
 
 	/// (expert use) When configured for the bucket it should be reflected here.
@@ -3797,3 +3805,11 @@ fn default_redaction_retention_seconds() -> u64 { 5_184_000 }
 fn default_media_storage_providers() -> BTreeSet<String> { ["media".to_owned()].into() }
 
 fn default_multipart_threshold() -> ByteSize { ByteSize::mib(100) }
+
+#[allow(clippy::ref_option)]
+fn fmt_redacted_opt(value: &Option<String>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+	match value {
+		| Some(_) => f.write_str("Some(<redacted>)"),
+		| None => f.write_str("None"),
+	}
+}
