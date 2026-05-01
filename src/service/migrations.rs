@@ -9,7 +9,7 @@ use tuwunel_core::{
 	result::NotFound,
 	utils,
 	utils::{
-		IterStream, ReadyExt,
+		BoolExt, IterStream, ReadyExt,
 		stream::{TryExpect, TryIgnore},
 	},
 	warn,
@@ -45,12 +45,10 @@ pub(crate) async fn migrations(services: &Services) -> Result {
 
 /// Matrix resource ownership is based on the server name; changing it
 /// requires recreating the database from scratch. The marker is stamped
-/// once in fresh(); legacy databases without it fall back to the original
-/// server-user heuristic only when admin-room creation is enabled.
+/// once in fresh(); pre-marker databases are backfilled by probing for
+/// any user from the configured server.
 async fn check_server_name(services: &Services) -> Result {
 	let server_name = &services.server.name;
-	let server_user = &services.globals.server_user;
-	let create_admin_room = &services.config.create_admin_room;
 
 	let existing = services.db["global"]
 		.get(SERVER_NAME_KEY)
@@ -58,18 +56,37 @@ async fn check_server_name(services: &Services) -> Result {
 		.deserialized::<String>();
 
 	match existing {
-		| Ok(existing) if existing.ne(server_name) => Err!(Database(
+		| Err(_) => backfill_server_name(services).await,
+		| Ok(existing) if existing.eq(server_name) => Ok(()),
+		| Ok(existing) => Err!(Database(
 			"Database belongs to {existing}; configured server name is {server_name}. Cannot \
 			 reuse."
 		)),
-		| Err(_) if *create_admin_room && !services.users.exists(server_user).await => {
-			Err!(
-				"The {server_user} server user does not exist, and the database is not new. \
-				 Cannot reuse."
-			)
-		},
-		| _ => Ok(()),
 	}
+}
+
+/// Stamp the marker on a database that pre-dates SERVER_NAME_KEY by probing
+/// for any user from the configured server. If none, the database belongs
+/// to a different server and reuse is refused.
+async fn backfill_server_name(services: &Services) -> Result {
+	let server_name = &services.server.name;
+
+	services
+		.users
+		.stream()
+		.ready_any(|user_id| services.globals.user_is_local(user_id))
+		.await
+		.ok_or_else(|| {
+			err!(Database(
+				"Database has no users from {server_name}; refusing to reuse with this \
+				 server_name."
+			))
+		})?;
+
+	services.db["global"].insert(SERVER_NAME_KEY, server_name.as_str());
+	info!(%server_name, "Stamped server_name marker on upgraded database");
+
+	Ok(())
 }
 
 async fn fresh(services: &Services) -> Result {
