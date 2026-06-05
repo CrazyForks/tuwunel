@@ -135,15 +135,9 @@ async fn migrate(services: &Services) -> Result {
 		));
 	}
 
-	if db["global"]
-		.get(b"feat_sha256_media")
-		.await
-		.is_not_found()
-	{
-		media::migrations::migrate_sha256_media(services).await?;
-	} else if config.media_startup_check {
-		media::migrations::checkup_sha256_media(services).await?;
-	}
+	// A Conduit database's colliding schema version 18 is reconciled below.
+	let conduit = is_conduit_database(services).await;
+	migrate_media(services, conduit).await?;
 
 	if db["global"]
 		.get(b"fix_bad_double_separator_in_state_cache")
@@ -211,7 +205,8 @@ async fn migrate(services: &Services) -> Result {
 			"Database: Migrated schema version from {} to {target_version}",
 			discovered_version().await
 		);
-	} else if discovered_version().await != target_version && config.force_migration {
+	} else if discovered_version().await != target_version && (config.force_migration || conduit)
+	{
 		services
 			.globals
 			.db
@@ -290,6 +285,42 @@ async fn migrate(services: &Services) -> Result {
 	info!("Loaded RocksDB database with schema version {DATABASE_VERSION}");
 
 	Ok(())
+}
+
+/// Skips the key-addressed media migrations for a Conduit database (its
+/// content-addressed media is imported separately); otherwise runs them.
+async fn migrate_media(services: &Services, conduit: bool) -> Result {
+	if conduit {
+		warn!(
+			"Detected a Conduit database; skipping the tuwunel media migrations (Conduit media \
+			 import is pending)."
+		);
+		return Ok(());
+	}
+
+	let db = &services.db;
+	let config = &services.server.config;
+
+	if db["global"]
+		.get(b"feat_sha256_media")
+		.await
+		.is_not_found()
+	{
+		media::migrations::migrate_sha256_media(services).await?;
+	} else if config.media_startup_check {
+		media::migrations::checkup_sha256_media(services).await?;
+	}
+
+	Ok(())
+}
+
+/// A Conduit (famedly) database opened in place. Conduit and Continuwuity both
+/// stamp schema version 18, so the discriminator is Conduit's content-addressed
+/// `filehash_metadata` column family, which neither tuwunel nor Continuwuity
+/// has.
+async fn is_conduit_database(services: &Services) -> bool {
+	services.globals.db.database_version().await == 18
+		&& services.db.engine.has_cf("filehash_metadata")
 }
 
 async fn fix_bad_double_separator_in_state_cache(services: &Services) -> Result {
