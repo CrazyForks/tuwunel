@@ -89,6 +89,24 @@ fn check_network(config: &Config) -> Result {
 		return Err!(Config("tls", "tls.certs and tls.key must either both be set or unset"));
 	}
 
+	// A non-zero depth shards the 64-char SHA-256 hex digest into `depth`
+	// segments of `length` plus a remainder, so the product must stay below 64.
+	let depth = config.conduit_media_directory_depth;
+	let length = config.conduit_media_directory_length;
+	if depth > 0 && length == 0 {
+		return Err!(Config(
+			"conduit_media_directory_length",
+			"must be non-zero when conduit_media_directory_depth is non-zero"
+		));
+	}
+	if depth > 0 && usize::from(depth).saturating_mul(usize::from(length)) >= 64 {
+		return Err!(Config(
+			"conduit_media_directory_depth",
+			"conduit_media_directory_depth times conduit_media_directory_length must be less \
+			 than 64, the length of a SHA-256 hex digest"
+		));
+	}
+
 	if let Some(source) = config.ip_source
 		&& !matches!(source, IpSource::ConnectInfo)
 	{

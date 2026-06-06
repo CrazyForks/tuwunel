@@ -3017,6 +3017,29 @@ pub struct Config {
 	#[serde(default)]
 	pub force_migration: bool,
 
+	/// When importing a Conduit database in place, the filesystem path to
+	/// Conduit's media directory. Leave unset to use `<database_path>/media`,
+	/// which is Conduit's own default location.
+	///
+	/// example: "/var/lib/matrix-conduit/media"
+	pub conduit_source_media_path: Option<PathBuf>,
+
+	/// When importing a Conduit database, the sharding depth of Conduit's media
+	/// directory (0 for a flat directory). Must match the importing Conduit's
+	/// `media.directory_structure`; the default matches Conduit's own default
+	/// of `Deep { length = 2, depth = 2 }`.
+	///
+	/// default: 2
+	#[serde(default = "default_conduit_media_directory_depth")]
+	pub conduit_media_directory_depth: u8,
+
+	/// When importing a Conduit database, the shard-segment length of Conduit's
+	/// media directory. Paired with `conduit_media_directory_depth`.
+	///
+	/// default: 2
+	#[serde(default = "default_conduit_media_directory_length")]
+	pub conduit_media_directory_length: u8,
+
 	/// Set this to true for excluding unencrypted rooms from the common-rooms
 	/// calculation deciding the receivers of device list updates.
 	///
@@ -4147,6 +4170,10 @@ fn some_true_fn() -> Option<bool> { Some(true) }
 fn default_server_name() -> OwnedServerName { ruma::owned_server_name!("localhost") }
 
 fn default_database_path() -> PathBuf { "/var/lib/tuwunel".to_owned().into() }
+
+fn default_conduit_media_directory_depth() -> u8 { 2 }
+
+fn default_conduit_media_directory_length() -> u8 { 2 }
 
 fn default_port() -> ListeningPort { ListeningPort { ports: Left(8008) } }
 

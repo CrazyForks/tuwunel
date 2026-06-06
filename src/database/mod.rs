@@ -63,6 +63,17 @@ impl Database {
 			.ok_or_else(|| err!(Request(NotFound("column not found"))))
 	}
 
+	/// Open a Map for an existing column family that tuwunel does not describe
+	/// in `MAPS`, for migration reads of a foreign database's families (e.g. a
+	/// Conduit database). The engine opens undescribed families as ignored
+	/// handles, so this returns `None` only when the family is absent.
+	pub fn open_cf(&self, name: &'static str) -> Result<Option<Arc<Map>>> {
+		self.engine
+			.has_cf(name)
+			.then(|| Map::open(&self.engine, name))
+			.transpose()
+	}
+
 	#[inline]
 	pub fn iter(&self) -> impl Iterator<Item = (&MapsKey, &MapsVal)> + Send + '_ {
 		self.maps.iter()
