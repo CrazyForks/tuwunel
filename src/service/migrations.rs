@@ -1,6 +1,7 @@
 use std::{
 	cmp,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use futures::{FutureExt, StreamExt};
@@ -20,7 +21,7 @@ use tuwunel_core::{
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, SEP};
+use tuwunel_database::{Deserialized, Map, SEP};
 
 use crate::{Services, media};
 
@@ -371,7 +372,7 @@ fn sha256_hex(digest: &[u8]) -> String {
 /// Imports the original media files of a Conduit database, reading each entry
 /// of its content-addressed `servernamemediaid_metadata` family and
 /// re-uploading the file through `media.create`, which lays it out in tuwunel's
-/// key-addressed store. Owner attribution is backfilled separately. Unreadable
+/// key-addressed store and attributes each local file to its owner. Unreadable
 /// entries are logged and skipped rather than aborting the import.
 async fn migrate_conduit_media(services: &Services) -> Result {
 	let db = &services.db;
@@ -381,6 +382,9 @@ async fn migrate_conduit_media(services: &Services) -> Result {
 		warn!("Conduit database has no media metadata; nothing to import.");
 		return Ok(());
 	};
+
+	let owners = db.open_cf("servernamemediaid_userlocalpart")?;
+	let owners = owners.as_ref();
 
 	let media_dir = config
 		.conduit_source_media_path
@@ -396,7 +400,9 @@ async fn migrate_conduit_media(services: &Services) -> Result {
 		.raw_stream()
 		.ignore_err()
 		.fold((0_usize, 0_usize), async |(imported, skipped), (key, value)| {
-			match import_conduit_original(services, &media_dir, depth, length, key, value).await {
+			match import_conduit_original(services, owners, &media_dir, depth, length, key, value)
+				.await
+			{
 				| Ok(()) => (imported.saturating_add(1), skipped),
 				| Err(e) => {
 					debug_warn!(error = %e, "skipping unimportable Conduit media entry");
@@ -421,6 +427,7 @@ async fn migrate_conduit_media(services: &Services) -> Result {
 /// content_type`. The file lives at the digest's content-addressed path.
 async fn import_conduit_original(
 	services: &Services,
+	owners: Option<&Arc<Map>>,
 	media_dir: &Path,
 	depth: u8,
 	length: u8,
@@ -451,11 +458,25 @@ async fn import_conduit_original(
 		.map_err(|e| err!(Database("reading Conduit media file {path:?}: {e}")))?;
 
 	let content_disposition = make_content_disposition(None, content_type, filename);
+	let owner = conduit_media_owner(owners, key, server_name).await;
 	let mxc = Mxc { server_name, media_id };
 	services
 		.media
-		.create(&mxc, None, Some(&content_disposition), content_type, &file)
+		.create(&mxc, owner.as_deref(), Some(&content_disposition), content_type, &file)
 		.await
+}
+
+/// The local owner of a Conduit media entry, read from
+/// `servernamemediaid_userlocalpart` (the same key, value the owner's
+/// localpart). None for remote media, which has no such entry.
+async fn conduit_media_owner(
+	owners: Option<&Arc<Map>>,
+	key: &[u8],
+	server_name: &ServerName,
+) -> Option<OwnedUserId> {
+	let localpart = owners?.get(key).await.ok()?;
+
+	UserId::parse_with_server_name(str::from_utf8(&localpart).ok()?, server_name).ok()
 }
 
 async fn fix_bad_double_separator_in_state_cache(services: &Services) -> Result {
