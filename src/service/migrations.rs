@@ -1,12 +1,14 @@
 use std::{
 	cmp,
+	collections::BTreeMap,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	Mxc, MxcUri, OwnedUserId, RoomId, ServerName, UserId, events::room::member::MembershipState,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, Mxc, MxcUri, OwnedRoomId, OwnedUserId,
+	RoomId, ServerName, UserId, events::room::member::MembershipState,
 };
 use tuwunel_core::{
 	Err, Result, debug, debug_info, debug_warn, err, info,
@@ -145,6 +147,15 @@ async fn migrate(services: &Services) -> Result {
 	// A Conduit database's colliding schema version 18 is reconciled below.
 	let conduit = is_conduit_database(services).await;
 	migrate_media(services, conduit).await?;
+
+	if conduit {
+		migrate_conduit_pdus(services).await?;
+		// The roomuserid_joined repairs below fix conduwuit-era bugs absent from
+		// Conduit; running them rewrites Conduit's correct membership index from
+		// re-derived state and corrupts it, so record them done to skip them.
+		db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
+		db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
+	}
 
 	if db["global"]
 		.get(b"fix_bad_double_separator_in_state_cache")
@@ -477,6 +488,127 @@ async fn conduit_media_owner(
 	let localpart = owners?.get(key).await.ok()?;
 
 	UserId::parse_with_server_name(str::from_utf8(&localpart).ok()?, server_name).ok()
+}
+
+/// Injects `room_id` into Conduit's stored event PDUs. Conduit omits the field
+/// from each stored value (rebuilding it on read), but tuwunel's `PduEvent`
+/// requires it, so without this its events fail to deserialize. Covers the
+/// `pduid_pdu` timeline (room from the key's leading short room id) and
+/// `eventid_outlierpdu` (where only v12 create events lack it; their room id
+/// derives from the create event's own id, which is the outlier key).
+async fn migrate_conduit_pdus(services: &Services) -> Result {
+	let db = &services.db;
+
+	// shortroomid -> room_id, inverted once so resolving each timeline PDU's
+	// room is a lookup rather than a scan of roomid_shortroomid.
+	let rooms: BTreeMap<u64, OwnedRoomId> = db["roomid_shortroomid"]
+		.stream()
+		.ignore_err()
+		.map(|(room_id, short): (&RoomId, u64)| (short, room_id.to_owned()))
+		.collect()
+		.await;
+
+	warn!("Reconciling Conduit PDUs into tuwunel's format...");
+	let cork = db.cork_and_sync();
+
+	let pduid_pdu = &db["pduid_pdu"];
+	let timeline = pduid_pdu
+		.raw_stream()
+		.ignore_err()
+		.ready_fold((0_usize, 0_usize), |acc, (key, value)| {
+			tally(acc, inject_room_id(pduid_pdu, key, value, |_| pduid_room(&rooms, key)))
+		})
+		.await;
+
+	let outlier = &db["eventid_outlierpdu"];
+	let outliers = outlier
+		.raw_stream()
+		.ignore_err()
+		.ready_fold((0_usize, 0_usize), |acc, (key, value)| {
+			tally(acc, inject_room_id(outlier, key, value, |pdu| outlier_room(key, pdu)))
+		})
+		.await;
+
+	drop(cork);
+
+	let fixed = timeline.0.saturating_add(outliers.0);
+	let skipped = timeline.1.saturating_add(outliers.1);
+	if skipped > 0 {
+		warn!(%fixed, %skipped, "Reconciled Conduit PDUs; some were skipped");
+	} else {
+		info!(%fixed, "Reconciled Conduit PDUs");
+	}
+
+	Ok(())
+}
+
+/// Folds one reconciliation outcome into a `(fixed, skipped)` tally.
+fn tally((fixed, skipped): (usize, usize), result: Result<bool>) -> (usize, usize) {
+	match result {
+		| Ok(true) => (fixed.saturating_add(1), skipped),
+		| Ok(false) => (fixed, skipped),
+		| Err(e) => {
+			debug_warn!(error = %e, "skipping unreconcilable Conduit PDU");
+			(fixed, skipped.saturating_add(1))
+		},
+	}
+}
+
+/// Injects `room_id` into one PDU value that lacks it, sourcing the room from
+/// `resolve`. Returns whether the value was rewritten; `false` means it already
+/// carried a `room_id`.
+fn inject_room_id(
+	map: &Arc<Map>,
+	key: &[u8],
+	value: &[u8],
+	resolve: impl FnOnce(&CanonicalJsonObject) -> Result<OwnedRoomId>,
+) -> Result<bool> {
+	let mut pdu: CanonicalJsonObject = serde_json::from_slice(value)
+		.map_err(|e| err!(Database("Conduit PDU is not canonical JSON: {e}")))?;
+
+	if pdu.contains_key("room_id") {
+		return Ok(false);
+	}
+
+	let room_id = resolve(&pdu)?;
+	pdu.insert("room_id".into(), CanonicalJsonValue::String(room_id.as_str().into()));
+
+	let bytes = serde_json::to_vec(&pdu)
+		.map_err(|e| err!(Database("re-serializing reconciled Conduit PDU: {e}")))?;
+	map.insert(key, bytes);
+
+	Ok(true)
+}
+
+/// The room of a `pduid_pdu` entry, from the short room id leading its key.
+fn pduid_room(rooms: &BTreeMap<u64, OwnedRoomId>, key: &[u8]) -> Result<OwnedRoomId> {
+	let short = key
+		.get(..8)
+		.ok_or_else(|| err!(Database("Conduit pduid is shorter than a short room id")))?;
+
+	rooms
+		.get(&utils::u64_from_u8(short))
+		.cloned()
+		.ok_or_else(|| err!(Database("Conduit pduid short room id maps to no room")))
+}
+
+/// The room of an `eventid_outlierpdu` entry that lacks `room_id`. Only a v12
+/// create event omits it, and its room id derives from the create event's own
+/// id, which is this outlier's key.
+fn outlier_room(key: &[u8], pdu: &CanonicalJsonObject) -> Result<OwnedRoomId> {
+	let is_create = matches!(
+		pdu.get("type"),
+		Some(CanonicalJsonValue::String(kind)) if kind == "m.room.create"
+	);
+	if !is_create {
+		return Err!(Database("Conduit outlier lacks room_id and is not a create event"));
+	}
+
+	let event_id = <&EventId>::try_from(str::from_utf8(key)?)
+		.map_err(|_| err!(Database("Conduit outlier key is not a valid event id")))?;
+
+	RoomId::new_v2(event_id.localpart())
+		.map_err(|e| err!(Database("deriving room id from create event id: {e}")))
 }
 
 async fn fix_bad_double_separator_in_state_cache(services: &Services) -> Result {
