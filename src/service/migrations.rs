@@ -151,8 +151,8 @@ async fn migrate(services: &Services) -> Result {
 	if conduit {
 		migrate_conduit_pdus(services).await?;
 		// The roomuserid_joined repairs below fix conduwuit-era bugs absent from
-		// Conduit; running them rewrites Conduit's correct membership index from
-		// re-derived state and corrupts it, so record them done to skip them.
+		// Conduit; record them done to skip the unnecessary re-derivation of
+		// Conduit's already-correct membership index.
 		db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
 		db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
 	}
@@ -700,7 +700,7 @@ async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) 
 					.state_accessor
 					.get_member(room_id, user_id)
 					.map(|member| {
-						member.is_ok_and(|member| member.membership == MembershipState::Join)
+						member.is_ok_and(|member| member.membership != MembershipState::Join)
 					})
 			})
 			.collect::<Vec<_>>()
