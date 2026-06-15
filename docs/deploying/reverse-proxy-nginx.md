@@ -28,10 +28,15 @@ upstream tuwunel {
   server 127.0.0.1:8008; # IP and port where tuwunel is listening
 }
 
-# Client-Server API over HTTPS (port 443)
 server {
+  # Client-Server API over HTTPS (port 443)
   listen 443 ssl;
   listen [::]:443 ssl;
+  # Matrix Federation over HTTPS (port 8448)
+  # Only needed if you want to federate with other homeservers
+  # Don't forget to open port 8448 in your firewall!
+  listen 8448 ssl;
+  listen [::]:8448 ssl;
   http2 on;
   server_name matrix.example.com;
 
@@ -50,31 +55,6 @@ server {
   }
 
   # TLS configuration (Let's Encrypt example using certbot)
-  ssl_certificate /etc/letsencrypt/live/matrix.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/matrix.example.com/privkey.pem;
-}
-
-# Matrix Federation over HTTPS (port 8448)
-# Only needed if you want to federate with other homeservers
-# Don't forget to open port 8448 in your firewall!
-server {
-  listen 8448 ssl;
-  listen [::]:8448 ssl;
-  http2 on;
-  server_name matrix.example.com;
-
-  # Same body size increase for larger files
-  client_max_body_size 100M;
-
-  # Forward to the same local port as client-server API
-  location / {
-    proxy_pass http://tuwunel;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header X-Forwarded-Proto https;
-  }
-
-  # TLS configuration (same certificates as above)
   ssl_certificate /etc/letsencrypt/live/matrix.example.com/fullchain.pem;
   ssl_certificate_key /etc/letsencrypt/live/matrix.example.com/privkey.pem;
 }
