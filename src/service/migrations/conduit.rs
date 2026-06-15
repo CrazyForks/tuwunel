@@ -81,8 +81,8 @@ pub(super) async fn migrate_conduit_media(services: &Services) -> Result {
 }
 
 /// Imports one `servernamemediaid_metadata` entry: the key is
-/// `servername 0xff media_id`, the value is `sha256(32) | filename | 0xff |
-/// content_type`. The file lives at the digest's content-addressed path.
+/// `servername 0xff media_id`. The file lives at the digest's content-addressed
+/// path.
 async fn import_conduit_original(
 	services: &Services,
 	owners: Option<&Arc<Map>>,
@@ -100,16 +100,7 @@ async fn import_conduit_original(
 
 	let media_id = str::from_utf8(&key[sep.saturating_add(1)..])?;
 
-	let (sha256, rest) = value
-		.split_at_checked(32)
-		.ok_or_else(|| err!(Database("Conduit media value shorter than a SHA-256 digest")))?;
-	let Some(sep) = rest.iter().position(|&byte| byte == SEP) else {
-		return Err!(Database("Conduit media value has no content-type separator"));
-	};
-	let filename = str::from_utf8(&rest[..sep])?;
-	let content_type = str::from_utf8(&rest[sep.saturating_add(1)..])?;
-	let filename = (!filename.is_empty()).then_some(filename);
-	let content_type = (!content_type.is_empty()).then_some(content_type);
+	let (sha256, filename, content_type) = parse_conduit_media_value(value)?;
 
 	let path = conduit_media_path(media_dir, depth, length, &sha256_hex(sha256));
 	let file = tokio::fs::read(&path)
@@ -124,6 +115,29 @@ async fn import_conduit_original(
 		.media
 		.create(&mxc, owner.as_deref(), Some(&content_disposition), content_type, &file)
 		.await
+}
+
+/// Splits a `servernamemediaid_metadata` value into its digest, filename, and
+/// content type. The value is `sha256(32) | filename | 0xff | content_type`
+/// with an optional trailing `0xff` that Conduit's media-auth migration appends
+/// to flag unauthenticated access; that flag is ignored.
+fn parse_conduit_media_value(value: &[u8]) -> Result<(&[u8], Option<&str>, Option<&str>)> {
+	let (sha256, rest) = value
+		.split_at_checked(32)
+		.ok_or_else(|| err!(Database("Conduit media value shorter than a SHA-256 digest")))?;
+
+	// Take filename and content_type, ignoring the optional trailing 0xff flag.
+	let mut parts = rest.split(|&byte| byte == SEP);
+	let filename = parts.next().unwrap_or_default();
+	let Some(content_type) = parts.next() else {
+		return Err!(Database("Conduit media value has no content-type separator"));
+	};
+	let filename = str::from_utf8(filename)?;
+	let content_type = str::from_utf8(content_type)?;
+	let filename = (!filename.is_empty()).then_some(filename);
+	let content_type = (!content_type.is_empty()).then_some(content_type);
+
+	Ok((sha256, filename, content_type))
 }
 
 /// The local owner of a Conduit media entry from
@@ -306,7 +320,7 @@ fn outlier_room(key: &[u8], pdu: &CanonicalJsonObject) -> Result<OwnedRoomId> {
 mod tests {
 	use std::path::Path;
 
-	use super::{conduit_media_path, sha256_hex};
+	use super::{conduit_media_path, parse_conduit_media_value, sha256_hex};
 
 	#[test]
 	fn conduit_media_path_deep_matches_conduit_default() {
@@ -333,5 +347,33 @@ mod tests {
 	#[test]
 	fn sha256_hex_encodes_lowercase_padded() {
 		assert_eq!(sha256_hex(&[0x00, 0x0F, 0xFF, 0xA5]), "000fffa5");
+	}
+
+	#[test]
+	fn conduit_media_value_ignores_unauthenticated_flag() {
+		// Conduit's media-auth migration appends a trailing 0xff after content_type.
+		let mut value = vec![7_u8; 32];
+		value.extend_from_slice(b"pic.png");
+		value.push(0xFF);
+		value.extend_from_slice(b"image/png");
+		value.push(0xFF);
+
+		let (sha256, filename, content_type) = parse_conduit_media_value(&value).unwrap();
+
+		assert_eq!(sha256, [7_u8; 32].as_slice());
+		assert_eq!(filename, Some("pic.png"));
+		assert_eq!(content_type, Some("image/png"));
+	}
+
+	#[test]
+	fn conduit_media_value_empty_filename_is_none() {
+		let mut value = vec![0_u8; 32];
+		value.push(0xFF);
+		value.extend_from_slice(b"image/png");
+
+		let (_, filename, content_type) = parse_conduit_media_value(&value).unwrap();
+
+		assert_eq!(filename, None);
+		assert_eq!(content_type, Some("image/png"));
 	}
 }
