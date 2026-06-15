@@ -52,9 +52,12 @@ and `-v3-` CPU-optimized variants. Running the wrong one produces an
 variant your CPU supports; `-v2-` or better is recommended for RocksDB's CRC32
 performance.
 
-**RocksDB is the only supported database.** SQLite support has been removed. If
-you are migrating from Conduit, you will need a migration tool before deploying
-Tuwunel.
+**RocksDB is the only supported database.** SQLite support has been removed. A
+RocksDB Conduit database migrates in place on first boot: point Tuwunel's
+`database_path` at the existing Conduit data directory and it reconciles the
+schema, room history, and media automatically. If Conduit's media lived outside
+`<database_path>/media`, set `conduit_source_media_path`. SQLite Conduit
+databases are not supported.
 
 **Port 8448 matters for federation.** Clients connect on port 443, but other
 Matrix homeservers connect on port 8448. Both must be reachable for a fully
