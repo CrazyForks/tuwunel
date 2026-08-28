@@ -31,6 +31,10 @@ RUN \
 <<EOF
     set -eux
     mkdir -p "${pkg_dir}"
+    # Every warning cargo-deb prints is a defect in the package it went on to
+    # write anyway, so the log is kept and the build refuses to carry one
+    # forward. Capturing it rather than piping keeps cargo-deb's own status.
+    log=$(mktemp)
     rustup run ${rust_toolchain} sched_wrap.sh \
         cargo deb \
             --verbose \
@@ -43,7 +47,14 @@ RUN \
             --manifest-path Cargo.toml \
             --compress-type gz \
             --output "${pkg_dir}" \
-            ${deb_args}
+            ${deb_args} \
+        > "$log" 2>&1 || { cat "$log"; exit 1; }
+
+	cat "$log"
+	if sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -q '^warning:'; then
+		echo "cargo-deb warned; the package it wrote is wrong" >&2
+		exit 1
+	fi
 
 	mv ${pkg_dir}/* "${pkg_dir}/tuwunel.deb"
 	dpkg --info "${pkg_dir}/tuwunel.deb"
