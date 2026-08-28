@@ -19,9 +19,12 @@ name = "tuwunel"
 maintainer = "Jason Volk <jason@zemos.net>"
 copyright = "2025, Tuwunel Contributors"
 license-file = ["../../LICENSE", "3"]
-# procps owns /usr/bin/kill, which the unit's ExecReload= invokes. It is only
-# Priority: important, so a trimmed install would not otherwise carry it.
-depends = "$auto, ca-certificates, adduser, procps"
+# The release binary is statically linked, so $auto has no shared library to
+# discover and only sends cargo-deb looking for a dpkg-shlibdeps that the build
+# image does not carry. procps owns /usr/bin/kill, which the unit's ExecReload=
+# invokes; it is only Priority: important, so a trimmed install would not
+# otherwise carry it.
+depends = "ca-certificates, adduser, procps"
 conflicts = "conduwuit, matrix-conduit"
 extended-description = """\
 High performance Matrix homeserver written in Rust"""
