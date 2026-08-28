@@ -12,7 +12,7 @@
 use std::{fs::remove_dir_all, io::Cursor, path::PathBuf, time::Duration};
 
 use image::{
-	AnimationDecoder, ImageFormat, ImageReader,
+	AnimationDecoder, Frames, ImageFormat, ImageReader,
 	codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
 	guess_format,
 };
@@ -423,30 +423,35 @@ fn frames(format: ImageFormat, bytes: &[u8]) -> Option<usize> {
 	match format {
 		| ImageFormat::Gif => GifDecoder::new(cursor)
 			.ok()
+			.map(AnimationDecoder::into_frames)
 			.and_then(count_frames),
 		| ImageFormat::WebP => match WebPDecoder::new(cursor) {
 			| Err(_) => None,
 			| Ok(decoder) if !decoder.has_animation() => Some(1),
-			| Ok(decoder) => count_frames(decoder),
+			| Ok(decoder) => count_frames(decoder.into_frames()),
 		},
 		| ImageFormat::Png => match PngDecoder::new(cursor) {
 			| Err(_) => None,
 			| Ok(decoder) if !decoder.is_apng().unwrap_or(false) => Some(1),
-			| Ok(decoder) => decoder.apng().ok().and_then(count_frames),
+			| Ok(decoder) => decoder
+				.apng()
+				.ok()
+				.map(AnimationDecoder::into_frames)
+				.and_then(count_frames),
 		},
 		| _ => Some(1),
 	}
 }
 
-/// Frames a decoder yields, or `None` if any of them fails to decode.
+/// Frames in a decoded sequence, or `None` if any of them fails to decode.
 ///
-/// The frames are counted rather than kept, so a long animation is walked
-/// without retaining it, and one bad frame invalidates the count instead of
-/// silently shortening it.
-fn count_frames<'a>(decoder: impl AnimationDecoder<'a>) -> Option<usize> {
-	decoder
-		.into_frames()
-		.try_fold(0_usize, |count, frame| frame.ok().and_then(|_| count.checked_add(1)))
+/// Takes the sequence rather than the decoder that produced it, so the three
+/// callers share one body without this needing a lifetime of its own. The
+/// frames are counted rather than kept, so a long animation is walked without
+/// retaining it, and one bad frame invalidates the count instead of silently
+/// shortening it.
+fn count_frames(mut frames: Frames<'_>) -> Option<usize> {
+	frames.try_fold(0_usize, |count, frame| frame.ok().and_then(|_| count.checked_add(1)))
 }
 
 /// Render one swept case as a report line.
