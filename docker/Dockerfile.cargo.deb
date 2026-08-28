@@ -41,7 +41,6 @@ RUN \
             --profile "${cargo_profile}" \
             --target "${CARGO_TARGET}" \
             --manifest-path Cargo.toml \
-            --multiarch same \
             --compress-type gz \
             --output "${pkg_dir}" \
             ${deb_args}
@@ -77,4 +76,9 @@ RUN <<EOF
 	# depends on, so hold them against the filesystem the install produced.
 	sed -nE 's/^Exec[A-Za-z]+=[-+!@]*(\/[^ ]+).*/\1/p' \
 		/usr/lib/systemd/system/tuwunel.service | xargs -rt -n1 test -x
+	# Both units belong in the directory systemd searches, and the socket is
+	# the operator's choice to make, so it arrives installed and unenabled.
+	test -f /usr/lib/systemd/system/tuwunel.socket
+	test -L /etc/systemd/system/multi-user.target.wants/tuwunel.service
+	test ! -e /etc/systemd/system/sockets.target.wants/tuwunel.socket
 EOF

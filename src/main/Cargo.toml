@@ -29,16 +29,15 @@ section = "net"
 priority = "optional"
 conf-files = ["/etc/tuwunel/tuwunel.toml"]
 maintainer-scripts = "../../debian/"
-systemd-units = { unit-name = "tuwunel", start = false }
+# cargo-deb enables every unit it installs into the systemd directory, and
+# socket activation stays opt-in, so nothing is enabled from here and
+# debian/postinst enables the service alone.
+systemd-units = { unit-name = "tuwunel", enable = false, start = false }
 assets = [
 	["../../debian/README.md", "usr/share/doc/tuwunel/README.Debian", "644"],
 	["../../README.md", "usr/share/doc/tuwunel/", "644"],
 	["target/release/tuwunel", "usr/sbin/tuwunel", "755"],
 	["../../tuwunel-example.toml", "etc/tuwunel/tuwunel.toml", "640"],
-	# Socket activation stays opt-in. cargo-deb enables the units it finds
-	# beside tuwunel.service or installed into lib/systemd/system, so this one
-	# lives outside both while landing in a vendor directory systemd reads all
-	# the same. Moving either path back would enable it on every install.
 	["../../debian/units/tuwunel.socket", "usr/lib/systemd/system/tuwunel.socket", "644"],
 ]
 

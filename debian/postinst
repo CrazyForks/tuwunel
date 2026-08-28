@@ -116,3 +116,10 @@ case "$1" in
 esac
 
 #DEBHELPER#
+
+# Enablement is declined for the package as a whole so the socket unit stays
+# opt-in, which leaves the service to be enabled here, on first install only so
+# an administrator who disabled it keeps that across upgrades.
+if [ "$1" = "configure" ] && [ -z "$2" ]; then
+  deb-systemd-helper enable tuwunel.service >/dev/null || true
+fi
