@@ -5321,6 +5321,7 @@ dependencies = [
  "ctor",
  "dtor",
  "futures",
+ "image",
  "insta",
  "log",
  "maplit",

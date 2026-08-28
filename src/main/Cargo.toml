@@ -263,6 +263,7 @@ workspace = true
 [dev-dependencies]
 criterion.workspace = true
 futures.workspace = true
+image.workspace = true
 insta.workspace = true
 maplit.workspace = true
 quoted_printable.workspace = true
