@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ruma::{Mxc, OwnedMxcUri, OwnedServerName};
 use tuwunel_core::Result;
-use tuwunel_service::media::Dim;
+use tuwunel_service::media::{Animate, Dim};
 
 use crate::admin_command;
 
@@ -21,7 +21,7 @@ pub(super) async fn get_remote_thumbnail(
 	let mut result = self
 		.services
 		.media
-		.fetch_remote_thumbnail(&mxc, server.as_deref(), timeout, &dim)
+		.fetch_remote_thumbnail(&mxc, server.as_deref(), timeout, &dim, Animate::Allowed)
 		.await?;
 
 	let len = result.content.len();

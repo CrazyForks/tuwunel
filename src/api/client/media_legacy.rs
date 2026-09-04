@@ -16,7 +16,7 @@ use tuwunel_core::{
 	Err, Result, err,
 	utils::{content_disposition::make_content_disposition, math::ruma_from_usize},
 };
-use tuwunel_service::media::{CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, Media};
+use tuwunel_service::media::{Animate, CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, Media};
 
 use crate::{ClientIp, Ruma, RumaResponse};
 
@@ -98,7 +98,7 @@ pub(crate) async fn get_content_legacy_route(
 		&& services.globals.server_is_ours(&body.server_name)
 		&& let Some(url) = services
 			.media
-			.redirect_url(&mxc, &Dim::default())
+			.redirect_url(&mxc, &Dim::default(), Animate::Allowed)
 			.await?
 	{
 		return Ok(Redirect::temporary(url.as_str()).into_response());
@@ -184,7 +184,7 @@ pub(crate) async fn get_content_as_filename_legacy_route(
 		&& services.globals.server_is_ours(&body.server_name)
 		&& let Some(url) = services
 			.media
-			.redirect_url(&mxc, &Dim::default())
+			.redirect_url(&mxc, &Dim::default(), Animate::Allowed)
 			.await?
 	{
 		return Ok(Redirect::temporary(url.as_str()).into_response());
@@ -267,17 +267,21 @@ pub(crate) async fn get_content_thumbnail_legacy_route(
 	};
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
+	let animate = Animate::from(body.animated);
 
 	if body.allow_redirect
 		&& services.globals.server_is_ours(&body.server_name)
-		&& let Some(url) = services.media.redirect_url(&mxc, &dim).await?
+		&& let Some(url) = services
+			.media
+			.redirect_url(&mxc, &dim, animate)
+			.await?
 	{
 		return Ok(Redirect::temporary(url.as_str()).into_response());
 	}
 
 	match services
 		.media
-		.get_thumbnail(&mxc, &dim, Some(body.timeout_ms))
+		.get_thumbnail(&mxc, &dim, animate, Some(body.timeout_ms))
 		.await
 	{
 		| Ok(Media {

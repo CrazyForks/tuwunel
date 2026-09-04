@@ -422,7 +422,7 @@ impl Service {
 	pub async fn get_stored(&self, mxc: &Mxc<'_>) -> Result<Media> {
 		let meta = self
 			.db
-			.search_file_metadata(mxc, &Dim::default())
+			.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
 			.await;
 
 		let Ok(Metadata { content_type, content_disposition, key }) = meta else {
@@ -468,7 +468,7 @@ impl Service {
 		// a queued waiter for the same mxc may have promoted it already
 		if self
 			.db
-			.search_file_metadata(mxc, &Dim::default())
+			.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
 			.await
 			.is_ok()
 		{
@@ -521,17 +521,34 @@ impl Service {
 	/// Presigned redirect URL for locally-stored media (MSC3860).
 	///
 	/// Returns the first configured provider's signed URL for the object, or
-	/// `None` when redirects are disabled, the media is unknown, or no provider
-	/// can presign (filesystem-only media).
+	/// `None` when redirects are disabled, the media is unknown, or no
+	/// provider can presign it (filesystem-only media). A stored file that
+	/// animates also answers `None` to a request forbidding animation, since
+	/// handing over the object as it stands cannot re-encode it.
 	#[tracing::instrument(level = "debug", skip(self))]
-	pub async fn redirect_url(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<Url>> {
+	pub async fn redirect_url(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+		animate: Animate,
+	) -> Result<Option<Url>> {
 		if !self.services.config.media_allow_redirect {
 			return Ok(None);
 		}
 
-		let Ok(Metadata { key, .. }) = self.db.search_file_metadata(mxc, dim).await else {
+		let Ok(Metadata { key, content_type, .. }) = self
+			.db
+			.search_file_metadata(mxc, dim, animate)
+			.await
+		else {
 			return Ok(None);
 		};
+
+		// a redirect hands over the stored object as it is, so a variant the
+		// request forbids has to fall through to the re-encoding path
+		if !animate.accepts(content_type.as_deref()) {
+			return Ok(None);
+		}
 
 		let path = self.get_media_name_sha256(&key);
 		let urls = self
@@ -953,7 +970,7 @@ impl Service {
 	#[inline]
 	pub async fn get_metadata(&self, mxc: &Mxc<'_>) -> Option<Metadata> {
 		self.db
-			.search_file_metadata(mxc, &Dim::default())
+			.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
 			.await
 			.ok()
 	}

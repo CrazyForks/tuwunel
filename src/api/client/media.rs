@@ -21,7 +21,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::{
 	Services,
-	media::{CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, MXC_LENGTH, Media},
+	media::{Animate, CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, MXC_LENGTH, Media},
 };
 
 use crate::{ClientIp, Ruma};
@@ -163,6 +163,7 @@ pub(crate) async fn get_content_thumbnail_route(
 	let user = body.sender_user();
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
+	let animate = Animate::from(body.animated);
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
@@ -172,7 +173,7 @@ pub(crate) async fn get_content_thumbnail_route(
 		content,
 		content_type,
 		content_disposition,
-	} = fetch_thumbnail(&services, &mxc, user, body.timeout_ms, &dim).await?;
+	} = fetch_thumbnail(&services, &mxc, user, body.timeout_ms, &dim, animate).await?;
 
 	Ok(get_content_thumbnail::v1::Response {
 		file: content,
@@ -305,6 +306,7 @@ async fn fetch_thumbnail(
 	user: &UserId,
 	timeout_ms: Duration,
 	dim: &Dim,
+	animate: Animate,
 ) -> Result<Media> {
 	let Media {
 		content,
@@ -312,7 +314,7 @@ async fn fetch_thumbnail(
 		content_disposition,
 	} = services
 		.media
-		.get_or_fetch_thumbnail(mxc, dim, timeout_ms, user)
+		.get_or_fetch_thumbnail(mxc, dim, animate, timeout_ms, user)
 		.await?;
 
 	let content_disposition = Some(make_content_disposition(

@@ -17,7 +17,7 @@ use ruma::http_headers::ContentDispositionType;
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
 use tokio::sync::Notify;
 use tuwunel_core::{
-	Err, Result, checked, err, implement,
+	Err, Result, async_noinline, checked, err, implement,
 	utils::{result::LogDebugErr, stream::IterStream},
 };
 
@@ -99,11 +99,12 @@ impl super::Service {
 		&self,
 		mxc: &Mxc<'_>,
 		dim: &Dim,
+		animate: Animate,
 		timeout_ms: Duration,
 		user: &UserId,
 	) -> Result<Media> {
 		if let Ok(media) = self
-			.get_thumbnail(mxc, dim, Some(timeout_ms))
+			.get_thumbnail(mxc, dim, animate, Some(timeout_ms))
 			.await
 		{
 			return Ok(media);
@@ -118,33 +119,49 @@ impl super::Service {
 		}
 
 		let lock = self.federation_mutex.lock(&mxc.to_string()).await;
+		let normalized = dim.normalized();
 
 		if self
 			.db
-			.file_metadata_exists(mxc, &dim.normalized())
+			.file_metadata_exists(mxc, &normalized)
 			.await
 		{
 			drop(lock);
-			return self.get_thumbnail(mxc, dim, None).await;
+			return self.get_thumbnail(mxc, dim, animate, None).await;
 		}
 
-		self.fetch_remote_thumbnail(mxc, None, timeout_ms, dim)
-			.await
+		let media = self
+			.fetch_remote_thumbnail(mxc, None, timeout_ms, dim, animate)
+			.await?;
+
+		// a peer may ignore the parameter and this answers the caller directly,
+		// so the variant is repaired before it leaves rather than one request on
+		if animate.accepts(media.content_type.as_deref()) {
+			return Ok(media);
+		}
+
+		self.store_still(mxc, &normalized, media).await
 	}
 
 	/// Download a thumbnail and wait up to a timeout_ms if it is pending.
+	///
+	/// The future is boxed because the still-repair path pulls the thumbnailer
+	/// into it, and inlining that into every caller overflows the layout depth
+	/// limit in the federation handler.
+	#[async_noinline]
 	#[tracing::instrument(
 		level = "debug",
 		err(level = "debug")
 		skip(self),
 	)]
-	pub async fn get_thumbnail(
-		&self,
-		mxc: &Mxc<'_>,
-		dim: &Dim,
+	pub async fn get_thumbnail<'a>(
+		&'a self,
+		mxc: &'a Mxc<'_>,
+		dim: &'a Dim,
+		animate: Animate,
 		timeout_duration: Option<Duration>,
 	) -> Result<Media> {
-		if let Ok(meta) = self.get_stored_thumbnail(mxc, dim).await {
+		if let Ok(meta) = self.get_stored_thumbnail(mxc, dim, animate).await {
 			return Ok(meta);
 		}
 
@@ -171,7 +188,7 @@ impl super::Service {
 			return Err!(Request(NotYetUploaded("Media has not been uploaded yet")));
 		}
 
-		self.get_stored_thumbnail(mxc, dim).await
+		self.get_stored_thumbnail(mxc, dim, animate).await
 	}
 
 	/// Downloads a file's thumbnail.
@@ -193,19 +210,36 @@ impl super::Service {
 		err(level = "trace")
 		skip(self),
 	)]
-	pub async fn get_stored_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Media> {
+	pub async fn get_stored_thumbnail(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+		animate: Animate,
+	) -> Result<Media> {
 		// 0, 0 because that's the original file
 		let dim = dim.normalized();
+		let animate = animate.at(&dim);
 
-		if let Ok(metadata) = self.db.search_file_metadata(mxc, &dim).await {
-			return self.get_thumbnail_saved(metadata).await;
+		if let Ok(metadata) = self
+			.db
+			.search_file_metadata(mxc, &dim, animate)
+			.await
+		{
+			// a peer ignoring the animated parameter answers with an animated
+			// passthrough, which is re-derived here rather than refused
+			return match animate.accepts(metadata.content_type.as_deref()) {
+				| true => self.get_thumbnail_saved(metadata).await,
+				| false =>
+					self.get_thumbnail_still(mxc, &dim, metadata)
+						.await,
+			};
 		}
 
 		// the original may be lazy preview media promoted on this very request;
 		// only an image is worth serving in a thumbnail's place
 		let Ok(metadata) = self
 			.db
-			.search_file_metadata(mxc, &Dim::default())
+			.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
 			.await
 		else {
 			let media = self.get_stored(mxc).await?;
@@ -218,7 +252,7 @@ impl super::Service {
 				.ok_or_else(|| err!(Request(NotFound("Media not found."))));
 		};
 
-		self.get_thumbnail_generate(mxc, &dim, metadata)
+		self.get_thumbnail_generate(mxc, &dim, animate, metadata)
 			.await
 	}
 }
@@ -247,6 +281,73 @@ async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
 	Ok(into_media(data, bytes.to_vec()))
 }
 
+/// Re-derive a still thumbnail from a stored animated one.
+///
+/// A request forbidding animation would otherwise be refused over media the
+/// server already holds. Decoding the stored row answers it instead, and
+/// leaves a still variant behind for the next one.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[tracing::instrument(name = "restill", level = "debug", skip(self, data))]
+async fn get_thumbnail_still(&self, mxc: &Mxc<'_>, dim: &Dim, data: Metadata) -> Result<Media> {
+	let animated = self.get_thumbnail_saved(data).await?;
+
+	self.store_still(mxc, dim, animated).await
+}
+
+/// Re-encode picture bytes as a still thumbnail and store it.
+///
+/// A cached row and a fresh federation fetch both reach here, so a peer that
+/// ignores the parameter is repaired the same way a stale row is.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[tracing::instrument(name = "still", level = "debug", skip(self, animated))]
+pub(super) async fn store_still(
+	&self,
+	mxc: &Mxc<'_>,
+	dim: &Dim,
+	animated: Media,
+) -> Result<Media> {
+	// the sentinel names the original file rather than a size to re-encode at,
+	// and no encoder accepts the zero dimensions it would ask for
+	if dim.is_original() {
+		return Ok(animated);
+	}
+
+	// serving the picture is what the request forbade, so a decode that fails
+	// leaves nothing answerable
+	let Ok(image) = self.decode(&animated.content) else {
+		return Err!(Request(NotFound("Media thumbnail not found.")));
+	};
+
+	drop(animated);
+
+	self.store_thumbnail(mxc, dim, &image).await
+}
+
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "restill", level = "debug", skip_all)]
+async fn get_thumbnail_still(&self, _mxc: &Mxc<'_>, _dim: &Dim, data: Metadata) -> Result<Media> {
+	self.get_thumbnail_saved(data).await
+}
+
+/// Hands the picture back as it stands, there being no thumbnailer.
+///
+/// A build without the feature keeps serving what it holds rather than
+/// refusing, so a request for a still goes unhonored instead of failing.
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "still", level = "debug", skip_all)]
+pub(super) async fn store_still(
+	&self,
+	_mxc: &Mxc<'_>,
+	_dim: &Dim,
+	animated: Media,
+) -> Result<Media> {
+	Ok(animated)
+}
+
 /// Generate a thumbnail
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
@@ -255,6 +356,7 @@ async fn get_thumbnail_generate(
 	&self,
 	mxc: &Mxc<'_>,
 	dim: &Dim,
+	animate: Animate,
 	data: Metadata,
 ) -> Result<Media> {
 	let Ok(media) = self.get_stored(mxc).await else {
@@ -280,7 +382,9 @@ async fn get_thumbnail_generate(
 	// a video is never servable in place of its own thumbnail, so its frame is
 	// re-encoded however small it is
 	let source = Dim::new(image.width(), image.height(), None);
-	if !from_video && dim.is_passthrough(&source)? {
+	let servable = animate.accepts(media.content_type.as_deref());
+
+	if !from_video && servable && dim.is_passthrough(&source)? {
 		return Ok(into_media(data, media.content));
 	}
 
@@ -288,8 +392,32 @@ async fn get_thumbnail_generate(
 	// staged file, and the encode and the store must not hold it
 	drop(media);
 
+	self.store_thumbnail(mxc, dim, &image).await
+}
+
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "fallback", level = "debug", skip_all)]
+async fn get_thumbnail_generate(
+	&self,
+	_mxc: &Mxc<'_>,
+	_dim: &Dim,
+	_animate: Animate,
+	data: Metadata,
+) -> Result<Media> {
+	self.get_thumbnail_saved(data).await
+}
+
+/// Encode a still PNG thumbnail at these dimensions and store it.
+///
+/// The generate path and the still-repair path share this, so a given size
+/// carries one content type and one disposition whichever produced it.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[tracing::instrument(name = "store", level = "debug", skip(self, image))]
+async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: &DynamicImage) -> Result<Media> {
 	let mut thumbnail_bytes = Vec::new();
-	let thumbnail = thumbnail_generate(&image, dim)?;
+	let thumbnail = thumbnail_generate(image, dim)?;
 	let mut cursor = Cursor::new(&mut thumbnail_bytes);
 
 	thumbnail
@@ -304,37 +432,19 @@ async fn get_thumbnail_generate(
 		filename: Some(THUMBNAIL_NAME.to_owned()),
 	};
 
-	let data = Metadata {
-		content_type: Some(PNG.to_owned()),
-		content_disposition: Some(content_disposition),
-		..data
-	};
-
 	// Save thumbnail in database so we don't have to generate it again next time
-	let thumbnail_key = self.db.create_file_metadata(
-		mxc,
-		None,
-		dim,
-		data.content_disposition.as_ref(),
-		data.content_type.as_deref(),
-	)?;
+	let thumbnail_key =
+		self.db
+			.create_file_metadata(mxc, None, dim, Some(&content_disposition), Some(PNG))?;
 
 	self.create_media_file(&thumbnail_key, &thumbnail_bytes)
 		.await?;
 
-	Ok(into_media(data, thumbnail_bytes))
-}
-
-#[cfg(not(feature = "media_thumbnail"))]
-#[implement(super::Service)]
-#[tracing::instrument(name = "fallback", level = "debug", skip_all)]
-async fn get_thumbnail_generate(
-	&self,
-	_mxc: &Mxc<'_>,
-	_dim: &Dim,
-	data: Metadata,
-) -> Result<Media> {
-	self.get_thumbnail_saved(data).await
+	Ok(Media {
+		content: thumbnail_bytes,
+		content_type: Some(PNG.to_owned()),
+		content_disposition: Some(content_disposition),
+	})
 }
 
 /// Decode a picture whose header declares no more than the configured pixel

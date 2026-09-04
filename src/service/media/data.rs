@@ -15,7 +15,11 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
 
-use super::{Media, preview::CachedPreview, thumbnail::Dim};
+use super::{
+	Media,
+	preview::CachedPreview,
+	thumbnail::{Animate, Dim},
+};
 
 pub(crate) struct Data {
 	db: Arc<Database>,
@@ -290,46 +294,67 @@ impl Data {
 		keys.next().await.is_some()
 	}
 
+	/// Metadata for the row at these dimensions that best answers the request.
+	///
+	/// A row whose content type the request accepts wins when the prefix holds
+	/// one, and otherwise any row does, so the caller can repair a variant it
+	/// cannot serve rather than refuse media the server holds. One cursor walk
+	/// harvests both, since a second seek would cost every fallback a scan.
 	pub(super) async fn search_file_metadata(
 		&self,
 		mxc: &Mxc<'_>,
 		dim: &Dim,
+		animate: Animate,
 	) -> Result<Metadata> {
 		let dim: &[u32] = &[dim.width, dim.height];
 		let prefix = (mxc, dim, Interfix);
 
-		let keys = self
+		let (accepted, rejected) = self
 			.mediaid_file
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.map(ToOwned::to_owned);
+			.ready_fold((None, None), |(accepted, rejected), key: &[u8]| {
+				// owning only what is retained; the rest of the prefix is walked
+				// past and never copied
+				match animate.accepts(key_content_type(key)) {
+					| true if accepted.is_none() => (Some(key.to_owned()), rejected),
+					| false if rejected.is_none() => (accepted, Some(key.to_owned())),
+					| _ => (accepted, rejected),
+				}
+			})
+			.await;
 
-		pin_mut!(keys);
-		let key = keys
-			.next()
-			.await
+		let key = accepted
+			.or(rejected)
 			.ok_or_else(|| err!(Request(NotFound("Media not found"))))?;
 
-		let mut parts = key.rsplit(|&b| b == 0xFF);
+		// the borrow the parse takes ends before the key is moved into the result
+		let (content_type, content_disposition) = {
+			let mut parts = key_parts(&key);
 
-		let content_type = parts
-			.next()
-			.map(string_from_bytes)
-			.transpose()
-			.map_err(|e| err!(Database(error!(?mxc, "Content-type is invalid: {e}"))))?;
+			let content_type = parts
+				.next()
+				.map(string_from_bytes)
+				.transpose()
+				.map_err(|e| err!(Database(error!(?mxc, "Content-type is invalid: {e}"))))?;
 
-		let content_disposition = parts
-			.next()
-			.map(Some)
-			.ok_or_else(|| err!(Database(error!(?mxc, "Media ID in db is invalid."))))?
-			.filter(|bytes| !bytes.is_empty())
-			.map(string_from_bytes)
-			.transpose()
-			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?
-			.as_deref()
-			.map(str::parse)
-			.transpose()
-			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?;
+			let content_disposition = parts
+				.next()
+				.map(Some)
+				.ok_or_else(|| err!(Database(error!(?mxc, "Media ID in db is invalid."))))?
+				.filter(|bytes| !bytes.is_empty())
+				.map(string_from_bytes)
+				.transpose()
+				.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?
+				.as_deref()
+				.map(str::parse)
+				.transpose()
+				.map_err(|e| {
+					err!(Database(error!(?mxc, "Content-disposition is invalid: {e}")))
+				})?;
+
+			(content_type, content_disposition)
+		};
 
 		Ok(Metadata { content_disposition, content_type, key })
 	}
@@ -397,6 +422,20 @@ impl Data {
 			.ignore_err()
 			.map(|(mxc, user): (&str, &UserId)| (mxc.into(), user.to_owned()))
 	}
+}
+
+/// Components of a `mediaid_file` key, innermost first.
+///
+/// The key is joined on `0xFF` with the content type last and the content
+/// disposition before it, so splitting from the right yields the two the
+/// caller wants without walking the mxc and dimensions ahead of them.
+fn key_parts(key: &[u8]) -> impl Iterator<Item = &[u8]> { key.rsplit(|&b| b == 0xFF) }
+
+fn key_content_type(key: &[u8]) -> Option<&str> {
+	key_parts(key)
+		.next()
+		.map(str_from_bytes)
+		.and_then(Result::ok)
 }
 
 #[cfg(feature = "url_preview")]

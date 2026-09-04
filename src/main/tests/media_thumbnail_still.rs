@@ -1,0 +1,158 @@
+#![cfg(test)]
+#![cfg(feature = "media_thumbnail")]
+
+use std::{env::var, fs::remove_dir_all, path::PathBuf, process::id as process_id};
+
+use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
+use tuwunel_core::{Err, Result, ruma::Mxc};
+use tuwunel_service::{
+	Services,
+	media::{Animate, Dim},
+};
+
+/// A one-by-one GIF, the smallest picture that carries `image/gif` and decodes.
+///
+/// The size is load-bearing. Every thumbnail bucket is larger, so every
+/// in-bucket request upscales and reaches the passthrough branch.
+const GIF: &[u8] = &[
+	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x3B,
+];
+
+/// One media per case, since the variant a request stores is visible to every
+/// later request for the same picture.
+///
+/// Sharing one would make each case's answer depend on the cases that ran
+/// before it rather than on the request under test.
+const STILL_ID: &str = "stillthumbnailregressionmediaid0";
+const ANIMATED_ID: &str = "animatedthumbnailregressionmedia";
+
+const GIF_TYPE: &str = "image/gif";
+
+const PNG_TYPE: &str = "image/png";
+
+struct DatabasePath(PathBuf);
+
+impl Drop for DatabasePath {
+	fn drop(&mut self) { remove_dir_all(&self.0).ok(); }
+}
+
+/// A request forbidding animation is never answered with an animated file.
+///
+/// The same picture still animates for a request that permits it, so the rule
+/// is shown to withhold rather than to have broken generation outright.
+#[test]
+fn still_request_is_never_answered_with_an_animated_file() -> Result {
+	let root = var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+	let db_path = DatabasePath(
+		PathBuf::from(root).join(format!("tuwunel-media-thumbnail-still-{}", process_id())),
+	);
+
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_option(format!("database_path={:?}", db_path.0));
+
+	args.maintenance = true;
+
+	let runtime = Runtime::new(Some(&args))?;
+	let server = Server::new(Some(&args), Some(&runtime))?;
+	let result = runtime.block_on(async {
+		let services = async_start(&server).await?;
+		let outcome = exercise(&services).await;
+		let shutdown = server.server.shutdown();
+
+		drop(services);
+
+		let run = async_run(&server).await;
+		let stop = async_stop(&server).await;
+
+		outcome.and(shutdown).and(run).and(stop)
+	});
+
+	drop(runtime);
+
+	result
+}
+
+async fn exercise(services: &Services) -> Result {
+	let still = upload(services, STILL_ID).await?;
+	let animated = upload(services, ANIMATED_ID).await?;
+
+	// an absent parameter forbids animation exactly as an explicit false does,
+	// so both must re-encode rather than pass the original through
+	for animate in [Animate::Never, Animate::from(None), Animate::from(Some(false))] {
+		let content_type = thumbnail_type(services, &still, 32, 32, animate).await?;
+
+		if content_type != PNG_TYPE {
+			return Err!("{animate:?} was answered with {content_type}, expected {PNG_TYPE}");
+		}
+	}
+
+	// the same picture, untouched by a still request, still animates for one
+	let content_type = thumbnail_type(services, &animated, 32, 32, Animate::Allowed).await?;
+
+	if content_type != GIF_TYPE {
+		return Err!("animated request was answered with {content_type}, expected {GIF_TYPE}");
+	}
+
+	// an animated request accepts any stored variant, so the still a forbidding
+	// request cached answers permitting ones until an encoder can beat it
+	let content_type = thumbnail_type(services, &still, 32, 32, Animate::Allowed).await?;
+
+	if content_type != PNG_TYPE {
+		return Err!("expected the stored still to answer, got {content_type}");
+	}
+
+	oversized_request_serves_the_original(services, &still).await
+}
+
+async fn upload<'a>(services: &'a Services, media_id: &'a str) -> Result<Mxc<'a>> {
+	let mxc = Mxc {
+		server_name: services.globals.server_name(),
+		media_id,
+	};
+
+	services
+		.media
+		.create(&mxc, None, None, Some(GIF_TYPE), GIF)
+		.await?;
+
+	Ok(mxc)
+}
+
+async fn thumbnail_type(
+	services: &Services,
+	mxc: &Mxc<'_>,
+	width: u32,
+	height: u32,
+	animate: Animate,
+) -> Result<String> {
+	services
+		.media
+		.get_stored_thumbnail(mxc, &Dim::new(width, height, None), animate)
+		.await
+		.map(|media| media.content_type.unwrap_or_default())
+}
+
+/// A request past the largest bucket names the original rather than a size.
+///
+/// Withholding a variant there would hide the original and ask for a picture
+/// of zero dimensions, which no encoder accepts.
+async fn oversized_request_serves_the_original(services: &Services, mxc: &Mxc<'_>) -> Result {
+	let media = services
+		.media
+		.get_stored_thumbnail(mxc, &Dim::new(1200, 900, None), Animate::Never)
+		.await?;
+
+	let content_type = media.content_type.as_deref().unwrap_or_default();
+
+	if content_type != GIF_TYPE {
+		return Err!("oversized request was answered with {content_type}, expected {GIF_TYPE}");
+	}
+
+	if media.content != GIF {
+		return Err!("oversized request did not return the original file");
+	}
+
+	Ok(())
+}

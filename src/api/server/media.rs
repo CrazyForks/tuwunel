@@ -6,7 +6,7 @@ use ruma::{
 	},
 };
 use tuwunel_core::{Result, utils::content_disposition::make_content_disposition};
-use tuwunel_service::media::{Dim, Media};
+use tuwunel_service::media::{Animate, Dim, Media};
 
 use crate::{ClientIp, Ruma};
 
@@ -65,6 +65,7 @@ pub(crate) async fn get_content_thumbnail_route(
 	body: Ruma<get_content_thumbnail::v1::Request>,
 ) -> Result<get_content_thumbnail::v1::Response> {
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
+	let animate = Animate::from(body.animated);
 	let mxc = Mxc {
 		server_name: services.globals.server_name(),
 		media_id: &body.media_id,
@@ -76,7 +77,7 @@ pub(crate) async fn get_content_thumbnail_route(
 		content_disposition,
 	} = services
 		.media
-		.get_thumbnail(&mxc, &dim, None)
+		.get_thumbnail(&mxc, &dim, animate, None)
 		.await?;
 
 	let content_disposition =

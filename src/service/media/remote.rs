@@ -17,7 +17,7 @@ use tuwunel_core::{
 };
 use url::Url;
 
-use super::{Dim, Media, preview::Agent};
+use super::{Animate, Dim, Media, preview::Agent};
 use crate::{
 	client::read_response_capped,
 	federation::scheme::{FedAuth, FedPath},
@@ -41,18 +41,19 @@ pub async fn fetch_remote_thumbnail(
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
+	animate: Animate,
 ) -> Result<Media> {
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
-		.fetch_thumbnail_authenticated(mxc, server, timeout_ms, dim)
+		.fetch_thumbnail_authenticated(mxc, server, timeout_ms, dim, animate)
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
 		&& self.services.server.config.request_legacy_media
 	{
 		return self
-			.fetch_thumbnail_unauthenticated(mxc, server, timeout_ms, dim)
+			.fetch_thumbnail_unauthenticated(mxc, server, timeout_ms, dim, animate)
 			.await;
 	}
 
@@ -91,6 +92,7 @@ async fn fetch_thumbnail_authenticated(
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
+	animate: Animate,
 ) -> Result<Media> {
 	use federation::authenticated_media::get_content_thumbnail::v1::{Request, Response};
 
@@ -99,7 +101,7 @@ async fn fetch_thumbnail_authenticated(
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
 		height: dim.height.into(),
-		animated: true.into(),
+		animated: animate.into(),
 		timeout_ms,
 	};
 
@@ -147,13 +149,14 @@ async fn fetch_thumbnail_unauthenticated(
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
+	animate: Animate,
 ) -> Result<Media> {
 	use media::get_content_thumbnail::v3::{Request, Response};
 
 	let request = Request {
 		allow_remote: true,
 		allow_redirect: true,
-		animated: true.into(),
+		animated: animate.into(),
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
 		height: dim.height.into(),
@@ -393,6 +396,8 @@ pub async fn fetch_remote_thumbnail_legacy(
 	&self,
 	body: &media::get_content_thumbnail::v3::Request,
 ) -> Result<media::get_content_thumbnail::v3::Response> {
+	use media::get_content_thumbnail::v3::Response;
+
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
@@ -417,10 +422,34 @@ pub async fn fetch_remote_thumbnail_legacy(
 		.await?;
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
-	self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
+	let animate = Animate::from(body.animated);
+
+	if animate.accepts(response.content_type.as_deref()) {
+		self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
+			.await?;
+
+		return Ok(response);
+	}
+
+	// this arm hands the bytes straight to the client, so a peer that ignored
+	// the parameter is repaired here rather than cached as the answer
+	let fetched = Media {
+		content: response.file,
+		content_type: response.content_type.map(Into::into),
+		content_disposition: response.content_disposition,
+	};
+
+	let still = self
+		.store_still(&mxc, &dim.normalized(), fetched)
 		.await?;
 
-	Ok(response)
+	Ok(Response {
+		file: still.content,
+		content_type: still.content_type.map(Into::into),
+		content_disposition: still.content_disposition,
+		cross_origin_resource_policy: response.cross_origin_resource_policy,
+		cache_control: response.cache_control,
+	})
 }
 
 #[implement(super::Service)]
