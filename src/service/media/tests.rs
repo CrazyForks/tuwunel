@@ -104,7 +104,7 @@ mod animate {
 	fn still_request_withholds_every_animated_type() {
 		for content_type in ANIMATED_TYPES {
 			assert!(
-				!Animate::Never.accepts(Some(content_type)),
+				!Animate::Never.accepts_type(Some(content_type)),
 				"{content_type} must not answer a still request"
 			);
 		}
@@ -119,7 +119,10 @@ mod animate {
 		for content_type in
 			[Some("image/png"), Some("image/jpeg"), Some("image/png; charset=binary"), None]
 		{
-			assert!(Animate::Never.accepts(content_type), "{content_type:?} must be servable");
+			assert!(
+				Animate::Never.accepts_type(content_type),
+				"{content_type:?} must be servable"
+			);
 		}
 	}
 
@@ -130,7 +133,10 @@ mod animate {
 	#[test]
 	fn animated_request_accepts_anything() {
 		for content_type in [Some("image/gif"), Some("image/png"), None] {
-			assert!(Animate::Allowed.accepts(content_type), "{content_type:?} must be servable");
+			assert!(
+				Animate::Allowed.accepts_type(content_type),
+				"{content_type:?} must be servable"
+			);
 		}
 	}
 
@@ -140,9 +146,9 @@ mod animate {
 	/// so the match tolerates the parameters and casing a peer may attach.
 	#[test]
 	fn withholding_survives_parameters_and_casing() {
-		assert!(!Animate::Never.accepts(Some("image/GIF")));
-		assert!(!Animate::Never.accepts(Some("image/gif; charset=binary")));
-		assert!(!Animate::Never.accepts(Some("Image/WebP ")));
+		assert!(!Animate::Never.accepts_type(Some("image/GIF")));
+		assert!(!Animate::Never.accepts_type(Some("image/gif; charset=binary")));
+		assert!(!Animate::Never.accepts_type(Some("Image/WebP ")));
 	}
 
 	/// A type merely spelled like an animated one is a different type.
@@ -151,8 +157,8 @@ mod animate {
 	/// longer subtype nor a different top-level type is withheld.
 	#[test]
 	fn withholding_does_not_reach_beyond_the_family() {
-		assert!(Animate::Never.accepts(Some("image/gifted")));
-		assert!(Animate::Never.accepts(Some("video/webp")));
+		assert!(Animate::Never.accepts_type(Some("image/gifted")));
+		assert!(Animate::Never.accepts_type(Some("video/webp")));
 	}
 
 	/// A request too large to thumbnail normalizes to the sentinel.
@@ -175,6 +181,91 @@ mod animate {
 		assert_eq!(Animate::Never.at(&Dim::default()), Animate::Allowed);
 		assert_eq!(Animate::Never.at(&scale(1200, 900).normalized()), Animate::Allowed);
 		assert_eq!(Animate::Never.at(&scale(800, 600).normalized()), Animate::Never);
+	}
+}
+
+mod sniff {
+	use super::super::thumbnail::animates;
+
+	/// A PNG whose chunks reach the pixel data without an animation control.
+	const STILL_PNG: &[u8] =
+		b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x00IDATCRC2";
+
+	/// The same, with the control chunk an APNG carries ahead of its data.
+	const ANIMATED_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x08acTL01234567CRC2\x00\x00\x00\x00IDATCRC3";
+
+	/// A WebP opening with a plain lossy chunk, which cannot animate.
+	const STILL_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 \x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
+	/// A WebP whose extended header sets the animation bit.
+	const ANIMATED_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00";
+
+	/// The same extended header with every flag but animation set.
+	const EXTENDED_STILL_WEBP: &[u8] =
+		b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\xfd\x00\x00\x00";
+
+	/// A GIF holding one image descriptor, no colour tables, no extensions.
+	const STILL_GIF: &[u8] =
+		b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x3b";
+
+	/// The same with a second image descriptor, which is what animates a GIF.
+	const ANIMATED_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x3b";
+
+	/// The frame count of an animation is written nowhere in any of the three.
+	///
+	/// Each format announces it differently, so the three are pinned together
+	/// to keep one from being taught a rule that only suits another.
+	#[test]
+	fn animation_is_read_from_the_container() {
+		assert!(animates(ANIMATED_PNG), "an acTL chunk makes a PNG an APNG");
+		assert!(animates(ANIMATED_WEBP), "the extended header sets the animation bit");
+		assert!(animates(ANIMATED_GIF), "a second image descriptor animates a GIF");
+	}
+
+	/// A still of each format is servable, whatever its family can also carry.
+	///
+	/// This is the half the declared content type gets wrong: `image/webp` and
+	/// `image/gif` name families rather than frame counts.
+	#[test]
+	fn a_still_is_not_withheld_for_the_company_it_keeps() {
+		assert!(!animates(STILL_PNG));
+		assert!(!animates(STILL_WEBP));
+		assert!(!animates(EXTENDED_STILL_WEBP), "an extended header alone is not an animation");
+		assert!(!animates(STILL_GIF));
+	}
+
+	/// Bytes a prefix needs before it names which format it is a prefix of.
+	///
+	/// Below this the walk has no container to enter, which is the unrecognized
+	/// case rather than the truncated one.
+	const IDENTIFIED: usize = 16;
+
+	/// An animation cannot be truncated into a still.
+	///
+	/// A walk that runs out of bytes has not shown the picture to be still, so
+	/// every prefix of each of the three is withheld rather than served.
+	#[test]
+	fn a_picture_cut_short_is_withheld() {
+		for source in [ANIMATED_PNG, ANIMATED_WEBP, ANIMATED_GIF] {
+			for len in IDENTIFIED..source.len() {
+				let Some(prefix) = source.get(..len) else {
+					continue;
+				};
+
+				assert!(animates(prefix), "a {len} byte prefix was answered as a still");
+			}
+		}
+	}
+
+	/// Nothing that is not one of the three animating formats is withheld.
+	///
+	/// A JPEG or a text file reaching the classifier must pass, since the rule
+	/// exists to withhold animation rather than to police formats.
+	#[test]
+	fn an_unrecognized_container_animates_nothing() {
+		assert!(!animates(b""));
+		assert!(!animates(b"\xff\xd8\xff\xe0 jpeg"));
+		assert!(!animates(b"not a picture at all"));
 	}
 }
 

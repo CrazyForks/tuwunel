@@ -316,7 +316,7 @@ impl Data {
 			.ready_fold((None, None), |(accepted, rejected), key: &[u8]| {
 				// owning only what is retained; the rest of the prefix is walked
 				// past and never copied
-				match animate.accepts(key_content_type(key)) {
+				match animate.accepts_type(key_content_type(key)) {
 					| true if accepted.is_none() => (Some(key.to_owned()), rejected),
 					| false if rejected.is_none() => (accepted, Some(key.to_owned())),
 					| _ => (accepted, rejected),

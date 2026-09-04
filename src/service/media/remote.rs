@@ -424,7 +424,7 @@ pub async fn fetch_remote_thumbnail_legacy(
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
 	let animate = Animate::from(body.animated);
 
-	if animate.accepts(response.content_type.as_deref()) {
+	if animate.accepts_picture(&response.file) {
 		self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
 			.await?;
 

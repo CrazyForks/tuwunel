@@ -546,7 +546,7 @@ impl Service {
 
 		// a redirect hands over the stored object as it is, so a variant the
 		// request forbids has to fall through to the re-encoding path
-		if !animate.accepts(content_type.as_deref()) {
+		if !animate.accepts_type(content_type.as_deref()) {
 			return Ok(None);
 		}
 

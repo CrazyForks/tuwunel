@@ -137,7 +137,7 @@ impl super::Service {
 
 		// a peer may ignore the parameter and this answers the caller directly,
 		// so the variant is repaired before it leaves rather than one request on
-		if animate.accepts(media.content_type.as_deref()) {
+		if animate.accepts_picture(&media.content) {
 			return Ok(media);
 		}
 
@@ -228,7 +228,7 @@ impl super::Service {
 		{
 			// a peer ignoring the animated parameter answers with an animated
 			// passthrough, which is re-derived here rather than refused
-			return match animate.accepts(metadata.content_type.as_deref()) {
+			return match animate.accepts_type(metadata.content_type.as_deref()) {
 				| true => self.get_thumbnail_saved(metadata).await,
 				| false =>
 					self.get_thumbnail_still(mxc, &dim, metadata)
@@ -416,9 +416,7 @@ async fn get_thumbnail_generate(
 	// a video is never servable in place of its own thumbnail, so its frame is
 	// re-encoded however small it is
 	let source = Dim::new(image.width(), image.height(), None);
-	let servable = animate.accepts(media.content_type.as_deref());
-
-	if !from_video && servable && dim.is_passthrough(&source)? {
+	if !from_video && dim.is_passthrough(&source)? && animate.accepts_picture(&media.content) {
 		return Ok(into_media(data, media.content));
 	}
 
@@ -564,13 +562,24 @@ impl Animate {
 
 	/// Returns true when content of this type may answer the request.
 	///
-	/// Only the request forbidding animation discriminates, and it withholds
-	/// every type an animation may arrive in rather than decoding to find out.
+	/// This reads the declared type, which whoever uploaded the picture chose,
+	/// so it is only for deciding between stored rows, where the pictures
+	/// themselves are not in hand. Prefer [`Self::accepts_picture`] anywhere
+	/// the bytes are.
 	#[inline]
 	#[must_use]
-	pub fn accepts(self, content_type: Option<&str>) -> bool {
+	pub fn accepts_type(self, content_type: Option<&str>) -> bool {
 		self.allowed() || !content_type.is_some_and(is_animated_type)
 	}
+
+	/// Returns true when this picture may answer the request.
+	///
+	/// The bytes decide, so a file cannot pass a request that forbade
+	/// animation by declaring a content type that does not animate, and an
+	/// APNG is caught despite being an `image/png` like every thumbnail.
+	#[inline]
+	#[must_use]
+	pub fn accepts_picture(self, bytes: &[u8]) -> bool { self.allowed() || !animates(bytes) }
 
 	/// The preference in force at these dimensions.
 	///
@@ -598,6 +607,241 @@ impl From<Option<bool>> for Animate {
 
 impl From<Animate> for Option<bool> {
 	fn from(animate: Animate) -> Self { Some(animate.allowed()) }
+}
+
+/// Signature every PNG and APNG begins with.
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Chunk carrying an APNG's frame count, which a still PNG never holds.
+const PNG_ANIMATION: &[u8] = b"acTL";
+
+/// Chunk opening the pixel data, which every animation control precedes.
+const PNG_DATA: &[u8] = b"IDAT";
+
+/// Bit set in a WebP extended header when the file carries an animation.
+const WEBP_ANIMATION: u8 = 0x02;
+
+/// Bit set in a GIF descriptor when a colour table follows it.
+const GIF_COLOR_TABLE: u8 = 0x80;
+
+/// Field holding the exponent of a GIF colour table's entry count.
+const GIF_TABLE_SIZE: u8 = 0x07;
+
+/// Introducers the blocks of a GIF body begin with.
+const GIF_EXTENSION: u8 = 0x21;
+const GIF_IMAGE: u8 = 0x2C;
+const GIF_TRAILER: u8 = 0x3B;
+
+/// Blocks a sniff walks before it gives up on a picture.
+///
+/// A crafted file can chain small blocks without end, so the walk stops at a
+/// bound and reports animation rather than spending anything more on it.
+const SNIFF_BLOCKS: usize = 128;
+
+/// Whether these bytes carry more than one frame.
+///
+/// The container header decides this rather than the declared content type,
+/// which an upload takes from the client without checking it against the file.
+/// Anything the walk cannot settle counts as animated, so an unreadable
+/// picture is withheld rather than served against a request that forbade one.
+pub(super) fn animates(bytes: &[u8]) -> bool {
+	if bytes.starts_with(&PNG_MAGIC) {
+		return png_animates(bytes);
+	}
+
+	if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+		return webp_animates(bytes);
+	}
+
+	if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+		return gif_animates(bytes);
+	}
+
+	// no other format the thumbnailer decodes carries a frame sequence
+	false
+}
+
+/// Whether a PNG holds the control chunk that makes it an APNG.
+///
+/// That chunk is required to precede the pixel data, so reaching the data
+/// first settles the question without any of it being read.
+fn png_animates(bytes: &[u8]) -> bool {
+	let Some(mut rest) = bytes.get(PNG_MAGIC.len()..) else {
+		return true;
+	};
+
+	for _ in 0..SNIFF_BLOCKS {
+		let Some(kind) = rest.get(4..8) else {
+			return true;
+		};
+
+		if kind == PNG_ANIMATION {
+			return true;
+		}
+
+		if kind == PNG_DATA {
+			return false;
+		}
+
+		let Some(length) = rest
+			.get(..4)
+			.and_then(|field| <[u8; 4]>::try_from(field).ok())
+			.map(u32::from_be_bytes)
+		else {
+			return true;
+		};
+
+		// the length counts the data alone, which follows a four byte length
+		// and a four byte type and precedes a four byte checksum
+		let Some(next) = usize::try_from(length)
+			.ok()
+			.and_then(|length| length.checked_add(12))
+			.and_then(|skip| rest.get(skip..))
+		else {
+			return true;
+		};
+
+		rest = next;
+	}
+
+	true
+}
+
+/// Whether a WebP announces animation in its extended header.
+///
+/// Only the extended form can carry a frame sequence, so a file opening with
+/// a plain lossy or lossless chunk is a still without reading any further.
+fn webp_animates(bytes: &[u8]) -> bool {
+	let Some(chunk) = bytes.get(12..16) else {
+		return true;
+	};
+
+	if chunk != b"VP8X".as_slice() {
+		return false;
+	}
+
+	// a header cut short of its flags is unreadable rather than still
+	bytes
+		.get(20)
+		.is_none_or(|flags| flags & WEBP_ANIMATION != 0)
+}
+
+/// Whether a GIF holds more than one image descriptor.
+///
+/// Frame count is not written anywhere in the format, so the blocks are walked
+/// until a second image is found or the trailer ends them.
+fn gif_animates(bytes: &[u8]) -> bool {
+	let Some(&screen) = bytes.get(10) else {
+		return true;
+	};
+
+	let mut at = 13_usize;
+
+	if screen & GIF_COLOR_TABLE != 0 {
+		let Some(next) = at.checked_add(color_table_len(screen)) else {
+			return true;
+		};
+
+		at = next;
+	}
+
+	let mut images = 0_usize;
+
+	for _ in 0..SNIFF_BLOCKS {
+		let Some(&block) = bytes.get(at) else {
+			return true;
+		};
+
+		let Some(mut next) = at.checked_add(1) else {
+			return true;
+		};
+
+		match block {
+			| GIF_TRAILER => return false,
+			| GIF_EXTENSION => {
+				// the label, ahead of the sub-blocks every extension ends with
+				let Some(after) = next.checked_add(1) else {
+					return true;
+				};
+
+				next = after;
+			},
+			| GIF_IMAGE => {
+				images = images.saturating_add(1);
+
+				if images > 1 {
+					return true;
+				}
+
+				let Some(&local) = bytes.get(next.saturating_add(8)) else {
+					return true;
+				};
+
+				// the descriptor, then its own colour table, then the code size
+				let Some(after) = next.checked_add(9) else {
+					return true;
+				};
+
+				next = after;
+
+				if local & GIF_COLOR_TABLE != 0 {
+					let Some(after) = next.checked_add(color_table_len(local)) else {
+						return true;
+					};
+
+					next = after;
+				}
+
+				let Some(after) = next.checked_add(1) else {
+					return true;
+				};
+
+				next = after;
+			},
+			| _ => return true,
+		}
+
+		let Some(after) = skip_sub_blocks(bytes, next) else {
+			return true;
+		};
+
+		at = after;
+	}
+
+	true
+}
+
+/// Bytes the colour table this descriptor announces occupies.
+///
+/// The size field is an exponent rather than a count, and each entry is a
+/// three byte colour.
+fn color_table_len(packed: u8) -> usize {
+	let exponent = u32::from(packed & GIF_TABLE_SIZE).saturating_add(1);
+
+	2_usize.saturating_pow(exponent).saturating_mul(3)
+}
+
+/// The offset past the sub-block chain beginning here, if it ends.
+///
+/// Each block announces its own length and a zero length closes the chain, so
+/// a chain that neither closes nor runs out is abandoned at the bound.
+fn skip_sub_blocks(bytes: &[u8], at: usize) -> Option<usize> {
+	let mut at = at;
+
+	for _ in 0..SNIFF_BLOCKS {
+		let &size = bytes.get(at)?;
+		let next = at
+			.checked_add(1)?
+			.checked_add(usize::from(size))?;
+
+		if size == 0 {
+			return Some(next);
+		}
+
+		at = next;
+	}
+
+	None
 }
 
 fn is_animated_type(content_type: &str) -> bool {
