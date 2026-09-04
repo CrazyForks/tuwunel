@@ -9,6 +9,7 @@
 use std::io::Cursor;
 use std::{cmp::min, num::Saturating as Sat, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use futures::{StreamExt, pin_mut};
 #[cfg(feature = "media_thumbnail")]
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
@@ -257,11 +258,27 @@ impl super::Service {
 	}
 }
 
-/// Using saved thumbnail
+/// Answers a thumbnail row from the picture already in storage.
+///
+/// The response hands its body over by value, so the bytes are converted
+/// rather than read in place; the conversion reclaims the storage buffer
+/// whenever this holds the only handle to it.
 #[implement(super::Service)]
 #[tracing::instrument(name = "saved", level = "debug", skip_all)]
 async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
-	let path = self.get_media_name_sha256(&data.key);
+	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+
+	Ok(into_media(data, bytes.into()))
+}
+
+/// The stored bytes for a thumbnail row, from the first provider holding them.
+///
+/// Returning the shared `Bytes` spares a caller that only reads the picture
+/// the `Vec` copy `Media` would force on it.
+#[implement(super::Service)]
+#[tracing::instrument(name = "fetch", level = "debug", skip_all)]
+async fn fetch_thumbnail_bytes(&self, key: &[u8]) -> Result<Bytes> {
+	let path = self.get_media_name_sha256(key);
 	let fetch = self
 		.storage_providers()
 		.stream()
@@ -274,11 +291,11 @@ async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
 		});
 
 	pin_mut!(fetch);
-	let Some(bytes) = fetch.next().await else {
-		return Err!(Request(NotFound("Media thumbnail not found.")));
-	};
 
-	Ok(into_media(data, bytes.to_vec()))
+	fetch
+		.next()
+		.await
+		.ok_or_else(|| err!(Request(NotFound("Media thumbnail not found."))))
 }
 
 /// Re-derive a still thumbnail from a stored animated one.
@@ -290,15 +307,36 @@ async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
 #[implement(super::Service)]
 #[tracing::instrument(name = "restill", level = "debug", skip(self, data))]
 async fn get_thumbnail_still(&self, mxc: &Mxc<'_>, dim: &Dim, data: Metadata) -> Result<Media> {
-	let animated = self.get_thumbnail_saved(data).await?;
+	// the sentinel names the original file rather than a size to re-encode at,
+	// and no encoder accepts the zero dimensions it would ask for
+	if dim.is_original() {
+		return self.get_thumbnail_saved(data).await;
+	}
 
-	self.store_still(mxc, dim, animated).await
+	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+	let image = self.decode_still(&bytes)?;
+
+	drop((bytes, data));
+
+	self.store_thumbnail(mxc, dim, image).await
 }
 
-/// Re-encode picture bytes as a still thumbnail and store it.
+/// Decodes a picture that may not be served in the state it is held in.
 ///
-/// A cached row and a fresh federation fetch both reach here, so a peer that
-/// ignores the parameter is repaired the same way a stale row is.
+/// Serving it is what the request forbade, so a decode that fails leaves
+/// nothing answerable and the caller has no fallback to offer.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+fn decode_still(&self, bytes: &[u8]) -> Result<DynamicImage> {
+	self.decode(bytes)
+		.map_err(|_| err!(Request(NotFound("Media thumbnail not found."))))
+}
+
+/// Re-encode a fetched picture as a still thumbnail and store it.
+///
+/// A peer that ignores the parameter answers a cold fetch with animation, and
+/// this repairs it on the way out rather than one request later. The cached
+/// row takes its own path, which already holds the picture.
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
 #[tracing::instrument(name = "still", level = "debug", skip(self, animated))]
@@ -314,15 +352,11 @@ pub(super) async fn store_still(
 		return Ok(animated);
 	}
 
-	// serving the picture is what the request forbade, so a decode that fails
-	// leaves nothing answerable
-	let Ok(image) = self.decode(&animated.content) else {
-		return Err!(Request(NotFound("Media thumbnail not found.")));
-	};
+	let image = self.decode_still(&animated.content)?;
 
 	drop(animated);
 
-	self.store_thumbnail(mxc, dim, &image).await
+	self.store_thumbnail(mxc, dim, image).await
 }
 
 #[cfg(not(feature = "media_thumbnail"))]
@@ -392,7 +426,7 @@ async fn get_thumbnail_generate(
 	// staged file, and the encode and the store must not hold it
 	drop(media);
 
-	self.store_thumbnail(mxc, dim, &image).await
+	self.store_thumbnail(mxc, dim, image).await
 }
 
 #[cfg(not(feature = "media_thumbnail"))]
@@ -415,14 +449,21 @@ async fn get_thumbnail_generate(
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
 #[tracing::instrument(name = "store", level = "debug", skip(self, image))]
-async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: &DynamicImage) -> Result<Media> {
+async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: DynamicImage) -> Result<Media> {
 	let mut thumbnail_bytes = Vec::new();
-	let thumbnail = thumbnail_generate(image, dim)?;
+	let thumbnail = thumbnail_generate(&image, dim)?;
+
+	// the source raster is dead once the thumbnail exists, and neither it nor
+	// the thumbnail may be held across the store below
+	drop(image);
+
 	let mut cursor = Cursor::new(&mut thumbnail_bytes);
 
 	thumbnail
 		.write_to(&mut cursor, ImageFormat::Png)
 		.map_err(|error| err!(error!(?error, "Error writing PNG thumbnail.")))?;
+
+	drop(thumbnail);
 
 	// a generated thumbnail is a PNG rather than the uploaded file, and carries
 	// the name the media repository specification asks of one whether or not the
