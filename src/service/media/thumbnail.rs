@@ -42,7 +42,11 @@ const THUMBNAIL_NAME: &str = "thumbnail.png";
 /// A still `image/webp` cannot be told from an animated one without decoding
 /// it, so the family is withheld whole. MSC2705 also names `image/png` for
 /// APNG, which cannot join the list because every generated thumbnail is one.
-pub(super) const ANIMATED_TYPES: [&str; 3] = ["image/apng", "image/gif", "image/webp"];
+const APNG: &str = "image/apng";
+const GIF: &str = "image/gif";
+const WEBP: &str = "image/webp";
+
+pub(super) const ANIMATED_TYPES: [&str; 3] = [APNG, GIF, WEBP];
 
 /// Dimension specification for a thumbnail.
 #[derive(Debug)]
@@ -226,14 +230,9 @@ impl super::Service {
 			.search_file_metadata(mxc, &dim, animate)
 			.await
 		{
-			// a peer ignoring the animated parameter answers with an animated
-			// passthrough, which is re-derived here rather than refused
-			return match animate.accepts_type(metadata.content_type.as_deref()) {
-				| true => self.get_thumbnail_saved(metadata).await,
-				| false =>
-					self.get_thumbnail_still(mxc, &dim, metadata)
-						.await,
-			};
+			return self
+				.answer_stored(mxc, &dim, animate, metadata)
+				.await;
 		}
 
 		// the original may be lazy preview media promoted on this very request;
@@ -263,6 +262,7 @@ impl super::Service {
 /// The response hands its body over by value, so the bytes are converted
 /// rather than read in place; the conversion reclaims the storage buffer
 /// whenever this holds the only handle to it.
+#[cfg(not(feature = "media_thumbnail"))]
 #[implement(super::Service)]
 #[tracing::instrument(name = "saved", level = "debug", skip_all)]
 async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
@@ -298,22 +298,30 @@ async fn fetch_thumbnail_bytes(&self, key: &[u8]) -> Result<Bytes> {
 		.ok_or_else(|| err!(Request(NotFound("Media thumbnail not found."))))
 }
 
-/// Re-derive a still thumbnail from a stored animated one.
+/// Answers a request from a stored row, re-deriving a still if it animates.
 ///
-/// A request forbidding animation would otherwise be refused over media the
-/// server already holds. Decoding the stored row answers it instead, and
-/// leaves a still variant behind for the next one.
+/// The type a row is stored under is whatever produced it claimed, and a peer
+/// is free to claim wrongly, so the picture itself decides once it is in hand.
+/// A row that may not answer is re-encoded and the still left behind for the
+/// next request.
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
-#[tracing::instrument(name = "restill", level = "debug", skip(self, data))]
-async fn get_thumbnail_still(&self, mxc: &Mxc<'_>, dim: &Dim, data: Metadata) -> Result<Media> {
+#[tracing::instrument(name = "stored", level = "debug", skip(self, data))]
+async fn answer_stored(
+	&self,
+	mxc: &Mxc<'_>,
+	dim: &Dim,
+	animate: Animate,
+	data: Metadata,
+) -> Result<Media> {
+	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+
 	// the sentinel names the original file rather than a size to re-encode at,
 	// and no encoder accepts the zero dimensions it would ask for
-	if dim.is_original() {
-		return self.get_thumbnail_saved(data).await;
+	if animate.accepts_picture(&bytes) || dim.is_original() {
+		return Ok(into_media(data, bytes.into()));
 	}
 
-	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
 	let image = self.decode_still(&bytes)?;
 
 	drop((bytes, data));
@@ -361,8 +369,14 @@ pub(super) async fn store_still(
 
 #[cfg(not(feature = "media_thumbnail"))]
 #[implement(super::Service)]
-#[tracing::instrument(name = "restill", level = "debug", skip_all)]
-async fn get_thumbnail_still(&self, _mxc: &Mxc<'_>, _dim: &Dim, data: Metadata) -> Result<Media> {
+#[tracing::instrument(name = "stored", level = "debug", skip_all)]
+async fn answer_stored(
+	&self,
+	_mxc: &Mxc<'_>,
+	_dim: &Dim,
+	_animate: Animate,
+	data: Metadata,
+) -> Result<Media> {
 	self.get_thumbnail_saved(data).await
 }
 
@@ -609,68 +623,80 @@ impl From<Animate> for Option<bool> {
 	fn from(animate: Animate) -> Self { Some(animate.allowed()) }
 }
 
-/// Signature every PNG and APNG begins with.
-const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// Signatures the three animating containers begin with.
+///
+/// A picture names its own format in its first bytes, and these are what
+/// `animated_type` matches before entering the walk that suits each one.
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const RIFF_MAGIC: &[u8] = b"RIFF";
+const WEBP_MAGIC: &[u8] = b"WEBP";
+const GIF_MAGIC: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
 
-/// Chunk carrying an APNG's frame count, which a still PNG never holds.
+/// Chunks a PNG walk stops at.
+///
+/// The animation control is required to precede the pixel data, so meeting
+/// the data first settles the question without reading any of it.
 const PNG_ANIMATION: &[u8] = b"acTL";
-
-/// Chunk opening the pixel data, which every animation control precedes.
 const PNG_DATA: &[u8] = b"IDAT";
 
-/// Bit set in a WebP extended header when the file carries an animation.
+/// Chunk a WebP carries its animation flag in, and the flag's own bit.
+///
+/// Only the extended form can hold a frame sequence, so a file opening with
+/// a plain lossy or lossless chunk is a still without reading further.
+const WEBP_EXTENDED: &[u8] = b"VP8X";
 const WEBP_ANIMATION: u8 = 0x02;
 
-/// Bit set in a GIF descriptor when a colour table follows it.
-const GIF_COLOR_TABLE: u8 = 0x80;
-
-/// Field holding the exponent of a GIF colour table's entry count.
-const GIF_TABLE_SIZE: u8 = 0x07;
-
 /// Introducers the blocks of a GIF body begin with.
+///
+/// A body is a flat sequence of these, ending at the trailer, and animation
+/// is the presence of a second image rather than anything the format states.
 const GIF_EXTENSION: u8 = 0x21;
 const GIF_IMAGE: u8 = 0x2C;
 const GIF_TRAILER: u8 = 0x3B;
 
-/// Blocks a sniff walks before it gives up on a picture.
+/// Bits a GIF descriptor announces a colour table with.
 ///
-/// A crafted file can chain small blocks without end, so the walk stops at a
-/// bound and reports animation rather than spending anything more on it.
-const SNIFF_BLOCKS: usize = 128;
+/// The flag says whether one follows and the size field holds the exponent of
+/// its entry count, each entry being a three byte colour.
+const GIF_COLOR_TABLE: u8 = 0x80;
+const GIF_TABLE_SIZE: u8 = 0x07;
 
 /// Whether these bytes carry more than one frame.
 ///
 /// The container header decides this rather than the declared content type,
 /// which an upload takes from the client without checking it against the file.
-/// Anything the walk cannot settle counts as animated, so an unreadable
-/// picture is withheld rather than served against a request that forbade one.
-pub(super) fn animates(bytes: &[u8]) -> bool {
-	if bytes.starts_with(&PNG_MAGIC) {
-		return png_animates(bytes);
-	}
+pub(super) fn animates(bytes: &[u8]) -> bool { animated_type(bytes).is_some() }
 
-	if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
-		return webp_animates(bytes);
+/// The content type an animating picture ought to be stored under.
+///
+/// A picture that does not animate answers `None`, its declared type being no
+/// worse than anything read from its header, and so does one in any other
+/// format, none of which carries a frame sequence. Anything a walk cannot
+/// settle counts as animated, so an unreadable picture is withheld rather
+/// than served against a request that forbade one.
+pub(super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
+	match bytes {
+		| _ if bytes.starts_with(PNG_MAGIC) => png_animates(bytes).then_some(APNG),
+		| _ if bytes.starts_with(RIFF_MAGIC) && bytes.get(8..12) == Some(WEBP_MAGIC) =>
+			webp_animates(bytes).then_some(WEBP),
+		| _ if GIF_MAGIC
+			.iter()
+			.any(|magic| bytes.starts_with(magic)) =>
+			gif_animates(bytes).then_some(GIF),
+		| _ => None,
 	}
-
-	if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-		return gif_animates(bytes);
-	}
-
-	// no other format the thumbnailer decodes carries a frame sequence
-	false
 }
 
 /// Whether a PNG holds the control chunk that makes it an APNG.
 ///
-/// That chunk is required to precede the pixel data, so reaching the data
-/// first settles the question without any of it being read.
+/// Each hop clears a whole chunk, so the walk advances by at least its twelve
+/// byte frame every time and ends when a hop lands past the picture.
 fn png_animates(bytes: &[u8]) -> bool {
 	let Some(mut rest) = bytes.get(PNG_MAGIC.len()..) else {
 		return true;
 	};
 
-	for _ in 0..SNIFF_BLOCKS {
+	loop {
 		let Some(kind) = rest.get(4..8) else {
 			return true;
 		};
@@ -683,18 +709,13 @@ fn png_animates(bytes: &[u8]) -> bool {
 			return false;
 		}
 
-		let Some(length) = rest
-			.get(..4)
-			.and_then(|field| <[u8; 4]>::try_from(field).ok())
-			.map(u32::from_be_bytes)
-		else {
-			return true;
-		};
-
 		// the length counts the data alone, which follows a four byte length
 		// and a four byte type and precedes a four byte checksum
-		let Some(next) = usize::try_from(length)
-			.ok()
+		let Some(next) = rest
+			.get(..4)
+			.and_then(|field| field.try_into().ok())
+			.map(u32::from_be_bytes)
+			.and_then(|length| usize::try_from(length).ok())
 			.and_then(|length| length.checked_add(12))
 			.and_then(|skip| rest.get(skip..))
 		else {
@@ -703,69 +724,53 @@ fn png_animates(bytes: &[u8]) -> bool {
 
 		rest = next;
 	}
-
-	true
 }
 
 /// Whether a WebP announces animation in its extended header.
 ///
-/// Only the extended form can carry a frame sequence, so a file opening with
-/// a plain lossy or lossless chunk is a still without reading any further.
+/// The chunk name and the flags sit at fixed offsets, so this reads two
+/// fields and never walks; a header cut short of either is unreadable rather
+/// than still.
 fn webp_animates(bytes: &[u8]) -> bool {
-	let Some(chunk) = bytes.get(12..16) else {
-		return true;
-	};
-
-	if chunk != b"VP8X".as_slice() {
-		return false;
-	}
-
-	// a header cut short of its flags is unreadable rather than still
-	bytes
-		.get(20)
-		.is_none_or(|flags| flags & WEBP_ANIMATION != 0)
+	bytes.get(12..16).is_none_or(|chunk| {
+		chunk == WEBP_EXTENDED
+			&& bytes
+				.get(20)
+				.is_none_or(|flags| flags & WEBP_ANIMATION != 0)
+	})
 }
 
 /// Whether a GIF holds more than one image descriptor.
 ///
-/// Frame count is not written anywhere in the format, so the blocks are walked
-/// until a second image is found or the trailer ends them.
+/// Frame count is written nowhere in the format, so the blocks are walked
+/// until a second image is found or the trailer ends them. Every block clears
+/// at least its own introducer and a terminating sub-block, so the offset
+/// rises on every pass and a walk that runs off the picture ends.
 fn gif_animates(bytes: &[u8]) -> bool {
 	let Some(&screen) = bytes.get(10) else {
 		return true;
 	};
 
-	let mut at = 13_usize;
+	// the logical screen descriptor, then the colour table it may announce
+	let table = match screen & GIF_COLOR_TABLE == 0 {
+		| true => Some(13_usize),
+		| false => 13_usize.checked_add(color_table_len(screen)),
+	};
 
-	if screen & GIF_COLOR_TABLE != 0 {
-		let Some(next) = at.checked_add(color_table_len(screen)) else {
-			return true;
-		};
-
-		at = next;
-	}
+	let Some(mut at) = table else {
+		return true;
+	};
 
 	let mut images = 0_usize;
 
-	for _ in 0..SNIFF_BLOCKS {
+	loop {
 		let Some(&block) = bytes.get(at) else {
 			return true;
 		};
 
-		let Some(mut next) = at.checked_add(1) else {
-			return true;
-		};
-
-		match block {
+		let next = match block {
 			| GIF_TRAILER => return false,
-			| GIF_EXTENSION => {
-				// the label, ahead of the sub-blocks every extension ends with
-				let Some(after) = next.checked_add(1) else {
-					return true;
-				};
-
-				next = after;
-			},
+			| GIF_EXTENSION => at.checked_add(2),
 			| GIF_IMAGE => {
 				images = images.saturating_add(1);
 
@@ -773,42 +778,34 @@ fn gif_animates(bytes: &[u8]) -> bool {
 					return true;
 				}
 
-				let Some(&local) = bytes.get(next.saturating_add(8)) else {
-					return true;
-				};
-
-				// the descriptor, then its own colour table, then the code size
-				let Some(after) = next.checked_add(9) else {
-					return true;
-				};
-
-				next = after;
-
-				if local & GIF_COLOR_TABLE != 0 {
-					let Some(after) = next.checked_add(color_table_len(local)) else {
-						return true;
-					};
-
-					next = after;
-				}
-
-				let Some(after) = next.checked_add(1) else {
-					return true;
-				};
-
-				next = after;
+				image_data_start(bytes, at)
 			},
 			| _ => return true,
-		}
+		};
 
-		let Some(after) = skip_sub_blocks(bytes, next) else {
+		let Some(after) = next.and_then(|next| skip_sub_blocks(bytes, next)) else {
 			return true;
 		};
 
 		at = after;
 	}
+}
 
-	true
+/// Where an image descriptor's own sub-blocks begin.
+///
+/// The descriptor is a fixed nine bytes carrying the flag for a colour table
+/// of its own, and one further byte holds the code size the data opens with.
+fn image_data_start(bytes: &[u8], at: usize) -> Option<usize> {
+	let descriptor = at.checked_add(1)?;
+	let local = *bytes.get(descriptor.checked_add(8)?)?;
+	let table = descriptor.checked_add(9)?;
+
+	match local & GIF_COLOR_TABLE == 0 {
+		| true => table.checked_add(1),
+		| false => table
+			.checked_add(color_table_len(local))?
+			.checked_add(1),
+	}
 }
 
 /// Bytes the colour table this descriptor announces occupies.
@@ -824,24 +821,19 @@ fn color_table_len(packed: u8) -> usize {
 /// The offset past the sub-block chain beginning here, if it ends.
 ///
 /// Each block announces its own length and a zero length closes the chain, so
-/// a chain that neither closes nor runs out is abandoned at the bound.
-fn skip_sub_blocks(bytes: &[u8], at: usize) -> Option<usize> {
-	let mut at = at;
-
-	for _ in 0..SNIFF_BLOCKS {
+/// every pass clears at least the length byte and a chain that neither closes
+/// nor runs out of picture cannot occur.
+fn skip_sub_blocks(bytes: &[u8], mut at: usize) -> Option<usize> {
+	loop {
 		let &size = bytes.get(at)?;
-		let next = at
+		at = at
 			.checked_add(1)?
 			.checked_add(usize::from(size))?;
 
 		if size == 0 {
-			return Some(next);
+			return Some(at);
 		}
-
-		at = next;
 	}
-
-	None
 }
 
 fn is_animated_type(content_type: &str) -> bool {

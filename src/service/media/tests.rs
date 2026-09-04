@@ -184,32 +184,53 @@ mod animate {
 	}
 }
 
-mod sniff {
+mod container {
 	use super::super::thumbnail::animates;
 
-	/// A PNG whose chunks reach the pixel data without an animation control.
+	/// Hand-built headers, since only the header is ever read.
+	///
+	/// Each pair is the animated and the still form of one container, so a
+	/// rule taught to one format cannot quietly pass for another, and the
+	/// bodies are whatever the walk skips over rather than real pictures.
 	const STILL_PNG: &[u8] =
 		b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x00IDATCRC2";
-
-	/// The same, with the control chunk an APNG carries ahead of its data.
 	const ANIMATED_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x08acTL01234567CRC2\x00\x00\x00\x00IDATCRC3";
-
-	/// A WebP opening with a plain lossy chunk, which cannot animate.
 	const STILL_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 \x00\x00\x00\x00\x00\x00\x00\x00\x00";
-
-	/// A WebP whose extended header sets the animation bit.
 	const ANIMATED_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00";
-
-	/// The same extended header with every flag but animation set.
 	const EXTENDED_STILL_WEBP: &[u8] =
 		b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\xfd\x00\x00\x00";
-
-	/// A GIF holding one image descriptor, no colour tables, no extensions.
 	const STILL_GIF: &[u8] =
 		b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x3b";
-
-	/// The same with a second image descriptor, which is what animates a GIF.
 	const ANIMATED_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00\x3b";
+
+	/// Bytes a prefix needs before it names which container it is a prefix of.
+	///
+	/// Below this there is nothing to enter, which is the unrecognized case
+	/// rather than the truncated one.
+	const NAMED_BYTES: usize = 16;
+
+	/// Sub-blocks to give a still GIF's one frame.
+	///
+	/// Real pictures run to thousands, each holding at most 255 bytes, so a
+	/// walk bounded by a count of them rather than by the picture would call
+	/// an ordinary still animated.
+	const MANY_SUB_BLOCKS: usize = 512;
+
+	/// A still GIF whose one frame is split across many sub-blocks.
+	fn long_still_gif() -> Vec<u8> {
+		let mut gif = STILL_GIF
+			.get(..STILL_GIF.len().saturating_sub(2))
+			.unwrap_or_default()
+			.to_vec();
+
+		for _ in 0..MANY_SUB_BLOCKS {
+			gif.extend_from_slice(b"\x01\x44");
+		}
+
+		gif.extend_from_slice(b"\x00\x3b");
+
+		gif
+	}
 
 	/// The frame count of an animation is written nowhere in any of the three.
 	///
@@ -234,11 +255,15 @@ mod sniff {
 		assert!(!animates(STILL_GIF));
 	}
 
-	/// Bytes a prefix needs before it names which format it is a prefix of.
+	/// A frame split across many sub-blocks is still one frame.
 	///
-	/// Below this the walk has no container to enter, which is the unrecognized
-	/// case rather than the truncated one.
-	const IDENTIFIED: usize = 16;
+	/// The walk hops sub-block to sub-block to reach the block after the
+	/// picture data, so its work is set by the picture rather than by a count
+	/// it could exhaust on an ordinary file.
+	#[test]
+	fn a_long_frame_does_not_become_an_animation() {
+		assert!(!animates(&long_still_gif()));
+	}
 
 	/// An animation cannot be truncated into a still.
 	///
@@ -246,11 +271,9 @@ mod sniff {
 	/// every prefix of each of the three is withheld rather than served.
 	#[test]
 	fn a_picture_cut_short_is_withheld() {
-		for source in [ANIMATED_PNG, ANIMATED_WEBP, ANIMATED_GIF] {
-			for len in IDENTIFIED..source.len() {
-				let Some(prefix) = source.get(..len) else {
-					continue;
-				};
+		for animation in [ANIMATED_PNG, ANIMATED_WEBP, ANIMATED_GIF] {
+			for len in NAMED_BYTES..animation.len() {
+				let prefix = animation.get(..len).unwrap_or(animation);
 
 				assert!(animates(prefix), "a {len} byte prefix was answered as a still");
 			}

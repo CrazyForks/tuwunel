@@ -12,10 +12,9 @@ use tuwunel_service::{
 
 /// A one-by-one GIF carrying two frames.
 ///
-/// Both properties are load-bearing. Every thumbnail bucket is larger, so
-/// every in-bucket request upscales and reaches the passthrough branch, and
-/// the second frame is what makes withholding it the rule under test rather
-/// than a decision about the content type it was uploaded under.
+/// Both properties are load-bearing. Every bucket is larger, so an in-bucket
+/// request upscales and reaches the passthrough branch, and the second frame
+/// is what puts withholding under test rather than the content type.
 const GIF: &[u8] = &[
 	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00,
@@ -31,6 +30,7 @@ const GIF: &[u8] = &[
 /// before it rather than on the request under test.
 const STILL_ID: &str = "stillthumbnailregressionmediaid0";
 const ANIMATED_ID: &str = "animatedthumbnailregressionmedia";
+const MISLABELED_ID: &str = "mislabeledthumbnailrowregression";
 
 const GIF_TYPE: &str = "image/gif";
 
@@ -107,7 +107,49 @@ async fn exercise(services: &Services) -> Result {
 		return Err!("expected the stored still to answer, got {content_type}");
 	}
 
-	oversized_request_serves_the_original(services, &still).await
+	oversized_request_serves_the_original(services, &still).await?;
+	a_row_is_judged_by_its_picture(services).await
+}
+
+/// A stored row that animates is withheld whatever type it was stored under.
+///
+/// Nothing local produces such a row, since every thumbnail this generates is
+/// a still PNG. A peer's APNG arrives labelled `image/png` honestly and is
+/// cached under that, and the row is then all a later request has to go on.
+async fn a_row_is_judged_by_its_picture(services: &Services) -> Result {
+	let mxc = Mxc {
+		server_name: services.globals.server_name(),
+		media_id: MISLABELED_ID,
+	};
+
+	let dim = Dim::new(32, 32, None);
+
+	services
+		.media
+		.upload_thumbnail(&mxc, None, Some(PNG_TYPE), &dim, GIF)
+		.await?;
+
+	// the permitting request runs first, which is the order that puts an
+	// animation in the cache for the forbidding ones behind it to meet
+	let served = services
+		.media
+		.get_stored_thumbnail(&mxc, &dim, Animate::Allowed)
+		.await?;
+
+	if served.content != GIF {
+		return Err!("a permitting request was refused the animation the row holds");
+	}
+
+	let withheld = services
+		.media
+		.get_stored_thumbnail(&mxc, &dim, Animate::Never)
+		.await?;
+
+	// the type is `image/png` either way, so the body is what tells them apart
+	match withheld.content == GIF {
+		| true => Err!("a still request was answered with the row's own animated picture"),
+		| false => Ok(()),
+	}
 }
 
 async fn upload<'a>(services: &'a Services, media_id: &'a str) -> Result<Mxc<'a>> {

@@ -17,7 +17,7 @@ use tuwunel_core::{
 };
 use url::Url;
 
-use super::{Animate, Dim, Media, preview::Agent};
+use super::{Animate, Dim, Media, preview::Agent, thumbnail::animated_type};
 use crate::{
 	client::read_response_capped,
 	federation::scheme::{FedAuth, FedPath},
@@ -219,19 +219,18 @@ async fn handle_thumbnail_file(
 		None,
 	);
 
-	self.upload_thumbnail(
-		mxc,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		dim,
-		&content.file,
-	)
-	.await
-	.map(|()| Media {
-		content: content.file,
-		content_type: content.content_type.map(Into::into),
-		content_disposition: Some(content_disposition),
-	})
+	// a peer's declared type is its own claim, and a row stored under one that
+	// denies its animation is indistinguishable from a still to every later
+	// lookup, which holds the key and not the picture
+	let content_type = animated_type(&content.file).or(content.content_type.as_deref());
+
+	self.upload_thumbnail(mxc, Some(&content_disposition), content_type, dim, &content.file)
+		.await
+		.map(|()| Media {
+			content: content.file,
+			content_type: content.content_type.map(Into::into),
+			content_disposition: Some(content_disposition),
+		})
 }
 
 #[implement(super::Service)]
