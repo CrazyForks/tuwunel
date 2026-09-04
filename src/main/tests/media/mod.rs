@@ -107,8 +107,10 @@ pub(crate) struct Answer {
 /// Three sizes span the `Dim::normalized` buckets: `1x1` upscales at every one
 /// and so reaches the passthrough branch, `100x100` straddles them, and
 /// `1000x800` is downscaled by all of them. The APNG uploads as `image/png`,
-/// which is how APNG is labelled in practice and the one animated shape a
-/// content type cannot name. The two truncated entries are the only bodies
+/// the one animated shape a content type cannot name, and `anim_as_png.gif`
+/// carries GIF bytes under that same declared type, since an upload stores the
+/// content type a client sends without checking it against the file. The two
+/// truncated entries are the only bodies
 /// that decode partway, one failing at the header and one part way through its
 /// frames, which is what keeps both failure sentinels honest.
 pub(crate) const CORPUS: &[Source] = &[
@@ -166,6 +168,11 @@ pub(crate) const CORPUS: &[Source] = &[
 		name: "anim_100x100.apng",
 		content_type: "image/png",
 		bytes: include_bytes!("fixtures/anim_100x100.apng"),
+	},
+	Source {
+		name: "anim_as_png.gif",
+		content_type: "image/png",
+		bytes: include_bytes!("fixtures/anim_100x100.gif"),
 	},
 	Source {
 		name: "notimage.txt",

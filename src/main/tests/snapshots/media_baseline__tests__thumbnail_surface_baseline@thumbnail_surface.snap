@@ -234,6 +234,27 @@ v1      anim_100x100.apng    800x600  scale anim=true   -> 200 image/png        
 v1      anim_100x100.apng   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f3         inline
 v1      anim_100x100.apng   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f3         inline
 v1      anim_100x100.apng   1024x768  scale anim=true   -> 200 image/png                Png 100x100 f3         inline
+v1      anim_as_png.gif       16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif      320x240  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      320x240  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      320x240  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      640x480  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      640x480  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      640x480  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      800x600  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      800x600  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif      800x600  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif     1024x768  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif     1024x768  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+v1      anim_as_png.gif     1024x768  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
 v1      notimage.txt          16x16   scale anim=absent -> 200 text/plain               not-an-image           inline
 v1      notimage.txt          16x16   scale anim=false  -> 200 text/plain               not-an-image           inline
 v1      notimage.txt          16x16   scale anim=true   -> 200 text/plain               not-an-image           inline
@@ -528,6 +549,27 @@ legacy  anim_100x100.apng    800x600  scale anim=true   -> 200 image/png        
 legacy  anim_100x100.apng   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f3         inline
 legacy  anim_100x100.apng   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f3         inline
 legacy  anim_100x100.apng   1024x768  scale anim=true   -> 200 image/png                Png 100x100 f3         inline
+legacy  anim_as_png.gif       16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif       96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+legacy  anim_as_png.gif      320x240  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      320x240  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      320x240  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      640x480  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      640x480  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      640x480  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      800x600  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      800x600  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif      800x600  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif     1024x768  scale anim=absent -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif     1024x768  scale anim=false  -> 200 image/png                Gif 100x100 f3         inline
+legacy  anim_as_png.gif     1024x768  scale anim=true   -> 200 image/png                Gif 100x100 f3         inline
 legacy  notimage.txt          16x16   scale anim=absent -> 200 text/plain               not-an-image           inline
 legacy  notimage.txt          16x16   scale anim=false  -> 200 text/plain               not-an-image           inline
 legacy  notimage.txt          16x16   scale anim=true   -> 200 text/plain               not-an-image           inline
