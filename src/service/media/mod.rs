@@ -41,7 +41,11 @@ use url::Url;
 #[cfg(feature = "media_thumbnail")]
 use self::video::{FAILURES, Failures, sweep_staging_dir};
 use self::{data::Data, preview::Agent, remote::Fetch};
-pub use self::{data::Metadata, preview::UrlPreviewData, thumbnail::Dim};
+pub use self::{
+	data::Metadata,
+	preview::UrlPreviewData,
+	thumbnail::{Animate, Dim},
+};
 use crate::storage::Provider;
 
 #[derive(Debug)]

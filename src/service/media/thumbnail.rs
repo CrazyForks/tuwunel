@@ -36,12 +36,34 @@ const BYTES_PER_PIXEL: u64 = 4;
 #[cfg(feature = "media_thumbnail")]
 const THUMBNAIL_NAME: &str = "thumbnail.png";
 
+/// Content types withheld from a request that asked for a still picture.
+///
+/// A still `image/webp` cannot be told from an animated one without decoding
+/// it, so the family is withheld whole. MSC2705 also names `image/png` for
+/// APNG, which cannot join the list because every generated thumbnail is one.
+pub(super) const ANIMATED_TYPES: [&str; 3] = ["image/apng", "image/gif", "image/webp"];
+
 /// Dimension specification for a thumbnail.
 #[derive(Debug)]
 pub struct Dim {
 	pub width: u32,
 	pub height: u32,
 	pub method: Method,
+}
+
+/// Whether a thumbnail request will accept an animated result.
+///
+/// MSC2705 gives the `animated` parameter three states and two behaviors: only
+/// `animated=true` may be answered with animation, while `animated=false` and
+/// an absent parameter alike forbid it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Animate {
+	/// The response must be a still picture.
+	#[default]
+	Never,
+
+	/// The response may animate.
+	Allowed,
 }
 
 impl super::Service {
@@ -380,6 +402,64 @@ fn into_media(data: Metadata, content: Vec<u8>) -> Media {
 	}
 }
 
+impl Animate {
+	/// Returns true when the request will accept animation.
+	///
+	/// Only `animated=true` reaches this state; `animated=false` and an absent
+	/// parameter alike forbid animation.
+	#[inline]
+	#[must_use]
+	pub fn allowed(self) -> bool { matches!(self, Self::Allowed) }
+
+	/// Returns true when content of this type may answer the request.
+	///
+	/// Only the request forbidding animation discriminates, and it withholds
+	/// every type an animation may arrive in rather than decoding to find out.
+	#[inline]
+	#[must_use]
+	pub fn accepts(self, content_type: Option<&str>) -> bool {
+		self.allowed() || !content_type.is_some_and(is_animated_type)
+	}
+
+	/// The preference in force at these dimensions.
+	///
+	/// The zero dimension is the sentinel for a request too large to thumbnail,
+	/// which is answered with the original file, and the original's own row is
+	/// keyed there. Nothing may be withheld from it: doing so both hides the
+	/// original and sends the request on to generate a zero-sized picture.
+	#[must_use]
+	pub fn at(self, dim: &Dim) -> Self {
+		match dim.is_original() {
+			| true => Self::Allowed,
+			| false => self,
+		}
+	}
+}
+
+impl From<Option<bool>> for Animate {
+	fn from(animated: Option<bool>) -> Self {
+		match animated {
+			| Some(true) => Self::Allowed,
+			| Some(false) | None => Self::Never,
+		}
+	}
+}
+
+impl From<Animate> for Option<bool> {
+	fn from(animate: Animate) -> Self { Some(animate.allowed()) }
+}
+
+fn is_animated_type(content_type: &str) -> bool {
+	let essence = content_type
+		.split_once(';')
+		.map_or(content_type, |(essence, _)| essence)
+		.trim();
+
+	ANIMATED_TYPES
+		.iter()
+		.any(|kind| essence.eq_ignore_ascii_case(kind))
+}
+
 impl Dim {
 	/// Instantiate a Dim from Ruma integers with optional method.
 	pub fn from_ruma(width: UInt, height: UInt, method: Option<Method>) -> Result<Self> {
@@ -471,6 +551,15 @@ impl Dim {
 	#[inline]
 	#[must_use]
 	pub fn crop(&self) -> bool { self.method == Method::Crop }
+
+	/// Returns true for the sentinel that stands for the original file.
+	///
+	/// Every request too large to thumbnail normalizes to zero by zero, which
+	/// is also the key the original itself is stored under, so nothing may be
+	/// withheld there.
+	#[inline]
+	#[must_use]
+	pub fn is_original(&self) -> bool { self.width == 0 && self.height == 0 }
 }
 
 impl Default for Dim {

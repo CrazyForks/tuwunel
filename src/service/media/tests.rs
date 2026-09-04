@@ -78,6 +78,106 @@ fn passthrough_when_crop_request_matches_source() {
 	);
 }
 
+mod animate {
+	use super::{
+		super::{Animate, Dim, thumbnail::ANIMATED_TYPES},
+		scale,
+	};
+
+	/// MSC2705 gives `animated` three states but only two behaviors.
+	///
+	/// An explicit `animated=true` is the only one that may be answered with
+	/// animation; `false` and an absent parameter alike forbid it.
+	#[test]
+	fn three_parameter_states_map_to_two_behaviors() {
+		assert_eq!(Animate::from(Some(true)), Animate::Allowed);
+		assert_eq!(Animate::from(Some(false)), Animate::Never);
+		assert_eq!(Animate::from(None), Animate::Never);
+	}
+
+	/// A request for a still picture must not be answered with any type an
+	/// animation can arrive in.
+	///
+	/// This is MSC2705's only MUST NOT. The list is the constant itself, so a
+	/// type added there is covered on sight.
+	#[test]
+	fn still_request_withholds_every_animated_type() {
+		for content_type in ANIMATED_TYPES {
+			assert!(
+				!Animate::Never.accepts(Some(content_type)),
+				"{content_type} must not answer a still request"
+			);
+		}
+	}
+
+	/// Withholding is confined to that family.
+	///
+	/// The still types a thumbnail is generated as must keep answering every
+	/// request, or the rule would withhold the very variant it asks for.
+	#[test]
+	fn still_request_accepts_still_types() {
+		for content_type in
+			[Some("image/png"), Some("image/jpeg"), Some("image/png; charset=binary"), None]
+		{
+			assert!(Animate::Never.accepts(content_type), "{content_type:?} must be servable");
+		}
+	}
+
+	/// A request that asked for animation is not owed one.
+	///
+	/// The MSC phrases animation as a SHOULD, so such a request accepts
+	/// whichever variant is on hand rather than refusing a still.
+	#[test]
+	fn animated_request_accepts_anything() {
+		for content_type in [Some("image/gif"), Some("image/png"), None] {
+			assert!(Animate::Allowed.accepts(content_type), "{content_type:?} must be servable");
+		}
+	}
+
+	/// Withholding survives the shapes a content type arrives in.
+	///
+	/// These reach the classifier from remote servers and stored keys alike,
+	/// so the match tolerates the parameters and casing a peer may attach.
+	#[test]
+	fn withholding_survives_parameters_and_casing() {
+		assert!(!Animate::Never.accepts(Some("image/GIF")));
+		assert!(!Animate::Never.accepts(Some("image/gif; charset=binary")));
+		assert!(!Animate::Never.accepts(Some("Image/WebP ")));
+	}
+
+	/// A type merely spelled like an animated one is a different type.
+	///
+	/// The match is on the whole essence rather than a prefix, so neither a
+	/// longer subtype nor a different top-level type is withheld.
+	#[test]
+	fn withholding_does_not_reach_beyond_the_family() {
+		assert!(Animate::Never.accepts(Some("image/gifted")));
+		assert!(Animate::Never.accepts(Some("video/webp")));
+	}
+
+	/// A request too large to thumbnail normalizes to the sentinel.
+	///
+	/// That sentinel stands for the original file, and is also the key the
+	/// original itself is stored under.
+	#[test]
+	fn oversized_request_normalizes_to_the_original_sentinel() {
+		assert!(scale(1200, 900).normalized().is_original());
+		assert!(!scale(800, 600).normalized().is_original());
+		assert!(!scale(32, 32).normalized().is_original());
+	}
+
+	/// Nothing may be withheld at that sentinel.
+	///
+	/// Withholding there hides the original from a request for a still and
+	/// sends it on to generate at zero dimensions, which no encoder accepts.
+	#[test]
+	fn the_original_sentinel_withholds_nothing() {
+		assert_eq!(Animate::Never.at(&Dim::default()), Animate::Allowed);
+		assert_eq!(Animate::Never.at(&scale(1200, 900).normalized()), Animate::Allowed);
+		assert_eq!(Animate::Never.at(&scale(800, 600).normalized()), Animate::Never);
+	}
+}
+
 #[cfg(feature = "media_thumbnail")]
 mod generate {
 	use image::{DynamicImage, RgbImage};
