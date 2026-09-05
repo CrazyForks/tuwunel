@@ -276,7 +276,7 @@ async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Re
 		return self.answer_promoted(mxc).await;
 	};
 
-	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+	let bytes = self.fetch_bytes(&data.key).await?;
 
 	if animate.accepts_picture(&bytes) {
 		return Ok(into_media(data, bytes.into()));
@@ -284,11 +284,15 @@ async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Re
 
 	let dim = picture_dim(&bytes);
 
-	if let Ok(metadata) = self
+	let stored = self
 		.db
 		.search_file_metadata(mxc, &dim, animate)
 		.await
-	{
+		.ok();
+
+	if let Some(metadata) = stored {
+		drop((bytes, data));
+
 		return self
 			.answer_stored(mxc, &dim, animate, metadata)
 			.await;
@@ -346,7 +350,7 @@ async fn answer_promoted(&self, mxc: &Mxc<'_>) -> Result<Media> {
 		.as_deref()
 		.is_some_and(|content_type| content_type.starts_with("image/"))
 		.then_some(media)
-		.ok_or_else(|| err!(Request(NotFound("Media thumbnail not found."))))
+		.ok_or_else(|| err!(Request(NotFound("Media not found."))))
 }
 
 /// The stored bytes for a thumbnail row, from the first provider holding them.
@@ -355,7 +359,7 @@ async fn answer_promoted(&self, mxc: &Mxc<'_>) -> Result<Media> {
 /// the `Vec` copy `Media` would force on it.
 #[implement(super::Service)]
 #[tracing::instrument(name = "fetch", level = "debug", skip_all)]
-async fn fetch_thumbnail_bytes(&self, key: &[u8]) -> Result<Bytes> {
+async fn fetch_bytes(&self, key: &[u8]) -> Result<Bytes> {
 	let path = self.get_media_name_sha256(key);
 	let fetch = self
 		.storage_providers()
@@ -373,7 +377,7 @@ async fn fetch_thumbnail_bytes(&self, key: &[u8]) -> Result<Bytes> {
 	fetch
 		.next()
 		.await
-		.ok_or_else(|| err!(Request(NotFound("Media thumbnail not found."))))
+		.ok_or_else(|| err!(Request(NotFound("Media not found."))))
 }
 
 /// The size a picture that may not be served stands in at.
@@ -406,7 +410,7 @@ async fn answer_stored(
 	animate: Animate,
 	data: Metadata,
 ) -> Result<Media> {
-	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+	let bytes = self.fetch_bytes(&data.key).await?;
 
 	if animate.accepts_picture(&bytes) {
 		return Ok(into_media(data, bytes.into()));
@@ -419,6 +423,10 @@ async fn answer_stored(
 	self.store_thumbnail(mxc, dim, image).await
 }
 
+/// Hands the stored row back whatever its picture holds.
+///
+/// Judging it would only be worth doing if a still could then be derived, and
+/// a build without the feature has no thumbnailer to derive one with.
 #[cfg(not(feature = "media_thumbnail"))]
 #[implement(super::Service)]
 #[tracing::instrument(name = "stored", level = "debug", skip_all)]
@@ -441,7 +449,7 @@ async fn answer_stored(
 #[implement(super::Service)]
 #[tracing::instrument(name = "saved", level = "debug", skip_all)]
 async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
-	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+	let bytes = self.fetch_bytes(&data.key).await?;
 
 	Ok(into_media(data, bytes.into()))
 }
@@ -500,6 +508,7 @@ pub(super) async fn store_still(
 ) -> Result<Media> {
 	Ok(animated)
 }
+
 /// Generate a thumbnail
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
@@ -511,9 +520,8 @@ async fn get_thumbnail_generate(
 	animate: Animate,
 	data: Metadata,
 ) -> Result<Media> {
-	let Ok(media) = self.get_stored(mxc).await else {
-		return Err!("Could not find original media.");
-	};
+	let bytes = self.fetch_bytes(&data.key).await?;
+	let media = into_media(data, bytes.into());
 
 	let frame = self.video_frame(mxc, dim, &media).await;
 	let from_video = frame.is_some();
@@ -526,7 +534,7 @@ async fn get_thumbnail_generate(
 		}
 
 		// Couldn't parse file to generate thumbnail, send original
-		return Ok(into_media(data, media.content));
+		return Ok(media);
 	};
 
 	drop(frame);
@@ -535,7 +543,7 @@ async fn get_thumbnail_generate(
 	// re-encoded however small it is
 	let source = Dim::new(image.width(), image.height(), None);
 	if !from_video && dim.is_passthrough(&source)? && animate.accepts_picture(&media.content) {
-		return Ok(into_media(data, media.content));
+		return Ok(media);
 	}
 
 	// nothing below reads the original, which on the video path is the whole
@@ -545,6 +553,10 @@ async fn get_thumbnail_generate(
 	self.store_thumbnail(mxc, dim, image).await
 }
 
+/// Hands the original back in place of the thumbnail it cannot generate.
+///
+/// The row this is given is the original's own, so the caller is answered with
+/// media the server holds rather than being refused outright.
 #[cfg(not(feature = "media_thumbnail"))]
 #[implement(super::Service)]
 #[tracing::instrument(name = "fallback", level = "debug", skip_all)]
@@ -597,11 +609,13 @@ async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: DynamicImage) -
 	self.create_media_file(&thumbnail_key, &thumbnail_bytes)
 		.await?;
 
-	Ok(Media {
+	let media = Media {
 		content: thumbnail_bytes,
 		content_type: Some(PNG.to_owned()),
 		content_disposition: Some(content_disposition),
-	})
+	};
+
+	Ok(media)
 }
 
 /// Decode a picture whose header declares no more than the configured pixel
