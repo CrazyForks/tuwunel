@@ -28,7 +28,7 @@ use tuwunel_core::{
 	smallstr::SmallString,
 	smallvec::SmallVec,
 	utils::{
-		BoolExt, IterStream, ReadyExt, TryFutureExtExt,
+		BoolExt, IterStream, OptionExt, ReadyExt, TryFutureExtExt,
 		hash::sha256::{
 			Digest as Sha256Digest, delimited as sha256_delimited, hash as sha256_hash,
 		},
@@ -98,9 +98,6 @@ pub(super) async fn handle_room(
 	let encrypted = services.state_accessor.is_encrypted_room(room_id);
 
 	let (timeline_limit, required_state) = room_details;
-	let required_state = membership_allows_required_state(membership.as_ref())
-		.then_some(required_state)
-		.unwrap_or_default();
 
 	let timeline = is_invite.is_false().then_async(|| {
 		load_timeline_fallible(
@@ -142,6 +139,11 @@ pub(super) async fn handle_room(
 	)
 	.map_err(Failure::Timeline)
 	.await?;
+
+	let required_state = membership_allows_required_state(membership.as_ref())
+		.and_is(state_may_have_changed(state_mode, last_timeline_count))
+		.then_some(required_state)
+		.unwrap_or_default();
 
 	let required_state = collect_required_state(
 		services,
@@ -308,6 +310,17 @@ fn membership_allows_required_state(membership: Option<&MembershipState>) -> boo
 	matches!(membership, None | Some(MembershipState::Join))
 }
 
+/// Whether a room's newest event lies past the delta cursor.
+///
+/// State changes arrive as timeline events, so a room with nothing newer than
+/// the cursor has none to report. A full sync always reports.
+fn state_may_have_changed(state_mode: StateMode, last_timeline_count: PduCount) -> bool {
+	match state_mode {
+		| StateMode::Full => true,
+		| StateMode::Delta(since) => last_timeline_count > since,
+	}
+}
+
 fn room_timeline_limited(timeline_limit: usize, limited: bool) -> bool {
 	timeline_limit > 0 && limited
 }
@@ -453,6 +466,33 @@ async fn collect_required_state(
 		.iter()
 		.any(is_equal_to!(&(StateEventType::RoomMember, "$LAZY".into())));
 
+	let needs_since_state = required_state
+		.iter()
+		.any(|(_, state_key)| state_key != "$LAZY");
+
+	// Falling back to current state would match every entry against itself.
+	let since_state = match state_mode {
+		| StateMode::Delta(since) if needs_since_state => services
+			.timeline
+			.next_shortstatehash(room_id, since)
+			.ok()
+			.await
+			.map(|shortstatehash| (since, shortstatehash)),
+		| _ => None,
+	};
+
+	// Equal hashes are the same state set, so only lazy members can be due.
+	let state_unchanged = since_state
+		.map_async(|(_, since_shortstatehash)| {
+			services
+				.state
+				.get_room_shortstatehash(room_id)
+				.ok()
+				.map(move |current| current == Some(since_shortstatehash))
+		})
+		.await
+		.unwrap_or(false);
+
 	let timeline_senders = timeline_pdus
 		.iter()
 		.filter(|_| lazy)
@@ -469,7 +509,7 @@ async fn collect_required_state(
 
 	let wildcard_state = required_state
 		.iter()
-		.filter(|(_, state_key)| state_key == "*")
+		.filter(|(_, state_key)| !state_unchanged && state_key == "*")
 		.stream()
 		.flat_map(|(event_type, _)| {
 			services
@@ -502,6 +542,7 @@ async fn collect_required_state(
 
 	required_state
 		.iter()
+		.filter(|_| !state_unchanged)
 		.cloned()
 		.map(|state| (state, None, false))
 		.stream()
@@ -531,7 +572,20 @@ async fn collect_required_state(
 
 			let pdu_id = services.timeline.get_pdu_id(&event_id).await.ok();
 			let count = pdu_id.map(RawPduId::pdu_count);
-			let pdu_id = state_is_required(state_mode, count, lazy).then_some(pdu_id)?;
+			let same_at_since = since_state
+				.filter(|(since, _)| !lazy && count.is_some_and(|count| count <= *since))
+				.map_async(|(_, shortstatehash)| {
+					services
+						.state_accessor
+						.state_get_id(shortstatehash, &event_type, &state_key)
+						.ok()
+				})
+				.await
+				.flatten()
+				.is_some_and(|previous_event_id| previous_event_id == event_id);
+
+			let pdu_id =
+				state_is_required(state_mode, count, lazy, same_at_since).then_some(pdu_id)?;
 
 			let mut pdu = match pdu_id {
 				| None => services
@@ -556,10 +610,16 @@ async fn collect_required_state(
 		.collect()
 		.await
 }
-fn state_is_required(state_mode: StateMode, count: Option<PduCount>, lazy: bool) -> bool {
+
+fn state_is_required(
+	state_mode: StateMode,
+	count: Option<PduCount>,
+	lazy: bool,
+	same_at_since: bool,
+) -> bool {
 	lazy || match state_mode {
 		| StateMode::Full => true,
-		| StateMode::Delta(since) => count.is_none_or(|count| count > since),
+		| StateMode::Delta(since) => count.is_none_or(|count| count > since) || !same_at_since,
 	}
 }
 
@@ -577,7 +637,7 @@ mod tests {
 
 	use super::{
 		StateMode, membership_allows_required_state, room_config_hash, room_timeline_limited,
-		room_timeline_metadata, state_is_required, state_mode,
+		room_timeline_metadata, state_is_required, state_may_have_changed, state_mode,
 	};
 
 	fn timeline(positions: &[u64]) -> Vec<(PduCount, ())> {
@@ -646,15 +706,15 @@ mod tests {
 		assert_eq!(state_mode(0, false), StateMode::Full);
 		assert_eq!(state_mode(7, true), StateMode::Full);
 		assert_eq!(state_mode(7, false), StateMode::Delta(PduCount::Normal(7)));
-		assert!(state_is_required(StateMode::Full, Some(PduCount::Normal(1)), false));
+		assert!(state_is_required(StateMode::Full, Some(PduCount::Normal(1)), false, true));
 	}
 
 	#[test]
 	fn incremental_required_state_omits_unchanged_events() {
 		let mode = StateMode::Delta(PduCount::Normal(7));
 
-		assert!(!state_is_required(mode, Some(PduCount::Normal(7)), false));
-		assert!(!state_is_required(mode, Some(PduCount::Normal(6)), false));
+		assert!(!state_is_required(mode, Some(PduCount::Normal(7)), false, true));
+		assert!(!state_is_required(mode, Some(PduCount::Normal(6)), false, true));
 	}
 
 	#[test]
@@ -662,18 +722,40 @@ mod tests {
 		let mode = StateMode::Delta(PduCount::Normal(7));
 		let included = [PduCount::Normal(6), PduCount::Normal(8)]
 			.into_iter()
-			.filter(|count| state_is_required(mode, Some(*count), false))
+			.filter(|count| state_is_required(mode, Some(*count), false, true))
 			.count();
 
 		assert_eq!(included, 1);
 	}
 
 	#[test]
+	fn incremental_required_state_keeps_reselected_old_event() {
+		let mode = StateMode::Delta(PduCount::Normal(7));
+
+		assert!(state_is_required(mode, Some(PduCount::Normal(6)), false, false));
+	}
+
+	#[test]
+	fn incremental_required_state_keeps_uncounted_events() {
+		let mode = StateMode::Delta(PduCount::Normal(7));
+
+		assert!(state_is_required(mode, None, false, false));
+	}
+
+	#[test]
+	fn incremental_required_state_needs_a_newer_timeline_event() {
+		let mode = StateMode::Delta(PduCount::Normal(7));
+
+		assert!(!state_may_have_changed(mode, PduCount::Normal(7)));
+		assert!(state_may_have_changed(mode, PduCount::Normal(8)));
+		assert!(state_may_have_changed(StateMode::Full, PduCount::Normal(0)));
+	}
+
+	#[test]
 	fn incremental_required_state_keeps_lazy_members() {
 		let mode = StateMode::Delta(PduCount::Normal(7));
 
-		assert!(state_is_required(mode, Some(PduCount::Normal(1)), true));
-		assert!(state_is_required(mode, None, false));
+		assert!(state_is_required(mode, Some(PduCount::Normal(1)), true, true));
 	}
 
 	#[test]
