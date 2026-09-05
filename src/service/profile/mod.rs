@@ -3,9 +3,9 @@ mod tests;
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use futures::{Stream, StreamExt, future::join};
+use futures::{Stream, StreamExt, TryStreamExt, future::join};
 use ruma::{
-	MxcUri, OwnedMxcUri, OwnedRoomId, RoomId, UserId,
+	MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, UserId,
 	api::federation::query::get_profile_information,
 	events::room::member::{MembershipState, RoomMemberEventContent},
 	profile::{ProfileFieldName, ProfileFieldValue},
@@ -17,8 +17,9 @@ use tuwunel_core::{
 	matrix::PduBuilder,
 	smallvec::SmallVec,
 	utils::{
-		ReadyExt, TryReadyExt,
+		MutexMap, ReadyExt,
 		future::TryExtExt,
+		result::NotFound,
 		stream::{IterStream, TryIgnore, automatic_width},
 	},
 	warn,
@@ -26,6 +27,7 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Ignore, Interfix, Json, KeyVal, Map};
 
 pub struct Service {
+	mutex: MutexMap<OwnedUserId, ()>,
 	services: Arc<crate::services::OnceServices>,
 	profilechangeid_userid: Arc<Map>,
 	useridprofilekey_value: Arc<Map>,
@@ -34,6 +36,7 @@ pub struct Service {
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
+			mutex: MutexMap::new(),
 			services: args.services.clone(),
 			profilechangeid_userid: args.db["profilechangeid_userid"].clone(),
 			useridprofilekey_value: args.db["useridprofilekey_value"].clone(),
@@ -58,6 +61,12 @@ type ChangeKeyVal<'a> = KeyVal<'a, (&'a str, u64, &'a str), &'a UserId>;
 /// The field names one write actually changes, almost always just the one the
 /// caller named.
 type ChangedFields<'a> = SmallVec<[&'a str; 1]>;
+
+/// The field names a profile holds when it is cleared.
+///
+/// A profile commonly holds only the two canonical fields, which sizes the
+/// inline budget.
+type ClearedFields = SmallVec<[ProfileFieldName; 2]>;
 
 /// MSC4426 maximum `m.status` text length, in bytes.
 const MAX_STATUS_TEXT_LENGTH: usize = 256;
@@ -329,18 +338,38 @@ pub fn all_profile_keys(&self, user_id: &UserId) -> impl Stream<Item = ProfileFi
 		.ignore_err()
 }
 
+/// Clears every stored profile field and propagates canonical removals.
+///
+/// The removal is serialized with profile writes. Every joined room's member
+/// event drops the canonical fields, then each stored field is deleted and
+/// recorded in the profile change log.
 #[implement(Service)]
-pub async fn clear_profile_keys(&self, user_id: &UserId) {
-	let prefix = (user_id, Interfix);
+pub async fn clear_profile_keys(&self, user_id: &UserId) -> Result {
+	let _profile_lock = self.mutex.lock(user_id).await;
 
-	self.useridprofilekey_value
-		.keys_prefix_raw(&prefix)
-		.ready_try_for_each(|key| {
-			self.useridprofilekey_value.remove(key);
-			Ok(())
-		})
-		.await
-		.ok();
+	let prefix = (user_id, Interfix);
+	let fields: ClearedFields = self
+		.useridprofilekey_value
+		.keys_prefix(&prefix)
+		.map_ok(|(_, field): (Ignore, &str)| field.into())
+		.try_collect()
+		.await?;
+
+	self.update_all_rooms(
+		user_id,
+		&[(ProfileFieldName::DisplayName, None), (ProfileFieldName::AvatarUrl, None)],
+		Propagation::All,
+	)
+	.await;
+
+	for field in &fields {
+		self.useridprofilekey_value
+			.del((user_id, field.as_str()));
+	}
+
+	self.mark_profile_update(user_id, &fields).await;
+
+	Ok(())
 }
 
 /// Sets new profile key values, removes the key if value is None
@@ -351,6 +380,8 @@ pub async fn set_profile_keys(
 	profile_values: &[(ProfileFieldName, Option<Value>)],
 	propagation: Option<Propagation>,
 ) -> Result {
+	let _profile_lock = self.mutex.lock(user_id).await;
+
 	if self.services.globals.user_is_local(user_id) {
 		for (name, value) in profile_values {
 			check_profile_key(name.as_str())?;
@@ -362,6 +393,10 @@ pub async fn set_profile_keys(
 			}
 		}
 	}
+
+	let changed = self
+		.changed_fields(user_id, profile_values)
+		.await?;
 
 	let propagation = propagation.unwrap_or(
 		if self
@@ -379,8 +414,6 @@ pub async fn set_profile_keys(
 		self.update_all_rooms(user_id, profile_values, propagation)
 			.await;
 	}
-
-	let changed = self.changed_fields(user_id, profile_values).await;
 
 	for (name, value) in profile_values {
 		let key = (user_id, name.as_str());
@@ -408,19 +441,21 @@ async fn changed_fields<'a>(
 	&self,
 	user_id: &UserId,
 	profile_values: &'a [(ProfileFieldName, Option<Value>)],
-) -> ChangedFields<'a> {
+) -> Result<ChangedFields<'a>> {
 	profile_values
 		.iter()
-		.stream()
-		.filter_map(async |(name, value)| {
-			let stored: Option<Value> = self.profile_key(user_id, name).await.ok();
+		.try_stream()
+		.try_filter_map(async |(name, value)| {
+			let stored = self.profile_key(user_id, name).await.optional()?;
 
-			stored
+			let changed = stored
 				.as_ref()
 				.ne(&value.as_ref())
-				.then_some(name.as_str())
+				.then_some(name.as_str());
+
+			Ok(changed)
 		})
-		.collect()
+		.try_collect()
 		.await
 }
 
@@ -441,7 +476,10 @@ async fn changed_fields<'a>(
 		%user_id,
 	),
 )]
-async fn mark_profile_update(&self, user_id: &UserId, changed: &[&str]) {
+async fn mark_profile_update<T>(&self, user_id: &UserId, changed: &[T])
+where
+	T: AsRef<str> + Sync,
+{
 	if changed.is_empty() {
 		return;
 	}
@@ -450,7 +488,7 @@ async fn mark_profile_update(&self, user_id: &UserId, changed: &[&str]) {
 
 	for name in changed {
 		self.profilechangeid_userid
-			.put_raw((user_id, *count, name), user_id);
+			.put_raw((user_id, *count, name.as_ref()), user_id);
 	}
 
 	self.services
@@ -459,7 +497,7 @@ async fn mark_profile_update(&self, user_id: &UserId, changed: &[&str]) {
 		.ready_for_each(|room_id| {
 			for name in changed {
 				self.profilechangeid_userid
-					.put_raw((room_id, *count, name), user_id);
+					.put_raw((room_id, *count, name.as_ref()), user_id);
 			}
 		})
 		.await;
@@ -508,6 +546,7 @@ fn profile_changed_user_or_room<'a>(
 	// User and room ids never collide as a prefix here: their sigils differ.
 	self.profilechangeid_userid
 		.stream_from(&start)
+		.inspect_err(|error| warn!(%error, "Profile change log row failed to read"))
 		.ignore_err()
 		.ready_take_while(move |((prefix, count, _), _): &ChangeKeyVal<'_>| {
 			*prefix == user_or_room_id && *count <= to

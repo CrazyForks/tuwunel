@@ -3,15 +3,17 @@
 use std::{env::var, fs::remove_dir_all, path::PathBuf, process::id as process_id};
 
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err,
 	ruma::{UserId, profile::ProfileFieldName, user_id},
+	utils::result::NotFound,
 };
 use tuwunel_service::Services;
 
 const STATUS: &str = "org.matrix.msc4426.status";
+const CALL: &str = "org.matrix.msc4426.call";
 
 struct DatabasePath(PathBuf);
 
@@ -74,9 +76,41 @@ async fn assert_change_log_bounds(services: &Services) -> Result {
 
 	expect_fields(services, user_id, (after, latest), &[STATUS], "the second write").await?;
 
+	set_call(services, user_id).await?;
+
+	let before_clear = services.globals.current_count();
+
+	expect_fields(services, user_id, (latest, before_clear), &[CALL], "the call write").await?;
+
+	services
+		.profile
+		.clear_profile_keys(user_id)
+		.await?;
+
+	let cleared = services.globals.current_count();
+
+	expect_fields(
+		services,
+		user_id,
+		(before_clear, cleared),
+		&[CALL, STATUS],
+		"the profile clear",
+	)
+	.await?;
+
+	for name in [CALL, STATUS] {
+		let field = ProfileFieldName::from(name);
+		let value: Result<Value> = services
+			.profile
+			.profile_key(user_id, &field)
+			.await;
+
+		assert!(value.is_not_found(), "{name} must be cleared");
+	}
+
 	let stranger = user_id!("@statusbounds-stranger:localhost");
 
-	expect_fields(services, stranger, (before, latest), &[], "another user's prefix").await
+	expect_fields(services, stranger, (before, cleared), &[], "another user's prefix").await
 }
 
 async fn set_status(services: &Services, user_id: &UserId, text: &str) -> Result {
@@ -108,4 +142,13 @@ async fn expect_fields(
 		.eq(expected.iter().copied())
 		.then_some(())
 		.ok_or_else(|| err!("{subject} reported {changed:?}, expected {expected:?}"))
+}
+
+async fn set_call(services: &Services, user_id: &UserId) -> Result {
+	let call = json!({ "call_joined_ts": 1 });
+
+	services
+		.profile
+		.set_profile_keys(user_id, &[(ProfileFieldName::from(CALL), Some(call))], None)
+		.await
 }

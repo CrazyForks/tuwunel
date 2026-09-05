@@ -4,11 +4,8 @@ use futures::StreamExt;
 use ruma::{
 	OwnedRoomId, UserId,
 	events::{StateEventType, room::power_levels::RoomPowerLevelsEventContent},
-	profile::ProfileFieldName,
 };
 use tuwunel_core::{Event, Result, info, pdu::PduBuilder, warn};
-
-use crate::profile::Propagation;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -42,16 +39,11 @@ impl Service {
 		self.services
 			.profile
 			.clear_profile_keys(user_id)
-			.await;
-
-		self.services
-			.profile
-			.update_all_rooms(
-				user_id,
-				&[(ProfileFieldName::DisplayName, None), (ProfileFieldName::AvatarUrl, None)],
-				Propagation::All,
-			)
-			.await;
+			.await
+			.inspect_err(|error| {
+				warn!(%user_id, %error, "Failed to clear the profile during deactivation");
+			})
+			.ok();
 
 		let all_joined_rooms: Vec<OwnedRoomId> = self
 			.services

@@ -10,7 +10,8 @@ use ruma::{
 use serde_json::Value;
 use tuwunel_core::{
 	Result,
-	utils::{IterStream, ReadyExt, stream::BroadbandExt},
+	utils::{IterStream, ReadyExt, result::NotFound, stream::BroadbandExt},
+	warn,
 };
 use tuwunel_service::{Services, profile::ProfileChange, sync::Connection};
 
@@ -25,7 +26,7 @@ type Fields = BTreeSet<ProfileFieldName>;
 type Changes = BTreeMap<OwnedUserId, Fields>;
 
 /// One changed field paired with whatever reading it back produced.
-type Field = (ProfileFieldName, Result<Value>);
+type Field = (ProfileFieldName, Result<Option<Value>>);
 
 /// Collects the MSC4262 profiles extension payload.
 ///
@@ -151,18 +152,25 @@ async fn read_update(services: &Services, user_id: &UserId, fields: Fields) -> U
 }
 
 async fn read_field(services: &Services, user_id: &UserId, name: ProfileFieldName) -> Field {
-	let value = services.profile.profile_key(user_id, &name).await;
+	let value = services
+		.profile
+		.profile_key(user_id, &name)
+		.await
+		.optional()
+		.inspect_err(
+			|error| warn!(%user_id, %name, %error, "Failed to read a changed profile field"),
+		);
 
 	(name, value)
 }
 
 fn fold_field(mut changes: UserProfileChanges, (name, value): Field) -> UserProfileChanges {
-	// Only an absent field is a removal: a row that fails to decode is this
+	// Only an absent field is a removal: a row that fails to read is this
 	// server's problem, not a signal to wipe the client's copy.
 	match value {
-		| Err(error) if error.is_not_found() => changes.removed.push(name),
+		| Ok(None) => changes.removed.push(name),
 		| Err(_) => (),
-		| Ok(value) => {
+		| Ok(Some(value)) => {
 			changes.updated.insert(name, value);
 		},
 	}
