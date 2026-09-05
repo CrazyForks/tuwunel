@@ -6,11 +6,10 @@
 //! own decoder here, and all of them produce a GIF, which is the one animated
 //! format this build can encode.
 //!
-//! Every frame is quantized onto a palette of its own, so the work is bounded
-//! twice over, by a frame count and by a pixel budget spent across them, and
-//! runs on a blocking worker rather than the async runtime.
+//! The caps that bound the work live here rather than at either call site, so
+//! a source reaches no decoder before what it would cost is known.
 
-use std::{io::Cursor, num::Saturating as Sat};
+use std::{cmp::min, io::Cursor};
 
 use bytes::Bytes;
 use image::{
@@ -72,41 +71,42 @@ pub(super) async fn store_animated(
 
 /// Encode a picture's frames as a GIF scaled to these dimensions.
 ///
-/// The frame iterator is lazy and its decoder is given the pixel budget before
-/// it advances, so the caps bound the decode as well as the encode: frames stop
-/// at the count limit or once their source pixels have spent the budget, and
-/// the animation loops short rather than the request failing. Fewer than two
-/// frames is no animation and answers an error.
+/// Both caps are settled before a frame is pulled, so neither the decode nor
+/// the encode can run past them: the sequence stops at the frame count or at
+/// what the pixel budget affords, and the animation loops short rather than the
+/// request failing. Fewer than two frames is no animation and answers an error.
 pub(in super::super) fn encode_frames(
 	bytes: &[u8],
 	dim: &Dim,
 	max_frames: usize,
 	budget: u64,
 ) -> Result<Vec<u8>> {
-	let frames = source_frames(bytes, budget)?;
+	let (frames, canvas) = source_frames(bytes, budget)?;
+
+	// every frame composites onto the whole canvas whatever region it updates,
+	// so what the budget affords is a count rather than a running total
+	let afforded = budget
+		.checked_div(canvas)
+		.and_then(|afforded| usize::try_from(afforded).ok())
+		.unwrap_or(max_frames);
+
 	let mut content = Vec::new();
 	let mut encoder = GifEncoder::new_with_speed(&mut content, GIF_SPEED);
-	let mut spent = Sat(0_u64);
 	let mut count = 0_usize;
 
 	encoder
 		.set_repeat(Repeat::Infinite)
 		.map_err(|error| err!(debug_warn!(?error, "Failed to set the GIF loop count.")))?;
 
-	for frame in frames.take(max_frames) {
-		let frame =
-			frame.map_err(|error| err!(debug_warn!(?error, "Failed to decode a frame.")))?;
+	for frame in frames.take(min(max_frames, afforded)) {
+		// a frame the source will not yield ends the sequence where it stands,
+		// as a cap does, rather than discarding the frames already encoded
+		let Ok(frame) = frame else {
+			break;
+		};
 
 		let delay = frame.delay();
-		let buffer = frame.into_buffer();
-
-		spent += Sat(u64::from(buffer.width())) * Sat(u64::from(buffer.height()));
-
-		if spent.0 > budget {
-			break;
-		}
-
-		let scaled = thumbnail_generate(&DynamicImage::ImageRgba8(buffer), dim)?;
+		let scaled = thumbnail_generate(&DynamicImage::ImageRgba8(frame.into_buffer()), dim)?;
 
 		encoder
 			.encode_frame(Frame::from_parts(scaled.into_rgba8(), 0, 0, delay))
@@ -126,59 +126,78 @@ pub(in super::super) fn encode_frames(
 	Ok(content)
 }
 
-/// The frame sequence a picture carries, by the format its header names.
+/// The frame sequence a picture carries, and what one frame of it costs.
 ///
-/// Only the three containers MSC2705 names can hold one, and a WebP says in its
-/// own header whether it does, so anything else answers an error here rather
-/// than yielding a lone frame for the caller to reject.
-fn source_frames(bytes: &[u8], budget: u64) -> Result<Frames<'_>> {
+/// Only the three containers MSC2705 names can hold a sequence, and two of them
+/// say in their own header whether they do, so a still answers an error here
+/// rather than yielding a lone frame for the caller to reject. Each decoder is
+/// built without limits of its own and composites a whole source canvas on its
+/// first advance, so the canvas is budgeted and the decoder told what it may
+/// allocate before it is ever advanced.
+fn source_frames(bytes: &[u8], budget: u64) -> Result<(Frames<'_>, u64)> {
 	let format = reader(bytes)?
 		.format()
 		.ok_or_else(|| err!(debug_warn!("Picture names no format.")))?;
 
-	// each decoder here is built with no limits of its own and decodes a whole
-	// source frame on the first advance, so the header is budgeted first
-	let (width, height) = reader(bytes)?
-		.into_dimensions()
-		.map_err(|error| err!(debug_warn!(?error, "Failed to read picture dimensions.")))?;
-
-	let pixels = u64::from(width).saturating_mul(u64::from(height));
-
-	if pixels > budget {
-		return Err!(debug_warn!(%width, %height, "Frames are past the {budget} pixel budget."));
-	}
-
-	let mut limits = Limits::no_limits();
-	limits.max_alloc = Some(budget.saturating_mul(BYTES_PER_PIXEL));
-
 	let source = Cursor::new(bytes);
 	let failed = |error| err!(debug_warn!(?error, ?format, "Failed to read a frame sequence."));
+
+	let mut limits = Limits::no_limits();
+
+	limits.max_alloc = Some(budget.saturating_mul(BYTES_PER_PIXEL));
 
 	let frames = match format {
 		| ImageFormat::Gif => {
 			let mut decoder = GifDecoder::new(source).map_err(failed)?;
+			let canvas = canvas_pixels(&decoder, budget)?;
 
 			decoder.set_limits(limits).map_err(failed)?;
-			decoder.into_frames()
+
+			(decoder.into_frames(), canvas)
 		},
 		| ImageFormat::Png => {
 			let mut decoder = PngDecoder::new(source).map_err(failed)?;
+			let canvas = canvas_pixels(&decoder, budget)?;
+
+			if !decoder.is_apng().map_err(failed)? {
+				return Err!(debug_warn!("PNG carries a single frame."));
+			}
 
 			decoder.set_limits(limits).map_err(failed)?;
-			decoder.apng().map_err(failed)?.into_frames()
+
+			(decoder.apng().map_err(failed)?.into_frames(), canvas)
 		},
 		| ImageFormat::WebP => {
 			let mut decoder = WebPDecoder::new(source).map_err(failed)?;
+			let canvas = canvas_pixels(&decoder, budget)?;
 
 			if !decoder.has_animation() {
 				return Err!(debug_warn!("WebP carries a single frame."));
 			}
 
 			decoder.set_limits(limits).map_err(failed)?;
-			decoder.into_frames()
+
+			(decoder.into_frames(), canvas)
 		},
 		| _ => return Err!(debug_warn!(?format, "Format carries no frame sequence.")),
 	};
 
 	Ok(frames)
+}
+
+/// Pixels one composited frame of this source occupies.
+///
+/// A canvas the budget cannot afford even once is refused here, which is before
+/// the decoder has been advanced onto it and so before it has allocated one.
+fn canvas_pixels(decoder: &impl ImageDecoder, budget: u64) -> Result<u64> {
+	let (width, height) = decoder.dimensions();
+	let pixels = u64::from(width).saturating_mul(u64::from(height));
+
+	if pixels == 0 || pixels > budget {
+		return Err!(
+			debug_warn!(%width, %height, %budget, "Canvas is outside the pixel budget.")
+		);
+	}
+
+	Ok(pixels)
 }
