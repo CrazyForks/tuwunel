@@ -40,7 +40,7 @@ use url::Url;
 
 #[cfg(feature = "media_thumbnail")]
 use self::video::{FAILURES, Failures, sweep_staging_dir};
-use self::{data::Data, preview::Agent, remote::Fetch};
+use self::{data::Data, preview::Agent, remote::Fetch, thumbnail::animated_type};
 pub use self::{
 	data::Metadata,
 	preview::UrlPreviewData,
@@ -247,6 +247,12 @@ impl Service {
 	}
 
 	/// Uploads a file.
+	///
+	/// The declared type is whoever uploaded it saying so, and a picture that
+	/// animates is stored under the type its own container names instead. That
+	/// is the only record of whether the media animates that a later lookup can
+	/// read without fetching the whole of it. The disposition is left as the
+	/// caller computed it, so a file already bound for download stays there.
 	pub async fn create(
 		&self,
 		mxc: &Mxc<'_>,
@@ -255,6 +261,8 @@ impl Service {
 		content_type: Option<&str>,
 		file: &[u8],
 	) -> Result {
+		let content_type = animated_type(file).or(content_type);
+
 		// Width, Height = 0 if it's not a thumbnail
 		let key = self.db.create_file_metadata(
 			mxc,
