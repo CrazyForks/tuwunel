@@ -12,13 +12,22 @@ use std::{cmp::min, num::Saturating as Sat, sync::Arc, time::Duration};
 use bytes::Bytes;
 use futures::{StreamExt, pin_mut};
 #[cfg(feature = "media_thumbnail")]
-use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
+use image::{
+	AnimationDecoder, DynamicImage, Frame, Frames, ImageDecoder, ImageFormat, ImageReader,
+	Limits,
+	codecs::{
+		gif::{GifDecoder, GifEncoder, Repeat},
+		png::PngDecoder,
+		webp::WebPDecoder,
+	},
+	imageops::FilterType,
+};
 #[cfg(feature = "media_thumbnail")]
 use ruma::http_headers::ContentDispositionType;
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
 use tokio::sync::Notify;
 use tuwunel_core::{
-	Err, Result, async_noinline, checked, err, implement,
+	Err, Result, async_noinline, checked, defer, err, implement,
 	utils::{result::LogDebugErr, stream::IterStream},
 };
 
@@ -36,10 +45,20 @@ const PNG: &str = "image/png";
 #[cfg(feature = "media_thumbnail")]
 const BYTES_PER_PIXEL: u64 = 4;
 
-/// Filename a generated thumbnail is disposed under, per the media repository
+/// Filenames a generated thumbnail is disposed under, per the media repository
 /// specification, rather than the name of the file it was generated from.
 #[cfg(feature = "media_thumbnail")]
-const THUMBNAIL_NAME: &str = "thumbnail.png";
+const STILL_NAME: &str = "thumbnail.png";
+#[cfg(feature = "media_thumbnail")]
+const ANIMATED_NAME: &str = "thumbnail.gif";
+
+/// Quantization effort the GIF encoder spends per frame.
+///
+/// The encoder's own default is 1, which buys quality at any cost; a thumbnail
+/// is small and any remote server can ask for one, so this trades a little of
+/// that for an encode that ends.
+#[cfg(feature = "media_thumbnail")]
+const GIF_SPEED: i32 = 10;
 
 /// Content types naming a container that can carry a frame sequence.
 ///
@@ -521,8 +540,17 @@ async fn get_thumbnail_generate(
 	data: Metadata,
 ) -> Result<Media> {
 	let bytes = self.fetch_bytes(&data.key).await?;
-	let media = into_media(data, bytes.into());
 
+	// the source's own size decides this from its header, since a picture the
+	// request cannot improve on is better passed through below than re-encoded
+	if self.animation_wanted(animate, &bytes)
+		&& !dim.is_passthrough(&picture_dim(&bytes))?
+		&& let Ok(animated) = self.store_animated(mxc, dim, bytes.clone()).await
+	{
+		return Ok(animated);
+	}
+
+	let media = into_media(data, bytes.into());
 	let frame = self.video_frame(mxc, dim, &media).await;
 	let from_video = frame.is_some();
 
@@ -570,6 +598,167 @@ async fn get_thumbnail_generate(
 	self.get_thumbnail_saved(data).await
 }
 
+/// Whether this request takes the frames the source carries.
+///
+/// Only a request that asked for animation reaches the encoder, and only over
+/// a picture whose header says it holds a sequence, so a still never pays a
+/// decode that would yield one frame and be thrown away. A video is excluded by
+/// the same test, its container being none of the three that hold frames.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[inline]
+fn animation_wanted(&self, animate: Animate, content: &[u8]) -> bool {
+	animate.allowed() && self.services.config.media_thumbnail_animated && animates(content)
+}
+
+/// Encode this picture's frames as an animated GIF thumbnail and store it.
+///
+/// Quantization runs per frame on a palette of its own, which is far more work
+/// than a still costs, so the encode is handed to a blocking worker rather than
+/// run on the async runtime. A source whose frames will not decode answers an
+/// error and the caller falls through to the still it would have produced.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[tracing::instrument(name = "animate", level = "debug", skip(self, source))]
+async fn store_animated(&self, mxc: &Mxc<'_>, dim: &Dim, source: Bytes) -> Result<Media> {
+	let config = &self.services.config;
+	let max_frames = config.media_thumbnail_max_frames;
+	let budget = config.media_thumbnail_max_pixels;
+	let requested = Dim::new(dim.width, dim.height, Some(dim.method.clone()));
+
+	let encode = self
+		.services
+		.server
+		.runtime()
+		.spawn_blocking(move || encode_frames(&source, &requested, max_frames, budget));
+
+	// a started worker runs to completion, but one still queued is dropped, so
+	// a cancelled request must not leave it to reach the pool
+	let abort = encode.abort_handle();
+
+	defer! {{ abort.abort(); }}
+
+	let content = encode.await??;
+
+	self.store_encoded(mxc, dim, content, GIF, ANIMATED_NAME)
+		.await
+}
+
+/// Encode a picture's frames as a GIF scaled to these dimensions.
+///
+/// The frame iterator is lazy and its decoder is given the pixel budget before
+/// it advances, so the caps bound the decode as well as the encode: frames stop
+/// at the count limit or once their source pixels have spent the budget, and
+/// the animation loops short rather than the request failing. Fewer than two
+/// frames is no animation and answers an error.
+#[cfg(feature = "media_thumbnail")]
+pub(super) fn encode_frames(
+	bytes: &[u8],
+	dim: &Dim,
+	max_frames: usize,
+	budget: u64,
+) -> Result<Vec<u8>> {
+	let frames = source_frames(bytes, budget)?;
+	let mut content = Vec::new();
+	let mut encoder = GifEncoder::new_with_speed(&mut content, GIF_SPEED);
+	let mut spent = Sat(0_u64);
+	let mut count = 0_usize;
+
+	encoder
+		.set_repeat(Repeat::Infinite)
+		.map_err(|error| err!(debug_warn!(?error, "Failed to set the GIF loop count.")))?;
+
+	for frame in frames.take(max_frames) {
+		let frame =
+			frame.map_err(|error| err!(debug_warn!(?error, "Failed to decode a frame.")))?;
+
+		let delay = frame.delay();
+		let buffer = frame.into_buffer();
+
+		spent += Sat(u64::from(buffer.width())) * Sat(u64::from(buffer.height()));
+
+		if spent.0 > budget {
+			break;
+		}
+
+		let scaled = thumbnail_generate(&DynamicImage::ImageRgba8(buffer), dim)?;
+
+		encoder
+			.encode_frame(Frame::from_parts(scaled.into_rgba8(), 0, 0, delay))
+			.map_err(|error| err!(debug_warn!(?error, "Failed to encode a frame.")))?;
+
+		count = count.saturating_add(1);
+	}
+
+	// the encoder writes the trailer as it goes out of scope, so the picture is
+	// not complete until it has
+	drop(encoder);
+
+	if count < 2 {
+		return Err!(debug_warn!(%count, "Picture carries no frame sequence."));
+	}
+
+	Ok(content)
+}
+
+/// The frame sequence a picture carries, by the format its header names.
+///
+/// Only the three containers MSC2705 names can hold one, and a WebP says in its
+/// own header whether it does, so anything else answers an error here rather
+/// than yielding a lone frame for the caller to reject.
+#[cfg(feature = "media_thumbnail")]
+fn source_frames(bytes: &[u8], budget: u64) -> Result<Frames<'_>> {
+	let format = reader(bytes)?
+		.format()
+		.ok_or_else(|| err!(debug_warn!("Picture names no format.")))?;
+
+	// each decoder here is built with no limits of its own and decodes a whole
+	// source frame on the first advance, so the header is budgeted first
+	let (width, height) = reader(bytes)?
+		.into_dimensions()
+		.map_err(|error| err!(debug_warn!(?error, "Failed to read picture dimensions.")))?;
+
+	let pixels = u64::from(width).saturating_mul(u64::from(height));
+
+	if pixels > budget {
+		return Err!(debug_warn!(%width, %height, "Frames are past the {budget} pixel budget."));
+	}
+
+	let mut limits = Limits::no_limits();
+	limits.max_alloc = Some(budget.saturating_mul(BYTES_PER_PIXEL));
+
+	let source = Cursor::new(bytes);
+	let failed = |error| err!(debug_warn!(?error, ?format, "Failed to read a frame sequence."));
+
+	let frames = match format {
+		| ImageFormat::Gif => {
+			let mut decoder = GifDecoder::new(source).map_err(failed)?;
+
+			decoder.set_limits(limits).map_err(failed)?;
+			decoder.into_frames()
+		},
+		| ImageFormat::Png => {
+			let mut decoder = PngDecoder::new(source).map_err(failed)?;
+
+			decoder.set_limits(limits).map_err(failed)?;
+			decoder.apng().map_err(failed)?.into_frames()
+		},
+		| ImageFormat::WebP => {
+			let mut decoder = WebPDecoder::new(source).map_err(failed)?;
+
+			if !decoder.has_animation() {
+				return Err!(debug_warn!("WebP carries a single frame."));
+			}
+
+			decoder.set_limits(limits).map_err(failed)?;
+			decoder.into_frames()
+		},
+		| _ => return Err!(debug_warn!(?format, "Format carries no frame sequence.")),
+	};
+
+	Ok(frames)
+}
+
 /// Encode a still PNG thumbnail at these dimensions and store it.
 ///
 /// The generate path and the still-repair path share this, so a given size
@@ -578,14 +767,14 @@ async fn get_thumbnail_generate(
 #[implement(super::Service)]
 #[tracing::instrument(name = "store", level = "debug", skip(self, image))]
 async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: DynamicImage) -> Result<Media> {
-	let mut thumbnail_bytes = Vec::new();
+	let mut content = Vec::new();
 	let thumbnail = thumbnail_generate(&image, dim)?;
 
 	// the source raster is dead once the thumbnail exists, and neither it nor
 	// the thumbnail may be held across the store below
 	drop(image);
 
-	let mut cursor = Cursor::new(&mut thumbnail_bytes);
+	let mut cursor = Cursor::new(&mut content);
 
 	thumbnail
 		.write_to(&mut cursor, ImageFormat::Png)
@@ -593,25 +782,44 @@ async fn store_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim, image: DynamicImage) -
 
 	drop(thumbnail);
 
-	// a generated thumbnail is a PNG rather than the uploaded file, and carries
-	// the name the media repository specification asks of one whether or not the
-	// original arrived with a name of its own
+	self.store_encoded(mxc, dim, content, PNG, STILL_NAME)
+		.await
+}
+
+/// Store an encoded thumbnail under the type and name it carries.
+///
+/// Both encoders end here, so a stored thumbnail is disposed inline under the
+/// name the media repository specification asks of one whether or not the
+/// original arrived with a name of its own.
+#[cfg(feature = "media_thumbnail")]
+#[implement(super::Service)]
+#[tracing::instrument(name = "encoded", level = "debug", skip(self, content))]
+async fn store_encoded(
+	&self,
+	mxc: &Mxc<'_>,
+	dim: &Dim,
+	content: Vec<u8>,
+	content_type: &str,
+	filename: &str,
+) -> Result<Media> {
 	let content_disposition = ContentDisposition {
 		disposition_type: ContentDispositionType::Inline,
-		filename: Some(THUMBNAIL_NAME.to_owned()),
+		filename: Some(filename.to_owned()),
 	};
 
-	// Save thumbnail in database so we don't have to generate it again next time
-	let thumbnail_key =
-		self.db
-			.create_file_metadata(mxc, None, dim, Some(&content_disposition), Some(PNG))?;
+	let key = self.db.create_file_metadata(
+		mxc,
+		None,
+		dim,
+		Some(&content_disposition),
+		Some(content_type),
+	)?;
 
-	self.create_media_file(&thumbnail_key, &thumbnail_bytes)
-		.await?;
+	self.create_media_file(&key, &content).await?;
 
 	let media = Media {
-		content: thumbnail_bytes,
-		content_type: Some(PNG.to_owned()),
+		content,
+		content_type: Some(content_type.to_owned()),
 		content_disposition: Some(content_disposition),
 	};
 

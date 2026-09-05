@@ -307,6 +307,94 @@ mod container {
 }
 
 #[cfg(feature = "media_thumbnail")]
+mod animation {
+	use std::{io::Cursor, iter::repeat_with};
+
+	use image::{
+		AnimationDecoder, Frame, Rgba, RgbaImage,
+		codecs::gif::{GifDecoder, GifEncoder},
+	};
+
+	use super::{super::thumbnail::encode_frames, scale};
+
+	/// Pixels the tests give the encoder to spend, past anything they need.
+	const BUDGET: u64 = 1_000_000;
+
+	/// A canvas past the budget is refused before any frame is decoded.
+	///
+	/// The decoders carry no limits of their own and materialize a whole source
+	/// canvas on the first advance, so this thirteen byte header declaring a
+	/// 65535 by 65535 picture would otherwise ask for about seventeen gigabytes
+	/// before any per-frame cap could apply.
+	#[test]
+	fn a_canvas_past_the_budget_is_refused() {
+		let header = b"GIF89a\xff\xff\xff\xff\x00\x00\x00";
+
+		encode_frames(header, &scale(32, 32), 9, BUDGET).expect_err("refuses");
+	}
+
+	/// A red GIF of this many four-by-four frames.
+	///
+	/// The picture is whatever encodes smallest, since only the frame count and
+	/// the dimensions are ever asserted on.
+	fn animation(frames: usize) -> Vec<u8> {
+		let buffer = RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255]));
+		let mut content = Vec::new();
+		let mut encoder = GifEncoder::new(&mut content);
+
+		encoder
+			.encode_frames(repeat_with(|| Frame::new(buffer.clone())).take(frames))
+			.expect("encodes");
+
+		drop(encoder);
+
+		content
+	}
+
+	fn frames(bytes: &[u8]) -> usize {
+		GifDecoder::new(Cursor::new(bytes))
+			.expect("decodes")
+			.into_frames()
+			.count()
+	}
+
+	/// A source with more frames than the cap loops short.
+	///
+	/// Truncating is what the MSC wants over an error, since a client asked for
+	/// an animation and a shorter one still answers that.
+	#[test]
+	fn the_frame_cap_truncates_rather_than_refusing() {
+		let thumbnail = encode_frames(&animation(9), &scale(32, 32), 3, BUDGET).expect("encodes");
+
+		assert_eq!(frames(&thumbnail), 3);
+	}
+
+	/// A cap the source does not reach leaves every frame in place.
+	#[test]
+	fn a_shorter_source_keeps_all_of_its_frames() {
+		let thumbnail = encode_frames(&animation(3), &scale(32, 32), 9, BUDGET).expect("encodes");
+
+		assert_eq!(frames(&thumbnail), 3);
+	}
+
+	/// One frame is no animation, and the caller answers with a still instead.
+	#[test]
+	fn a_single_frame_is_not_an_animation() {
+		encode_frames(&animation(1), &scale(32, 32), 9, BUDGET).expect_err("refuses");
+	}
+
+	/// The pixel budget is spent across frames rather than by one of them.
+	///
+	/// A budget under two frames' worth of source leaves too few to be an
+	/// animation, which is the same answer a single-frame source gets.
+	#[test]
+	fn the_pixel_budget_is_spent_across_frames() {
+		encode_frames(&animation(9), &scale(32, 32), 9, 16).expect_err("one frame is refused");
+		encode_frames(&animation(9), &scale(32, 32), 9, 48).expect("two frames are an animation");
+	}
+}
+
+#[cfg(feature = "media_thumbnail")]
 mod generate {
 	use image::{DynamicImage, RgbImage};
 

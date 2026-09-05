@@ -2773,6 +2773,33 @@ pub struct Config {
 	#[serde(default = "default_media_thumbnail_max_pixels")]
 	pub media_thumbnail_max_pixels: u64,
 
+	/// Answer a request for an animated thumbnail with one, per MSC2705.
+	///
+	/// A client that asks is served an animated GIF when the source carries a
+	/// frame sequence and a still when it does not, and a client that does not
+	/// ask is served a still either way. Encoding quantizes every frame on its
+	/// own palette, which costs far more than a still, so the frame count and
+	/// pixel budget below bound the work too. Turning this off leaves every
+	/// thumbnail a still PNG.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub media_thumbnail_animated: bool,
+
+	/// Frames an animated thumbnail carries at most.
+	///
+	/// A source with more of them is truncated to this and loops short, which
+	/// the client is not told about, rather than being refused a thumbnail.
+	/// Frames are also budgeted against `media_thumbnail_max_pixels` in total
+	/// rather than one at a time, so a long animation stops at whichever limit
+	/// it meets first. Both bound a request any remote server can make.
+	///
+	/// reloadable: yes
+	/// default: 50
+	#[serde(default = "default_media_thumbnail_max_frames")]
+	pub media_thumbnail_max_frames: usize,
+
 	/// Program invoked to extract a still frame from a video, giving videos
 	/// uploaded without a thumbnail one anyway. Tuwunel decodes no video
 	/// itself; the frame is scaled and cropped like any other image and the
@@ -5450,6 +5477,8 @@ fn default_media_rc_create_per_second() -> u32 { 10 }
 fn default_media_rc_create_burst_count() -> u32 { 50 }
 
 fn default_media_thumbnail_max_pixels() -> u64 { 50_000_000 }
+
+fn default_media_thumbnail_max_frames() -> usize { 50 }
 
 fn default_media_video_thumbnail_timeout() -> u64 { 30 }
 
