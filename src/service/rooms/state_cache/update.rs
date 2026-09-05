@@ -17,7 +17,10 @@ use ruma::{
 use tuwunel_core::{
 	Result, implement, is_not_empty,
 	matrix::PduCount,
-	utils::{BoolExt, ReadyExt, result::LogErr},
+	utils::{
+		BoolExt, ReadyExt,
+		result::{LogErr, NotFound},
+	},
 	warn,
 };
 use tuwunel_database::{Json, keyval::ValBuf, serialize_key, serialize_val};
@@ -112,7 +115,7 @@ pub async fn update_membership(
 			// An ignored sender's invite is stored anyway; the recipient's list
 			// is applied when it is served, by InviteFilter::permission.
 			self.mark_as_invited(user_id, room_id, count, last_state, invite_via)
-				.await;
+				.await?;
 		},
 		| MembershipState::Leave | MembershipState::Ban => {
 			self.handle_leave(room_id, user_id, count).await;
@@ -347,7 +350,7 @@ pub(crate) async fn mark_as_invited(
 	count: PduCount,
 	last_state: StrippedRoomState,
 	invite_via: Option<Vec<OwnedServerName>>,
-) {
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -361,7 +364,9 @@ pub(crate) async fn mark_as_invited(
 		.is_none()
 		.then_async(|| self.db.userroomid_invitestate.get(&userroom_id))
 		.await
-		.and_then(Result::ok);
+		.transpose()
+		.optional()?
+		.flatten();
 
 	let invite_state = stored.as_deref().map_or_else(
 		|| {
@@ -389,6 +394,8 @@ pub(crate) async fn mark_as_invited(
 	}
 
 	txn.execute();
+
+	Ok(())
 }
 
 #[implement(super::Service)]

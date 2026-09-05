@@ -21,6 +21,7 @@ use tuwunel_core::{
 	utils::{
 		self, BoolExt,
 		future::OptionStream,
+		result::NotFound,
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
 	},
 	warn,
@@ -614,17 +615,19 @@ pub async fn invite_state(
 /// Whether the user's stored invite carries any stripped state.
 ///
 /// The row is probed raw rather than decoded through [`Self::invite_state`], so
-/// no stripped state is materialized to answer it.
+/// no stripped state is materialized to answer it. A failed read is an error
+/// rather than an absent row.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
-pub async fn has_invite_state(&self, user_id: &UserId, room_id: &RoomId) -> bool {
+pub async fn has_invite_state(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
 	let key = (user_id, room_id);
 
 	self.db
 		.userroomid_invitestate
 		.qry(&key)
 		.await
-		.is_ok_and(|state| state.len() > EMPTY_INVITE_STATE.len())
+		.optional()
+		.map(|state| state.is_some_and(|state| state.len() > EMPTY_INVITE_STATE.len()))
 }
 
 #[implement(Service)]

@@ -172,8 +172,9 @@ async fn force_member_effects(&self, room_id: &RoomId, pdu: &PduEvent) -> Result
 		.eq(&MembershipState::Invite)
 		.and_is(self.services.globals.user_is_local(&user_id))
 		.then_async(|| self.replayed_invite_state(room_id, &user_id, pdu))
-		.map(Option::flatten)
-		.await;
+		.map(Option::transpose)
+		.map_ok(Option::flatten)
+		.await?;
 
 	let count = self.services.globals.next_count();
 
@@ -196,20 +197,22 @@ async fn force_member_effects(&self, room_id: &RoomId, pdu: &PduEvent) -> Result
 ///
 /// A reset reaches this before the new state is installed, so the summary built
 /// here is thinner than what the invite itself stored. Returning nothing leaves
-/// the stored row for `mark_as_invited` to keep.
+/// the stored row for `mark_as_invited` to keep. A probe that fails to read
+/// the row is an error, not an absence.
 #[implement(Service)]
 async fn replayed_invite_state(
 	&self,
 	room_id: &RoomId,
 	user_id: &UserId,
 	pdu: &PduEvent,
-) -> StrippedRoomState {
+) -> Result<StrippedRoomState> {
 	self.services
 		.state_cache
 		.has_invite_state(user_id, room_id)
-		.await
+		.await?
 		.is_false()
 		.then_async(|| self.summary_stripped(pdu))
+		.map(Ok)
 		.await
 }
 

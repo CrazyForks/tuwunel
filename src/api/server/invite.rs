@@ -90,13 +90,7 @@ pub(crate) async fn create_invite_route(
 		.lock(&body.room_id)
 		.await;
 
-	if !services
-		.state_cache
-		.server_in_room(services.globals.server_name(), &body.room_id)
-		.await
-	{
-		record_local_invite(&services, &body, &invited_user, sender, invite_state, &pdu).await?;
-	}
+	record_local_invite(&services, &body, &invited_user, sender, invite_state, &pdu).await?;
 
 	Ok(create_invite::v2::Response {
 		event: services
@@ -328,7 +322,17 @@ async fn record_local_invite(
 	sender: &UserId,
 	invite_state: Vec<Raw<AnyStrippedStateEvent>>,
 	pdu: &PduEvent,
-) -> Result<()> {
+) -> Result {
+	let state_lock = services.state.mutex.lock(&body.room_id).await;
+
+	if services
+		.state_cache
+		.server_in_room(services.globals.server_name(), &body.room_id)
+		.await
+	{
+		return Ok(());
+	}
+
 	if services
 		.state_accessor
 		.room_state_get_content::<RoomMemberEventContent>(
@@ -360,7 +364,9 @@ async fn record_local_invite(
 			count: PduCount::Normal(*count),
 		})
 		.await?;
+
 	drop(count);
+	drop(state_lock);
 
 	let is_direct = pdu
 		.get_content()
