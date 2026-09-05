@@ -32,6 +32,8 @@ const PNG_DATA: &[u8] = b"IDAT";
 /// Only the extended form can hold a frame sequence, so a file opening with a
 /// plain lossy or lossless chunk is a still without reading further.
 const WEBP_EXTENDED: &[u8] = b"VP8X";
+const WEBP_LOSSY: &[u8] = b"VP8 ";
+const WEBP_LOSSLESS: &[u8] = b"VP8L";
 const WEBP_ANIMATION: u8 = 0x02;
 
 /// Leading byte of each block in a GIF body.
@@ -119,17 +121,24 @@ fn png_animates(bytes: &[u8]) -> bool {
 	}
 }
 
-/// Whether a WebP announces animation in its extended header.
+/// Whether a WebP announces animation in its opening chunk.
 ///
 /// The chunk name and the flags sit at fixed offsets, so this reads two fields
-/// and never walks, and a header cut short of either is unreadable.
+/// and never walks. Only the two plain still forms answer as a still, since a
+/// chunk name neither they nor the extended header claim is a structure this
+/// does not recognize.
 fn webp_animates(bytes: &[u8]) -> bool {
-	bytes.get(12..16).is_none_or(|chunk| {
-		chunk == WEBP_EXTENDED
-			&& bytes
-				.get(20)
-				.is_none_or(|flags| flags & WEBP_ANIMATION != 0)
-	})
+	let Some(chunk) = bytes.get(12..16) else {
+		return true;
+	};
+
+	match chunk {
+		| _ if chunk == WEBP_LOSSY || chunk == WEBP_LOSSLESS => false,
+		| _ if chunk == WEBP_EXTENDED => bytes
+			.get(20)
+			.is_none_or(|flags| flags & WEBP_ANIMATION != 0),
+		| _ => true,
+	}
 }
 
 /// Whether a GIF holds more than one image descriptor.

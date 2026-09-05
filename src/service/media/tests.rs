@@ -179,14 +179,17 @@ mod container {
 	/// Hand-built headers, since only the header is ever read.
 	///
 	/// Every container carries a still and an animated form, so a rule taught
-	/// to one format cannot quietly pass for another, and WebP carries a third
-	/// whose extended header announces no animation. The bodies and checksums
-	/// are whatever the walk skips over rather than real pictures.
+	/// to one format cannot quietly pass for another, and WebP carries two
+	/// more: an extended header announcing no animation, and an opening chunk
+	/// that names no form at all. The bodies and checksums are whatever the
+	/// walk skips over rather than real pictures.
 	const STILL_PNG: &[u8] =
 		b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x00IDATCRC2";
 	const ANIMATED_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x08acTL01234567CRC2\x00\x00\x00\x00IDATCRC3";
 	const STILL_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 \x00\x00\x00\x00\x00\x00\x00\x00\x00";
 	const ANIMATED_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00";
+	const UNKNOWN_CHUNK_WEBP: &[u8] =
+		b"RIFF\x00\x00\x00\x00WEBPICCP\x0a\x00\x00\x00\x00\x00\x00\x00";
 	const EXTENDED_STILL_WEBP: &[u8] =
 		b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\xfd\x00\x00\x00";
 	const STILL_GIF: &[u8] =
@@ -263,6 +266,17 @@ mod container {
 		let chain = SUB_BLOCK.repeat(MANY_SUB_BLOCKS);
 
 		[head, &chain, PICTURE_END].concat()
+	}
+
+	/// A container whose opening chunk names no known form is withheld.
+	///
+	/// Only the two plain still chunks and the extended header are recognized,
+	/// so anything else has not shown the picture to hold a single frame and
+	/// takes the same answer as a truncated one.
+	#[test]
+	fn an_unknown_chunk_is_not_a_still() {
+		assert!(animates(UNKNOWN_CHUNK_WEBP));
+		assert!(!animates(EXTENDED_STILL_WEBP), "the extended header is still recognized");
 	}
 
 	/// An animation cannot be truncated into a still.
