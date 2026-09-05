@@ -107,8 +107,73 @@ async fn exercise(services: &Services) -> Result {
 		return Err!("expected the stored still to answer, got {content_type}");
 	}
 
-	oversized_request_serves_the_original(services, &still).await?;
+	oversized_request_stands_in_for_the_original(services, &still).await?;
 	a_row_is_judged_by_its_picture(services).await
+}
+
+async fn upload<'a>(services: &'a Services, media_id: &'a str) -> Result<Mxc<'a>> {
+	let mxc = Mxc {
+		server_name: services.globals.server_name(),
+		media_id,
+	};
+
+	services
+		.media
+		.create(&mxc, None, None, Some(GIF_TYPE), GIF)
+		.await?;
+
+	Ok(mxc)
+}
+
+async fn thumbnail_type(
+	services: &Services,
+	mxc: &Mxc<'_>,
+	width: u32,
+	height: u32,
+	animate: Animate,
+) -> Result<String> {
+	services
+		.media
+		.get_stored_thumbnail(mxc, &Dim::new(width, height, None), animate)
+		.await
+		.map(|media| media.content_type.unwrap_or_default())
+}
+
+/// A request past the largest bucket is answered out of the original file.
+///
+/// The sentinel every such request normalizes to is the key the original is
+/// stored under, so it cannot also hold a still. A request that may not have
+/// the original is answered by a still carrying the original's own dimensions,
+/// rather than being refused or encoded at the sentinel's zero dimensions.
+async fn oversized_request_stands_in_for_the_original(
+	services: &Services,
+	mxc: &Mxc<'_>,
+) -> Result {
+	let oversized = Dim::new(1200, 900, None);
+
+	let permitted = services
+		.media
+		.get_stored_thumbnail(mxc, &oversized, Animate::Allowed)
+		.await?;
+
+	if permitted.content != GIF {
+		return Err!("a permitting oversized request did not return the original file");
+	}
+
+	let withheld = services
+		.media
+		.get_stored_thumbnail(mxc, &oversized, Animate::Never)
+		.await?;
+
+	let content_type = withheld
+		.content_type
+		.as_deref()
+		.unwrap_or_default();
+
+	match content_type == PNG_TYPE {
+		| true => Ok(()),
+		| false => Err!("a forbidding oversized request was answered with {content_type}"),
+	}
 }
 
 /// A stored row that animates is withheld whatever type it was stored under.
@@ -150,55 +215,4 @@ async fn a_row_is_judged_by_its_picture(services: &Services) -> Result {
 		| true => Err!("a still request was answered with the row's own animated picture"),
 		| false => Ok(()),
 	}
-}
-
-async fn upload<'a>(services: &'a Services, media_id: &'a str) -> Result<Mxc<'a>> {
-	let mxc = Mxc {
-		server_name: services.globals.server_name(),
-		media_id,
-	};
-
-	services
-		.media
-		.create(&mxc, None, None, Some(GIF_TYPE), GIF)
-		.await?;
-
-	Ok(mxc)
-}
-
-async fn thumbnail_type(
-	services: &Services,
-	mxc: &Mxc<'_>,
-	width: u32,
-	height: u32,
-	animate: Animate,
-) -> Result<String> {
-	services
-		.media
-		.get_stored_thumbnail(mxc, &Dim::new(width, height, None), animate)
-		.await
-		.map(|media| media.content_type.unwrap_or_default())
-}
-
-/// A request past the largest bucket names the original rather than a size.
-///
-/// Withholding a variant there would hide the original and ask for a picture
-/// of zero dimensions, which no encoder accepts.
-async fn oversized_request_serves_the_original(services: &Services, mxc: &Mxc<'_>) -> Result {
-	let media = services
-		.media
-		.get_stored_thumbnail(mxc, &Dim::new(1200, 900, None), Animate::Never)
-		.await?;
-
-	let content_type = media.content_type.as_deref().unwrap_or_default();
-
-	if content_type != GIF_TYPE {
-		return Err!("oversized request was answered with {content_type}, expected {GIF_TYPE}");
-	}
-
-	if media.content != GIF {
-		return Err!("oversized request did not return the original file");
-	}
-
-	Ok(())
 }

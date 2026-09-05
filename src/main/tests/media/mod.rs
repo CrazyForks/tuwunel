@@ -104,15 +104,16 @@ pub(crate) struct Answer {
 
 /// The corpus every media regression binary uploads.
 ///
-/// Three sizes span the `Dim::normalized` buckets: `1x1` upscales at every one
-/// and so reaches the passthrough branch, `100x100` straddles them, and
-/// `1000x800` is downscaled by all of them. The APNG uploads as `image/png`,
-/// the one animated shape a content type cannot name, and `anim_as_png.gif`
-/// carries GIF bytes under that same declared type, since an upload stores the
-/// content type a client sends without checking it against the file. The two
-/// truncated entries are the only bodies
-/// that decode partway, one failing at the header and one part way through its
-/// frames, which is what keeps both failure sentinels honest.
+/// Four sizes bracket the `Dim::normalized` buckets: `1x1` upscales at every
+/// one and so reaches the passthrough branch, `100x100` straddles them,
+/// `1000x800` is downscaled by all of them, and `1200x900` covers the largest
+/// request the suite makes, which is past every bucket. The APNG uploads as
+/// `image/png`, the one animated shape a content type cannot name, and
+/// `anim_as_png.gif` carries GIF bytes under that same declared type, since an
+/// upload stores the content type a client sends without checking it against
+/// the file. The two truncated entries are the only bodies that decode
+/// partway, one failing at the header and one part way through its frames,
+/// which is what keeps both failure sentinels honest.
 pub(crate) const CORPUS: &[Source] = &[
 	Source {
 		name: "still_1x1.png",
@@ -158,6 +159,11 @@ pub(crate) const CORPUS: &[Source] = &[
 		name: "anim_1000x800.gif",
 		content_type: "image/gif",
 		bytes: include_bytes!("fixtures/anim_1000x800.gif"),
+	},
+	Source {
+		name: "anim_1200x900.gif",
+		content_type: "image/gif",
+		bytes: include_bytes!("fixtures/anim_1200x900.gif"),
 	},
 	Source {
 		name: "anim_100x100.webp",

@@ -219,9 +219,8 @@ async fn handle_thumbnail_file(
 		None,
 	);
 
-	// a peer's declared type is its own claim, and a row stored under one that
-	// denies its animation is indistinguishable from a still to every later
-	// lookup, which holds the key and not the picture
+	// a peer's declared type is its own claim, and a later lookup holds the key
+	// rather than the picture it would need to catch a wrong one
 	let content_type = animated_type(&content.file).or(content.content_type.as_deref());
 
 	self.upload_thumbnail(mxc, Some(&content_disposition), content_type, dim, &content.file)

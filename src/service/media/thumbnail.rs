@@ -37,15 +37,20 @@ const BYTES_PER_PIXEL: u64 = 4;
 #[cfg(feature = "media_thumbnail")]
 const THUMBNAIL_NAME: &str = "thumbnail.png";
 
+/// Content types naming a container that can carry a frame sequence.
+///
+/// A picture read as animating is stored under the one its header names, so a
+/// later lookup holding the key rather than the picture still knows what the
+/// row carries.
+const APNG: &str = "image/apng";
+const GIF: &str = "image/gif";
+const WEBP: &str = "image/webp";
+
 /// Content types withheld from a request that asked for a still picture.
 ///
 /// A still `image/webp` cannot be told from an animated one without decoding
 /// it, so the family is withheld whole. MSC2705 also names `image/png` for
 /// APNG, which cannot join the list because every generated thumbnail is one.
-const APNG: &str = "image/apng";
-const GIF: &str = "image/gif";
-const WEBP: &str = "image/webp";
-
 pub(super) const ANIMATED_TYPES: [&str; 3] = [APNG, GIF, WEBP];
 
 /// Dimension specification for a thumbnail.
@@ -221,9 +226,13 @@ impl super::Service {
 		dim: &Dim,
 		animate: Animate,
 	) -> Result<Media> {
-		// 0, 0 because that's the original file
 		let dim = dim.normalized();
-		let animate = animate.at(&dim);
+
+		// the sentinel is the key the original is stored under rather than a
+		// size, so a request reaching it is answered from the original itself
+		if dim.is_original() {
+			return self.answer_original(mxc, animate).await;
+		}
 
 		if let Ok(metadata) = self
 			.db
@@ -235,21 +244,8 @@ impl super::Service {
 				.await;
 		}
 
-		// the original may be lazy preview media promoted on this very request;
-		// only an image is worth serving in a thumbnail's place
-		let Ok(metadata) = self
-			.db
-			.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
-			.await
-		else {
-			let media = self.get_stored(mxc).await?;
-
-			return media
-				.content_type
-				.as_deref()
-				.is_some_and(|content_type| content_type.starts_with("image/"))
-				.then_some(media)
-				.ok_or_else(|| err!(Request(NotFound("Media not found."))));
+		let Ok(metadata) = self.original_metadata(mxc).await else {
+			return self.answer_promoted(mxc).await;
 		};
 
 		self.get_thumbnail_generate(mxc, &dim, animate, metadata)
@@ -257,18 +253,96 @@ impl super::Service {
 	}
 }
 
-/// Answers a thumbnail row from the picture already in storage.
+/// Answers a request past every bucket, which names the original file.
 ///
-/// The response hands its body over by value, so the bytes are converted
-/// rather than read in place; the conversion reclaims the storage buffer
-/// whenever this holds the only handle to it.
-#[cfg(not(feature = "media_thumbnail"))]
+/// The original's own row is keyed at the sentinel, where there is no size to
+/// re-encode at, so a picture the request will not accept stands in at its own
+/// dimensions. Those are the largest a still may carry without upscaling, so
+/// the stand-in covers any request the original itself covers and is the best
+/// available where it does not.
+///
+/// The future is not inlined: this branch reaches the thumbnailer, and folding
+/// that into every caller overflows the layout depth limit.
+#[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
-#[tracing::instrument(name = "saved", level = "debug", skip_all)]
-async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
+#[async_noinline]
+#[tracing::instrument(name = "original", level = "debug", skip(self))]
+async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Result<Media> {
+	let Ok(data) = self.original_metadata(mxc).await else {
+		return self.answer_promoted(mxc).await;
+	};
+
 	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
 
-	Ok(into_media(data, bytes.into()))
+	if animate.accepts_picture(&bytes) {
+		return Ok(into_media(data, bytes.into()));
+	}
+
+	let dim = picture_dim(&bytes);
+
+	if let Ok(metadata) = self
+		.db
+		.search_file_metadata(mxc, &dim, animate)
+		.await
+	{
+		return self
+			.answer_stored(mxc, &dim, animate, metadata)
+			.await;
+	}
+
+	// no still can be derived from a picture that will not decode, and every
+	// bucket answers that with the original rather than refusing
+	let Ok(image) = self.decode(&bytes) else {
+		return Ok(into_media(data, bytes.into()));
+	};
+
+	drop((bytes, data));
+
+	self.store_thumbnail(mxc, &dim, image).await
+}
+
+/// Hands the original back, there being no thumbnailer to stand a still in.
+///
+/// A build without the feature keeps serving what it holds rather than
+/// refusing, so a request that forbade animation goes unhonored here.
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "original", level = "debug", skip_all)]
+async fn answer_original(&self, mxc: &Mxc<'_>, _animate: Animate) -> Result<Media> {
+	let Ok(data) = self.original_metadata(mxc).await else {
+		return self.answer_promoted(mxc).await;
+	};
+
+	self.get_thumbnail_saved(data).await
+}
+
+/// Metadata for the original file, which every thumbnail is derived from.
+///
+/// Its row is keyed at the sentinel dimension, and nothing is withheld from
+/// this lookup: the row is the original rather than a variant of it.
+#[implement(super::Service)]
+async fn original_metadata(&self, mxc: &Mxc<'_>) -> Result<Metadata> {
+	self.db
+		.search_file_metadata(mxc, &Dim::default(), Animate::Allowed)
+		.await
+}
+
+/// Answers from stored media when no metadata row names the original.
+///
+/// The original may be lazy preview media promoted on this very request, which
+/// leaves no row behind, and only a picture is worth serving in a thumbnail's
+/// place.
+#[implement(super::Service)]
+#[tracing::instrument(name = "promoted", level = "debug", skip(self))]
+async fn answer_promoted(&self, mxc: &Mxc<'_>) -> Result<Media> {
+	let media = self.get_stored(mxc).await?;
+
+	media
+		.content_type
+		.as_deref()
+		.is_some_and(|content_type| content_type.starts_with("image/"))
+		.then_some(media)
+		.ok_or_else(|| err!(Request(NotFound("Media not found."))))
 }
 
 /// The stored bytes for a thumbnail row, from the first provider holding them.
@@ -298,6 +372,20 @@ async fn fetch_thumbnail_bytes(&self, key: &[u8]) -> Result<Bytes> {
 		.ok_or_else(|| err!(Request(NotFound("Media thumbnail not found."))))
 }
 
+/// The size a picture that may not be served stands in at.
+///
+/// Only the header is read, since the decode this precedes may never happen.
+/// A header that will not read at all falls back to the largest bucket, which
+/// answers smaller than the request but never with the animation.
+#[cfg(feature = "media_thumbnail")]
+fn picture_dim(bytes: &[u8]) -> Dim {
+	reader(bytes)
+		.ok()
+		.and_then(|reader| reader.into_dimensions().ok())
+		.filter(|&(width, height)| width > 0 && height > 0)
+		.map_or_else(Dim::largest, |(width, height)| Dim::new(width, height, Some(Method::Scale)))
+}
+
 /// Answers a request from a stored row, re-deriving a still if it animates.
 ///
 /// The type a row is stored under is whatever produced it claimed, and a peer
@@ -316,9 +404,7 @@ async fn answer_stored(
 ) -> Result<Media> {
 	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
 
-	// the sentinel names the original file rather than a size to re-encode at,
-	// and no encoder accepts the zero dimensions it would ask for
-	if animate.accepts_picture(&bytes) || dim.is_original() {
+	if animate.accepts_picture(&bytes) {
 		return Ok(into_media(data, bytes.into()));
 	}
 
@@ -327,6 +413,33 @@ async fn answer_stored(
 	drop((bytes, data));
 
 	self.store_thumbnail(mxc, dim, image).await
+}
+
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "stored", level = "debug", skip_all)]
+async fn answer_stored(
+	&self,
+	_mxc: &Mxc<'_>,
+	_dim: &Dim,
+	_animate: Animate,
+	data: Metadata,
+) -> Result<Media> {
+	self.get_thumbnail_saved(data).await
+}
+
+/// Answers a thumbnail row from the picture already in storage.
+///
+/// The response hands its body over by value, so the bytes are converted
+/// rather than read in place; the conversion reclaims the storage buffer
+/// whenever this holds the only handle to it.
+#[cfg(not(feature = "media_thumbnail"))]
+#[implement(super::Service)]
+#[tracing::instrument(name = "saved", level = "debug", skip_all)]
+async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
+	let bytes = self.fetch_thumbnail_bytes(&data.key).await?;
+
+	Ok(into_media(data, bytes.into()))
 }
 
 /// Decodes a picture that may not be served in the state it is held in.
@@ -354,30 +467,18 @@ pub(super) async fn store_still(
 	dim: &Dim,
 	animated: Media,
 ) -> Result<Media> {
-	// the sentinel names the original file rather than a size to re-encode at,
-	// and no encoder accepts the zero dimensions it would ask for
-	if dim.is_original() {
-		return Ok(animated);
-	}
+	// the sentinel names the original rather than a size to re-encode at, so
+	// the picture stands in at its own, as it does on the lookup path
+	let standin = dim
+		.is_original()
+		.then(|| picture_dim(&animated.content));
 
 	let image = self.decode_still(&animated.content)?;
 
 	drop(animated);
 
-	self.store_thumbnail(mxc, dim, image).await
-}
-
-#[cfg(not(feature = "media_thumbnail"))]
-#[implement(super::Service)]
-#[tracing::instrument(name = "stored", level = "debug", skip_all)]
-async fn answer_stored(
-	&self,
-	_mxc: &Mxc<'_>,
-	_dim: &Dim,
-	_animate: Animate,
-	data: Metadata,
-) -> Result<Media> {
-	self.get_thumbnail_saved(data).await
+	self.store_thumbnail(mxc, standin.as_ref().unwrap_or(dim), image)
+		.await
 }
 
 /// Hands the picture back as it stands, there being no thumbnailer.
@@ -395,7 +496,6 @@ pub(super) async fn store_still(
 ) -> Result<Media> {
 	Ok(animated)
 }
-
 /// Generate a thumbnail
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
@@ -583,7 +683,7 @@ impl Animate {
 	#[inline]
 	#[must_use]
 	pub fn accepts_type(self, content_type: Option<&str>) -> bool {
-		self.allowed() || !content_type.is_some_and(is_animated_type)
+		self.allowed() || !content_type.is_some_and(declares_animation)
 	}
 
 	/// Returns true when this picture may answer the request.
@@ -594,20 +694,6 @@ impl Animate {
 	#[inline]
 	#[must_use]
 	pub fn accepts_picture(self, bytes: &[u8]) -> bool { self.allowed() || !animates(bytes) }
-
-	/// The preference in force at these dimensions.
-	///
-	/// The zero dimension is the sentinel for a request too large to thumbnail,
-	/// which is answered with the original file, and the original's own row is
-	/// keyed there. Nothing may be withheld from it: doing so both hides the
-	/// original and sends the request on to generate a zero-sized picture.
-	#[must_use]
-	pub fn at(self, dim: &Dim) -> Self {
-		match dim.is_original() {
-			| true => Self::Allowed,
-			| false => self,
-		}
-	}
 }
 
 impl From<Option<bool>> for Animate {
@@ -836,7 +922,7 @@ fn skip_sub_blocks(bytes: &[u8], mut at: usize) -> Option<usize> {
 	}
 }
 
-fn is_animated_type(content_type: &str) -> bool {
+fn declares_animation(content_type: &str) -> bool {
 	let essence = content_type
 		.split_once(';')
 		.map_or(content_type, |(essence, _)| essence)
@@ -919,9 +1005,11 @@ impl Dim {
 		Ok(width == source.width && height == source.height)
 	}
 
-	/// Returns width, height of the thumbnail and whether it should be cropped.
-	/// Returns None when the server should send the original file.
-	/// Ignores the input Method.
+	/// The size a requested one is answered at.
+	///
+	/// Bucketing keeps the number of stored variants bounded, so the requested
+	/// method is discarded along with the requested size. A request above every
+	/// bucket answers the sentinel, which stands for the original file.
 	#[must_use]
 	pub fn normalized(&self) -> Self {
 		match (self.width, self.height) {
@@ -929,10 +1017,18 @@ impl Dim {
 			| (0..=96, 0..=96) => Self::new(96, 96, Some(Method::Crop)),
 			| (0..=320, 0..=240) => Self::new(320, 240, Some(Method::Scale)),
 			| (0..=640, 0..=480) => Self::new(640, 480, Some(Method::Scale)),
-			| (0..=800, 0..=600) => Self::new(800, 600, Some(Method::Scale)),
+			| (0..=800, 0..=600) => Self::largest(),
 			| _ => Self::default(),
 		}
 	}
+
+	/// The largest size a thumbnail is generated at.
+	///
+	/// Every request above this normalizes to the sentinel instead, so it is
+	/// also the fallback for a picture whose own size cannot be read.
+	#[inline]
+	#[must_use]
+	pub fn largest() -> Self { Self::new(800, 600, Some(Method::Scale)) }
 
 	/// Returns true if the method is Crop.
 	#[inline]

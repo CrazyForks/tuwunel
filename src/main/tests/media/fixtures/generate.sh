@@ -3,7 +3,8 @@
 # only to add a format. Sizes are chosen against Dim::normalized's buckets
 # (32x32, 96x96, 320x240, 640x480, 800x600): 1x1 upscales at every bucket and
 # so reaches the passthrough branch, 100x100 straddles them, and 1000x800 is
-# downscaled by all of them.
+# downscaled by all of them. 1200x900 covers the largest request the suite
+# makes, which no bucket does.
 set -eu
 FF="ffmpeg -hide_banner -loglevel error -y"
 
@@ -21,6 +22,9 @@ $FF -f lavfi -i "color=c=teal:s=1x1"      -frames:v 1 still_1x1.gif
 anim anim_100x100.gif  100x100
 # a flat two-tone animation, since testsrc at this size costs 100x the bytes
 $FF -f lavfi -i "color=c=red:s=1000x800:d=1:r=3" -vf "geq=r='if(lt(mod(N,2),1),255,0)':g=0:b=0" anim_1000x800.gif
+# larger than the largest request, so a still standing in for it has room to
+# carry the size that was asked for
+$FF -f lavfi -i "color=c=red:s=1200x900:d=1:r=3" -vf "geq=r='if(lt(mod(N,2),1),255,0)':g=0:b=0" anim_1200x900.gif
 $FF -f lavfi -i "testsrc=size=100x100:rate=3:duration=1" -c:v libwebp_anim -loop 0 anim_100x100.webp
 $FF -f lavfi -i "testsrc=size=100x100:rate=3:duration=1" -c:v apng -plays 0 anim_100x100.apng
 

@@ -80,7 +80,7 @@ fn passthrough_when_crop_request_matches_source() {
 
 mod animate {
 	use super::{
-		super::{Animate, Dim, thumbnail::ANIMATED_TYPES},
+		super::{Animate, thumbnail::ANIMATED_TYPES},
 		scale,
 	};
 
@@ -171,17 +171,6 @@ mod animate {
 		assert!(!scale(800, 600).normalized().is_original());
 		assert!(!scale(32, 32).normalized().is_original());
 	}
-
-	/// Nothing may be withheld at that sentinel.
-	///
-	/// Withholding there hides the original from a request for a still and
-	/// sends it on to generate at zero dimensions, which no encoder accepts.
-	#[test]
-	fn the_original_sentinel_withholds_nothing() {
-		assert_eq!(Animate::Never.at(&Dim::default()), Animate::Allowed);
-		assert_eq!(Animate::Never.at(&scale(1200, 900).normalized()), Animate::Allowed);
-		assert_eq!(Animate::Never.at(&scale(800, 600).normalized()), Animate::Never);
-	}
 }
 
 mod container {
@@ -189,9 +178,10 @@ mod container {
 
 	/// Hand-built headers, since only the header is ever read.
 	///
-	/// Each pair is the animated and the still form of one container, so a
-	/// rule taught to one format cannot quietly pass for another, and the
-	/// bodies are whatever the walk skips over rather than real pictures.
+	/// Every container carries a still and an animated form, so a rule taught
+	/// to one format cannot quietly pass for another, and WebP carries a third
+	/// whose extended header announces no animation. The bodies and checksums
+	/// are whatever the walk skips over rather than real pictures.
 	const STILL_PNG: &[u8] =
 		b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x00IDATCRC2";
 	const ANIMATED_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR0123456789abcCRC1\x00\x00\x00\x08acTL01234567CRC2\x00\x00\x00\x00IDATCRC3";
@@ -216,21 +206,17 @@ mod container {
 	/// an ordinary still animated.
 	const MANY_SUB_BLOCKS: usize = 512;
 
-	/// A still GIF whose one frame is split across many sub-blocks.
-	fn long_still_gif() -> Vec<u8> {
-		let mut gif = STILL_GIF
-			.get(..STILL_GIF.len().saturating_sub(2))
-			.unwrap_or_default()
-			.to_vec();
+	/// One sub-block, holding a single byte of picture data.
+	///
+	/// A sub-block announces its own length, so this is the smallest one and
+	/// the most hops a given amount of data can be made to cost.
+	const SUB_BLOCK: &[u8] = b"\x01\x44";
 
-		for _ in 0..MANY_SUB_BLOCKS {
-			gif.extend_from_slice(b"\x01\x44");
-		}
-
-		gif.extend_from_slice(b"\x00\x3b");
-
-		gif
-	}
+	/// What closes a picture: an empty sub-block, then the trailer.
+	///
+	/// The empty sub-block ends the data chain and the trailer ends the body,
+	/// so a walk reaching this has seen every block the picture holds.
+	const PICTURE_END: &[u8] = b"\x00\x3b";
 
 	/// The frame count of an animation is written nowhere in any of the three.
 	///
@@ -263,6 +249,20 @@ mod container {
 	#[test]
 	fn a_long_frame_does_not_become_an_animation() {
 		assert!(!animates(&long_still_gif()));
+	}
+
+	/// A still GIF whose one frame is split across many sub-blocks.
+	///
+	/// The shared still's own ending is cut off and rebuilt, so the picture
+	/// differs from it in nothing but how far its data chain runs.
+	fn long_still_gif() -> Vec<u8> {
+		let head = STILL_GIF
+			.get(..STILL_GIF.len().saturating_sub(PICTURE_END.len()))
+			.unwrap_or_default();
+
+		let chain = SUB_BLOCK.repeat(MANY_SUB_BLOCKS);
+
+		[head, &chain, PICTURE_END].concat()
 	}
 
 	/// An animation cannot be truncated into a still.
