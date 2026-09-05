@@ -315,7 +315,7 @@ mod animation {
 		codecs::gif::{GifDecoder, GifEncoder},
 	};
 
-	use super::{super::thumbnail::encode_frames, scale};
+	use super::{super::thumbnail::animate::encode_frames, scale};
 
 	/// Pixels the tests give the encoder to spend, past anything they need.
 	const BUDGET: u64 = 1_000_000;
