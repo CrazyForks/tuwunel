@@ -57,28 +57,61 @@ const GIF_TABLE_SIZE: u8 = 0x07;
 /// sequence follows that.
 const GIF_HEADER_LEN: usize = 13;
 
-/// Whether these bytes carry more than one frame.
+/// What a container's header settles about a frame sequence.
 ///
-/// The container header decides this rather than the declared content type,
-/// which an upload takes from the client without checking it against the file.
-pub(in super::super) fn animates(bytes: &[u8]) -> bool { animated_type(bytes).is_some() }
+/// The two questions a caller asks of it want opposite defaults, so an
+/// unsettled walk is its own answer rather than being folded into either.
+enum Sequence {
+	/// This picture holds no sequence, either because its container cannot or
+	/// because the walk reached the end of one.
+	Absent,
+
+	/// The walk found a sequence, in a container of this type.
+	Present(&'static str),
+
+	/// The walk ran out of picture, or met a structure it does not know.
+	Unsettled,
+}
+
+/// Whether these bytes may carry more than one frame.
+///
+/// Only a settled walk answers false, so a truncated or unrecognized picture is
+/// withheld from a request that forbade animation rather than served to it.
+pub(in super::super) fn animates(bytes: &[u8]) -> bool {
+	!matches!(sequence(bytes), Sequence::Absent)
+}
 
 /// The content type an animating picture ought to be stored under.
 ///
-/// A picture that does not animate answers `None`, its declared type being no
-/// worse than anything read from its header, and so does one in any other
-/// format, none of which carries a frame sequence.
+/// Only a settled walk answers `Some`, since this names what a picture is
+/// rather than deciding what may be served, and a guess would be recorded as
+/// fact. An unsettled walk leaves the declared type in place, where the picture
+/// itself is still read before anything is served from it.
 pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
+	match sequence(bytes) {
+		| Sequence::Present(content_type) => Some(content_type),
+		| Sequence::Absent | Sequence::Unsettled => None,
+	}
+}
+
+/// Walks the container its first bytes name.
+fn sequence(bytes: &[u8]) -> Sequence {
 	let is_gif = GIF_MAGIC
 		.iter()
 		.any(|magic| bytes.starts_with(magic));
 
-	match bytes {
-		| _ if bytes.starts_with(PNG_MAGIC) => png_animates(bytes).then_some(APNG),
+	let (content_type, settled) = match bytes {
+		| _ if bytes.starts_with(PNG_MAGIC) => (APNG, png_animates(bytes)),
 		| _ if bytes.starts_with(RIFF_MAGIC) && bytes.get(8..12) == Some(WEBP_MAGIC) =>
-			webp_animates(bytes).then_some(WEBP),
-		| _ if is_gif => gif_animates(bytes).then_some(GIF),
-		| _ => None,
+			(WEBP, webp_animates(bytes)),
+		| _ if is_gif => (GIF, gif_animates(bytes)),
+		| _ => return Sequence::Absent,
+	};
+
+	match settled {
+		| Some(true) => Sequence::Present(content_type),
+		| Some(false) => Sequence::Absent,
+		| None => Sequence::Unsettled,
 	}
 }
 
@@ -86,38 +119,29 @@ pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
 ///
 /// Each hop clears a whole chunk, so the walk advances by at least its twelve
 /// byte frame every time and ends when a hop lands past the picture.
-fn png_animates(bytes: &[u8]) -> bool {
-	let Some(mut rest) = bytes.get(PNG_MAGIC.len()..) else {
-		return true;
-	};
+fn png_animates(bytes: &[u8]) -> Option<bool> {
+	let mut rest = bytes.get(PNG_MAGIC.len()..)?;
 
 	loop {
-		let Some(kind) = rest.get(4..8) else {
-			return true;
-		};
+		let kind = rest.get(4..8)?;
 
 		if kind == PNG_ANIMATION {
-			return true;
+			return Some(true);
 		}
 
 		if kind == PNG_DATA {
-			return false;
+			return Some(false);
 		}
 
 		// the length counts the data alone, which follows a four byte length
 		// and a four byte type and precedes a four byte checksum
-		let Some(next) = rest
+		rest = rest
 			.get(..4)
 			.and_then(|field| field.try_into().ok())
 			.map(u32::from_be_bytes)
 			.and_then(|length| usize::try_from(length).ok())
 			.and_then(|length| length.checked_add(12))
-			.and_then(|skip| rest.get(skip..))
-		else {
-			return true;
-		};
-
-		rest = next;
+			.and_then(|skip| rest.get(skip..))?;
 	}
 }
 
@@ -127,17 +151,15 @@ fn png_animates(bytes: &[u8]) -> bool {
 /// and never walks. Only the two plain still forms answer as a still, since a
 /// chunk name neither they nor the extended header claim is a structure this
 /// does not recognize.
-fn webp_animates(bytes: &[u8]) -> bool {
-	let Some(chunk) = bytes.get(12..16) else {
-		return true;
-	};
+fn webp_animates(bytes: &[u8]) -> Option<bool> {
+	let chunk = bytes.get(12..16)?;
 
 	match chunk {
-		| _ if chunk == WEBP_LOSSY || chunk == WEBP_LOSSLESS => false,
+		| _ if chunk == WEBP_LOSSY || chunk == WEBP_LOSSLESS => Some(false),
 		| _ if chunk == WEBP_EXTENDED => bytes
 			.get(20)
-			.is_none_or(|flags| flags & WEBP_ANIMATION != 0),
-		| _ => true,
+			.map(|flags| flags & WEBP_ANIMATION != 0),
+		| _ => None,
 	}
 }
 
@@ -147,46 +169,33 @@ fn webp_animates(bytes: &[u8]) -> bool {
 /// until a second image is found or the trailer ends them. Every block clears
 /// at least its own introducer and a terminating sub-block, so the offset
 /// rises on every pass and a walk that runs off the picture ends.
-fn gif_animates(bytes: &[u8]) -> bool {
-	let Some(&screen) = bytes.get(10) else {
-		return true;
-	};
-
+fn gif_animates(bytes: &[u8]) -> Option<bool> {
+	let &screen = bytes.get(10)?;
 	let global_table = (screen & GIF_COLOR_TABLE != 0)
 		.then(|| color_table_len(screen))
 		.unwrap_or_default();
 
-	let Some(mut at) = global_table.checked_add(GIF_HEADER_LEN) else {
-		return true;
-	};
-
+	let mut at = global_table.checked_add(GIF_HEADER_LEN)?;
 	let mut seen = false;
 
 	loop {
-		let Some(&block) = bytes.get(at) else {
-			return true;
-		};
-
+		let &block = bytes.get(at)?;
 		let image = block == GIF_IMAGE;
 
 		if image && seen {
-			return true;
+			return Some(true);
 		}
 
 		seen |= image;
 
 		let next = match block {
-			| GIF_TRAILER => return false,
+			| GIF_TRAILER => return Some(false),
 			| GIF_EXTENSION => at.checked_add(2),
 			| GIF_IMAGE => image_data_start(bytes, at),
-			| _ => return true,
+			| _ => return None,
 		};
 
-		let Some(after) = next.and_then(|next| skip_sub_blocks(bytes, next)) else {
-			return true;
-		};
-
-		at = after;
+		at = next.and_then(|next| skip_sub_blocks(bytes, next))?;
 	}
 }
 

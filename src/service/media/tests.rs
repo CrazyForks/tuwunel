@@ -174,7 +174,7 @@ mod animate {
 }
 
 mod container {
-	use super::super::thumbnail::animates;
+	use super::super::thumbnail::{animated_type, animates};
 
 	/// Hand-built headers, since only the header is ever read.
 	///
@@ -277,6 +277,23 @@ mod container {
 	fn an_unknown_chunk_is_not_a_still() {
 		assert!(animates(UNKNOWN_CHUNK_WEBP));
 		assert!(!animates(EXTENDED_STILL_WEBP), "the extended header is still recognized");
+	}
+
+	/// A walk that cannot settle names no type, though it still withholds.
+	///
+	/// The two questions want opposite defaults: what may be served fails
+	/// closed, but what a picture is would be recorded as fact, and a truncated
+	/// still would then be stored as the animation it is not.
+	#[test]
+	fn an_unsettled_walk_names_no_type() {
+		let cut = ANIMATED_PNG
+			.get(..NAMED_BYTES)
+			.unwrap_or(ANIMATED_PNG);
+
+		assert!(animates(cut), "an unsettled walk still withholds");
+		assert!(animated_type(cut).is_none(), "but it names nothing");
+		assert_eq!(animated_type(ANIMATED_PNG), Some("image/apng"));
+		assert_eq!(animated_type(STILL_PNG), None);
 	}
 
 	/// An animation cannot be truncated into a still.
