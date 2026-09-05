@@ -353,6 +353,8 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		clear_servername_status(services).await?;
 	}
 
+	services.server.check_running()?;
+
 	// Non-destructive and idempotent, so it runs every boot rather than once: a
 	// suspension added by an origin server after a prior tuwunel boot still
 	// carries on the next one.
@@ -374,6 +376,8 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		db["global"].insert("adopt_foreign_email_bindings", []);
 	}
 
+	services.server.check_running()?;
+
 	// A newer same-lineage database was already refused; stamping ours is safe. A
 	// foreign import above our version was already stamped down before the import
 	// ran, so this is a no-op for it.
@@ -392,7 +396,7 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		| Ordering::Equal => {},
 	}
 
-	warn_forbidden_names(services).await;
+	warn_forbidden_names(services).await?;
 
 	info!("Loaded RocksDB database with schema version {DATABASE_VERSION}");
 
@@ -403,8 +407,10 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 ///
 /// The patterns are advisory rather than enforced retroactively, so a match
 /// only names the user or the alias in the log. Neither scan runs when its own
-/// pattern list is empty.
-async fn warn_forbidden_names(services: &Services) {
+/// pattern list is empty or once shutdown begins.
+async fn warn_forbidden_names(services: &Services) -> Result {
+	services.server.check_running()?;
+
 	if !services.config.forbidden_usernames.is_empty() {
 		services
 			.server
@@ -432,6 +438,8 @@ async fn warn_forbidden_names(services: &Services) {
 			})
 			.await;
 	}
+
+	services.server.check_running()?;
 
 	if !services.config.forbidden_alias_names.is_empty() {
 		services
@@ -470,6 +478,8 @@ async fn warn_forbidden_names(services: &Services) {
 			.boxed()
 			.await;
 	}
+
+	Ok(())
 }
 
 /// Whether a named migration step still needs to run, refusing once shutdown
@@ -483,16 +493,26 @@ async fn warn_forbidden_names(services: &Services) {
 async fn pending(services: &Services, marker: &'static str) -> Result<bool> {
 	services.server.check_running()?;
 
-	let pending = services.db["global"]
-		.get(marker)
-		.await
-		.is_not_found();
+	let pending = !marker_present(services, marker).await?;
 
 	if pending {
 		services.server.progress.begin(marker);
 	}
 
 	Ok(pending)
+}
+
+/// Whether a migration step has stamped its marker.
+///
+/// Only a missing marker reads as absent. A read that fails propagates, so a
+/// step is never skipped on the strength of a failed read.
+pub(super) async fn marker_present(services: &Services, marker: &str) -> Result<bool> {
+	services.db["global"]
+		.get(marker)
+		.await
+		.optional()
+		.inspect_err(|error| warn!(%marker, %error, "Migration marker failed to read"))
+		.map(|stamp| stamp.is_some())
 }
 
 /// Assembles a local user id from a localpart a foreign column records.
