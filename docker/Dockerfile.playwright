@@ -15,6 +15,8 @@ COPY <<EOF /playwright/playwright.toml
     server_name = "localhost"
     database_path = "/database"
     db_pool_max_workers = 64
+    argon2_m_cost = 64
+    argon2_t_cost = 1
     allow_registration = true
     yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse = true
     allow_guest_registration = false

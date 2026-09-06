@@ -29,6 +29,8 @@ COPY <<EOF /mas/tuwunel.toml
     log_span_events = "NONE"
     media_startup_check = false
     rocksdb_parallelism_threads = 2
+    argon2_m_cost = 64
+    argon2_t_cost = 1
     startup_netburst = false
     admin_room_notices = false
     create_admin_room = false
