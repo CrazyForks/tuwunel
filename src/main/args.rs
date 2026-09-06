@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, builder::RangedU64ValueParser};
 use tuwunel_core::{
 	Err, Result,
 	config::{Figment, FigmentValue},
@@ -189,12 +189,13 @@ pub struct Args {
 
 	/// Set the poll histogram bucket count (tokio_unstable).
 	///
-	/// Default is 15.
+	/// Default is 15, and the value must be at least 1.
 	#[arg(
 		long,
 		hide(true),
 		env = "TUWUNEL_RUNTIME_POLL_HISTOGRAM_BUCKETS",
-		default_value = "15"
+		default_value = "15",
+		value_parser = histogram_buckets_parser()
 	)]
 	pub worker_poll_histogram_buckets: usize,
 
@@ -217,14 +218,16 @@ pub struct Args {
 
 	/// Set the scheduler histogram bucket count (tokio_unstable).
 	///
-	/// Default is 15. Every bucket but the last spans one bucket size; the
-	/// last is unbounded above, so the count and the bucket size together set
-	/// the latency beyond which the histogram stops resolving.
+	/// Default is 15, and the value must be at least 1. Every bucket but the
+	/// last spans one bucket size; the last is unbounded above, so the count
+	/// and the bucket size together set the latency beyond which the histogram
+	/// stops resolving.
 	#[arg(
 		long,
 		hide(true),
 		env = "TUWUNEL_RUNTIME_SCHED_HISTOGRAM_BUCKETS",
-		default_value = "15"
+		default_value = "15",
+		value_parser = histogram_buckets_parser()
 	)]
 	pub worker_sched_histogram_buckets: usize,
 
@@ -296,6 +299,10 @@ pub struct Args {
 		require_equals(false),
 	)]
 	pub gc_muzzy: Option<bool>,
+}
+
+fn histogram_buckets_parser() -> RangedU64ValueParser<usize> {
+	RangedU64ValueParser::new().range(1..)
 }
 
 /// Returns arguments for a test, naming the harnesses it opts into.
@@ -585,5 +592,16 @@ mod tests {
 
 		Args::try_parse_from(["tuwunel".into(), long("strip-unknown")])
 			.expect_err("residue stripping without regeneration rejected");
+	}
+
+	#[test]
+	fn histogram_bucket_counts_must_be_positive() {
+		for option in ["worker-poll-histogram-buckets", "worker-sched-histogram-buckets"] {
+			Args::try_parse_from(["tuwunel".into(), long(option), "0".into()])
+				.expect_err("zero histogram buckets rejected");
+
+			Args::try_parse_from(["tuwunel".into(), long(option), "1".into()])
+				.expect("one histogram bucket accepted");
+		}
 	}
 }
