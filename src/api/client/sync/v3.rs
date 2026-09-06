@@ -2491,8 +2491,8 @@ mod tests {
 	#[test]
 	fn thread_only_reset_delivers_zeros() {
 		// Thread cursors also gate zeros, even on busy rounds.
-		let mut thread_reads = BTreeMap::new();
-		thread_reads.insert(EventId::parse("$thread:example.org").unwrap(), 150);
+		let root = EventId::parse("$thread:example.org").unwrap();
+		let thread_reads = BTreeMap::from([(root, 150)]);
 
 		let gates = notification_gates(None, &thread_reads, false, false);
 
