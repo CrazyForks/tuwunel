@@ -123,7 +123,8 @@ pub(crate) fn new(server: &Arc<Server>) -> Result<Arc<Self>> {
 	});
 
 	for (chan_id, &count) in workers.iter().enumerate() {
-		pool.spawn_group(&receivers, chan_id, count)?;
+		pool.spawn_group(&receivers, chan_id, count)
+			.inspect_err(|_| pool.close())?;
 	}
 
 	Ok(pool)
