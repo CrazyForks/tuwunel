@@ -5,12 +5,13 @@ use std::{
 		atomic::{AtomicBool, Ordering},
 	},
 	task::{Context, Waker},
+	time::Duration,
 };
 
 use crate::{
 	Error, Result,
 	utils::{
-		self, MutexMap, math::usize_from_f64, two_phase_counter::Counter,
+		self, MutexMap, math::usize_from_f64, time::pretty, two_phase_counter::Counter,
 		url::hostname_matches_domain,
 	},
 };
@@ -93,6 +94,11 @@ fn usize_from_f64_enforces_exclusive_bound() {
 	assert_eq!(usize_from_f64(bound.next_down()).unwrap(), preceding);
 	assert!(matches!(usize_from_f64(bound), Err(Error::Arithmetic(_))));
 	assert!(matches!(usize_from_f64(bound.next_up()), Err(Error::Arithmetic(_))));
+}
+
+#[test]
+fn pretty_zero_pads_the_fraction() {
+	assert_eq!(pretty(Duration::from_secs(12 * 60 + 3)), "12.05 minutes");
 }
 
 #[tokio::test]

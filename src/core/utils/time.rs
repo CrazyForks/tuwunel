@@ -151,7 +151,7 @@ pub fn format(ts: SystemTime, str: &str) -> String {
 ///
 /// The unit and scale component come from [`whole_and_frac`]. Output has the
 /// form `{whole}.{scaled} {unit}`, where `scaled` is the component multiplied
-/// by 100, truncated to an integer, and emitted without zero padding.
+/// by 100, truncated to an integer, and zero-padded to two digits.
 #[must_use]
 #[expect(
 	clippy::as_conversions,
@@ -161,7 +161,7 @@ pub fn format(ts: SystemTime, str: &str) -> String {
 pub fn pretty(d: Duration) -> String {
 	use Unit::*;
 
-	let fmt = |w, f, u| format!("{w}.{f} {u}");
+	let fmt = |w, f, u| format!("{w}.{f:02} {u}");
 	let gen64 = |w, f, u| fmt(w, (f * 100.0) as u32, u);
 	let gen128 = |w, f, u| gen64(u64::try_from(w).expect("u128 to u64"), f, u);
 	match whole_and_frac(d) {
