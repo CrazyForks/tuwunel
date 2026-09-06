@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::TryStreamExt;
 use ruma::{EventId, OwnedEventId, RoomId, events::StateEventType};
-use tuwunel_core::{Result, debug_warn, implement};
+use tuwunel_core::{Result, debug_warn, implement, result::NotFound};
 use tuwunel_database::Deserialized;
 
 use crate::rooms::{short::ShortStateHash, state_compressor::CompressedState};
@@ -19,13 +19,13 @@ type StateIds = HashMap<u64, OwnedEventId>;
 /// Missing cache data remains a miss; materialization failures remain errors.
 #[implement(super::Service)]
 pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<Option<StateIds>> {
-	let Some(shortstatehash): Option<ShortStateHash> = optional_lookup(
-		self.db
-			.eventid_resolvedstate
-			.get(event_id)
-			.await
-			.deserialized(),
-	)?
+	let Some(shortstatehash): Option<ShortStateHash> = self
+		.db
+		.eventid_resolvedstate
+		.get(event_id)
+		.await
+		.deserialized()
+		.optional()?
 	else {
 		return Ok(None);
 	};
@@ -39,12 +39,12 @@ pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<O
 
 	// A room purge drops the events this map names; the create event goes only in
 	// a full purge, so reject the hit when it is gone and let the caller refetch.
-	let Some(create_shortstatekey) = optional_lookup(
-		self.services
-			.short
-			.get_shortstatekey(&StateEventType::RoomCreate, "")
-			.await,
-	)?
+	let Some(create_shortstatekey) = self
+		.services
+		.short
+		.get_shortstatekey(&StateEventType::RoomCreate, "")
+		.await
+		.optional()?
 	else {
 		return Ok(None);
 	};
@@ -62,14 +62,6 @@ pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<O
 	let state = create_present.then_some(state);
 
 	Ok(state)
-}
-
-fn optional_lookup<T>(result: Result<T>) -> Result<Option<T>> {
-	match result {
-		| Ok(value) => Ok(Some(value)),
-		| Err(error) if error.is_not_found() => Ok(None),
-		| Err(error) => Err(error),
-	}
 }
 
 /// Persist the state resolved for `event_id` over federation so a later walk of

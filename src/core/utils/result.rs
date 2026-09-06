@@ -19,6 +19,9 @@ mod not_found;
 mod unwrap_infallible;
 mod unwrap_or_err;
 
+#[cfg(test)]
+mod tests;
+
 pub use self::{
 	and_then_ref::AndThenRef,
 	debug_inspect::DebugInspect,
