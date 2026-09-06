@@ -55,6 +55,21 @@ fn a_locked_account_error_carries_a_401() {
 }
 
 #[test]
+fn a_suspended_account_error_carries_a_403() {
+	let ours = [
+		Error::BadRequest(ErrorKind::UserSuspended, "This account has been suspended."),
+		Error::Request(ErrorKind::UserSuspended, Cow::Borrowed(""), StatusCode::BAD_REQUEST),
+	];
+
+	for error in ours {
+		let (status, kind) = client_response(error);
+
+		assert_eq!(status, StatusCode::FORBIDDEN, "suspended accounts require 403");
+		assert_eq!(kind, ErrorKind::UserSuspended);
+	}
+}
+
+#[test]
 fn a_remote_uri_bearing_error_is_withheld() {
 	let user_limit = ErrorKind::UserLimitExceeded(UserLimitExceededErrorData {
 		info_uri: "https://remote.example/pay".to_owned(),
