@@ -48,9 +48,9 @@ where
 		.flat_map(IntoIterator::into_iter)
 	{
 		let acc = occurrences
-			.entry(k.clone())
+			.entry(k)
 			.or_default()
-			.entry(v.clone())
+			.entry(v)
 			.or_default();
 
 		*acc = acc.saturating_add(1);
@@ -62,7 +62,7 @@ where
 	for (k, v) in occurrences {
 		for (id, occurrence_count) in v {
 			if occurrence_count == state_set_count {
-				unconflicted_state_map.insert((k.0.clone(), k.1.clone()), id.clone());
+				unconflicted_state_map.insert((k.0.clone(), k.1.clone()), id);
 			} else {
 				let conflicts = conflicted_state_set
 					.entry((k.0.clone(), k.1.clone()))
@@ -73,7 +73,7 @@ where
 					"Unexpected duplicate conflicted state event"
 				);
 
-				conflicts.push(id.clone());
+				conflicts.push(id);
 			}
 		}
 	}

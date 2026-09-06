@@ -17,8 +17,7 @@ use serde_json::from_str;
 use tuwunel_core::{
 	Err, Result, debug_warn, err,
 	matrix::{Event, pdu::PduBuilder},
-	utils::{self},
-	warn,
+	utils, warn,
 };
 use tuwunel_service::Services;
 

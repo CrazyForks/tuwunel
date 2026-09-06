@@ -1,9 +1,7 @@
 use axum::extract::State;
 use futures::{FutureExt, StreamExt, pin_mut};
 use ruma::{
-	UserId,
-	api::client::user_directory::search_users::{self},
-	events::room::join_rules::JoinRule,
+	UserId, api::client::user_directory::search_users, events::room::join_rules::JoinRule,
 };
 use tuwunel_core::{
 	Result,

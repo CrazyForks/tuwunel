@@ -1,7 +1,7 @@
 use axum::extract::State;
 use ruma::api::client::discovery::{
 	discover_homeserver::{self, HomeserverInfo},
-	discover_support::{self},
+	discover_support,
 };
 use tuwunel_core::{Err, Result};
 

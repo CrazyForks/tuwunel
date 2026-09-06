@@ -79,7 +79,7 @@ pub(super) async fn do_check(
 		let state_after = state_after_with(&state_before, fake_event, &event_id);
 		let event = rebuild_with_auth(fake_event, &auth_events, prev_events);
 
-		store.0.insert(event_id.clone(), event.clone());
+		store.0.insert(event_id.clone(), event);
 		event_map.insert(event_id.clone(), store.0[&event_id].clone());
 		state_at_event.insert(node, state_after);
 	}

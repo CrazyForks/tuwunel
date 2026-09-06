@@ -2,7 +2,7 @@ use axum::extract::State;
 use futures::{FutureExt, StreamExt, pin_mut};
 use ruma::{
 	api::client::membership::{
-		get_member_events::{self},
+		get_member_events,
 		joined_members::{self, v3::RoomMember},
 	},
 	events::{
