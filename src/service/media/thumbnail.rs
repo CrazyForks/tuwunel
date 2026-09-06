@@ -19,7 +19,7 @@ use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
 use tokio::sync::Notify;
 use tuwunel_core::{
 	Err, Result, async_noinline, checked, err, implement,
-	utils::{result::LogDebugErr, stream::IterStream},
+	utils::{BoolExt, result::LogDebugErr, stream::IterStream},
 };
 
 use super::{Media, data::Metadata};
@@ -390,12 +390,20 @@ async fn fetch_bytes(&self, key: &[u8]) -> Result<Bytes> {
 /// A header that will not read at all falls back to the largest bucket, which
 /// answers smaller than the request but never with the animation.
 #[cfg(feature = "media_thumbnail")]
-fn picture_dim(bytes: &[u8]) -> Dim {
+fn picture_dim(bytes: &[u8]) -> Dim { header_dim(bytes).unwrap_or_else(Dim::largest) }
+
+/// The dimensions this picture's own header declares.
+///
+/// A header that will not read, or that reads as having no extent, answers
+/// `None` rather than a size nothing could be encoded at. Callers that must
+/// name a size regardless take [`picture_dim`] instead.
+#[cfg(feature = "media_thumbnail")]
+fn header_dim(bytes: &[u8]) -> Option<Dim> {
 	reader(bytes)
 		.ok()
 		.and_then(|reader| reader.into_dimensions().ok())
 		.filter(|&(width, height)| width > 0 && height > 0)
-		.map_or_else(Dim::largest, |(width, height)| Dim::new(width, height, Some(Method::Scale)))
+		.map(|(width, height)| Dim::new(width, height, Some(Method::Scale)))
 }
 
 /// Answers a request from a stored row, re-deriving a still if it animates.
@@ -530,13 +538,20 @@ async fn get_thumbnail_generate(
 	data: Metadata,
 ) -> Result<Media> {
 	let bytes = self.fetch_bytes(&data.key).await?;
-	let animated = match self.animates_at(dim, &bytes)? {
-		| true => self
-			.store_animated(mxc, dim, bytes.clone())
-			.await
-			.ok(),
-		| false => None,
-	};
+
+	let encoded = self
+		.animates_at(dim, &bytes)?
+		.then_async(async || {
+			self.store_animated(mxc, dim, bytes.clone())
+				.await
+				.ok()
+		})
+		.await
+		.flatten();
+
+	// the variant this request did not ask for is left stored rather than held,
+	// so its buffer is not carried across the still encode below
+	let animated = animate.allowed().and(encoded);
 
 	let media = into_media(data, bytes.into());
 	let frame = self.video_frame(mxc, dim, &media).await;
@@ -549,8 +564,9 @@ async fn get_thumbnail_generate(
 			self.remember_failure(mxc);
 		}
 
-		// Couldn't parse file to generate thumbnail, send original
-		return Ok(preferred(animate, animated, media));
+		// no still can be derived from a picture that will not decode, so the
+		// original answers unless an animated variant was stored for this
+		return Ok(animated.unwrap_or(media));
 	};
 
 	drop(frame);
@@ -568,7 +584,7 @@ async fn get_thumbnail_generate(
 
 	let still = self.store_thumbnail(mxc, dim, image).await?;
 
-	Ok(preferred(animate, animated, still))
+	Ok(animated.unwrap_or(still))
 }
 
 /// Hands the original back in place of the thumbnail it cannot generate.
@@ -602,20 +618,14 @@ fn animates_at(&self, dim: &Dim, content: &[u8]) -> Result<bool> {
 		return Ok(false);
 	}
 
-	dim.is_passthrough(&picture_dim(content))
-		.map(|through| !through)
-}
+	// the passthrough below is tested against the decoded size, so a header
+	// that will not read would leave the two disagreeing over one picture
+	let Some(source) = header_dim(content) else {
+		return Ok(false);
+	};
 
-/// The variant this request asked for, keeping the still when it forbade one.
-///
-/// Both are already stored by the time this chooses, so the one not taken is
-/// what the next request of the other kind is answered with.
-#[cfg(feature = "media_thumbnail")]
-fn preferred(animate: Animate, animated: Option<Media>, still: Media) -> Media {
-	match animated.filter(|_| animate.allowed()) {
-		| Some(animated) => animated,
-		| None => still,
-	}
+	dim.is_passthrough(&source)
+		.map(|through| !through)
 }
 
 /// Encode a still PNG thumbnail at these dimensions and store it.
@@ -781,10 +791,7 @@ impl Animate {
 	#[inline]
 	#[must_use]
 	pub fn prefers_type(self, content_type: Option<&str>) -> bool {
-		match self {
-			| Self::Allowed => content_type.is_some_and(declares_animation),
-			| Self::Never => !content_type.is_some_and(declares_animation),
-		}
+		self.allowed() == content_type.is_some_and(declares_animation)
 	}
 
 	/// Returns true when this picture may answer the request.
