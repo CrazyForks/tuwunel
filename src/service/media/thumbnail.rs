@@ -17,9 +17,11 @@ use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType
 use ruma::http_headers::ContentDispositionType;
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
 use tokio::sync::Notify;
+#[cfg(feature = "media_thumbnail")]
+use tuwunel_core::utils::BoolExt;
 use tuwunel_core::{
 	Err, Result, async_noinline, checked, err, implement,
-	utils::{BoolExt, result::LogDebugErr, stream::IterStream},
+	utils::{result::LogDebugErr, stream::IterStream},
 };
 
 use super::{Media, data::Metadata};
@@ -253,7 +255,7 @@ impl super::Service {
 		}
 
 		let Ok(metadata) = self.original_metadata(mxc).await else {
-			return self.answer_promoted(mxc).await;
+			return self.answer_promoted(mxc, animate).await;
 		};
 
 		self.get_thumbnail_generate(mxc, &dim, animate, metadata)
@@ -277,7 +279,7 @@ impl super::Service {
 #[tracing::instrument(name = "original", level = "debug", skip(self))]
 async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Result<Media> {
 	let Ok(data) = self.original_metadata(mxc).await else {
-		return self.answer_promoted(mxc).await;
+		return self.answer_promoted(mxc, animate).await;
 	};
 
 	let bytes = self.fetch_bytes(&data.key).await?;
@@ -305,7 +307,10 @@ async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Re
 	// no still can be derived from a picture that will not decode, and every
 	// bucket answers that with the original rather than refusing
 	let Ok(image) = self.decode(&bytes) else {
-		return Ok(into_media(data, bytes.into()));
+		return match animate.accepts_fallback(&bytes) {
+			| true => Ok(into_media(data, bytes.into())),
+			| false => Err!(Request(NotFound("Media thumbnail not found."))),
+		};
 	};
 
 	drop((bytes, data));
@@ -320,9 +325,9 @@ async fn answer_original<'a>(&'a self, mxc: &'a Mxc<'_>, animate: Animate) -> Re
 #[cfg(not(feature = "media_thumbnail"))]
 #[implement(super::Service)]
 #[tracing::instrument(name = "original", level = "debug", skip_all)]
-async fn answer_original(&self, mxc: &Mxc<'_>, _animate: Animate) -> Result<Media> {
+async fn answer_original(&self, mxc: &Mxc<'_>, animate: Animate) -> Result<Media> {
 	let Ok(data) = self.original_metadata(mxc).await else {
-		return self.answer_promoted(mxc).await;
+		return self.answer_promoted(mxc, animate).await;
 	};
 
 	self.get_thumbnail_saved(data).await
@@ -343,16 +348,19 @@ async fn original_metadata(&self, mxc: &Mxc<'_>) -> Result<Metadata> {
 ///
 /// The original may be lazy preview media promoted on this very request, which
 /// leaves no row behind, and only a picture is worth serving in a thumbnail's
-/// place.
+/// place. No row having named it, the request's own preference is the only gate
+/// it passes, so the picture is read here as it is anywhere else.
 #[implement(super::Service)]
 #[tracing::instrument(name = "promoted", level = "debug", skip(self))]
-async fn answer_promoted(&self, mxc: &Mxc<'_>) -> Result<Media> {
+async fn answer_promoted(&self, mxc: &Mxc<'_>, animate: Animate) -> Result<Media> {
 	let media = self.get_stored(mxc).await?;
-
-	media
+	let servable = media
 		.content_type
 		.as_deref()
 		.is_some_and(|content_type| content_type.starts_with("image/"))
+		&& animate.accepts_picture(&media.content);
+
+	servable
 		.then_some(media)
 		.ok_or_else(|| err!(Request(NotFound("Media not found."))))
 }
@@ -564,9 +572,17 @@ async fn get_thumbnail_generate(
 			self.remember_failure(mxc);
 		}
 
-		// no still can be derived from a picture that will not decode, so the
-		// original answers unless an animated variant was stored for this
-		return Ok(animated.unwrap_or(media));
+		if let Some(animated) = animated {
+			return Ok(animated);
+		}
+
+		// no still can be derived from a picture that will not decode, and the
+		// original answers in its place unless it is the animation the request
+		// forbade
+		return match animate.accepts_fallback(&media.content) {
+			| true => Ok(media),
+			| false => Err!(Request(NotFound("Media thumbnail not found."))),
+		};
 	};
 
 	drop(frame);
@@ -802,6 +818,19 @@ impl Animate {
 	#[inline]
 	#[must_use]
 	pub fn accepts_picture(self, bytes: &[u8]) -> bool { self.allowed() || !animates(bytes) }
+
+	/// Returns true when this picture may answer in a thumbnail's place.
+	///
+	/// Nothing can be derived from a picture that will not decode, so the
+	/// choice is between the original and refusing media the server holds. Only
+	/// a walk that settled on animation withholds it here, where
+	/// [`Self::accepts_picture`] withholds anything it could not settle, since
+	/// refusing every unreadable still would cost more than it buys.
+	#[inline]
+	#[must_use]
+	pub fn accepts_fallback(self, bytes: &[u8]) -> bool {
+		self.allowed() || animated_type(bytes).is_none()
+	}
 }
 
 impl From<Option<bool>> for Animate {

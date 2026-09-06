@@ -188,7 +188,10 @@ mod animate {
 }
 
 mod container {
-	use super::super::thumbnail::{animated_type, animates};
+	use super::super::{
+		Animate,
+		thumbnail::{animated_type, animates},
+	};
 
 	/// Hand-built headers, since only the header is ever read.
 	///
@@ -306,6 +309,25 @@ mod container {
 
 		assert!(animates(cut), "an unsettled walk still withholds");
 		assert!(animated_type(cut).is_none(), "but it names nothing");
+	}
+
+	/// A picture that will not decode is withheld when it settled as animating.
+	///
+	/// Nothing can be derived from such a picture, so the original is the only
+	/// answer left, and the one thing that answer may not be is the animation
+	/// the request forbade. An animation past the decoder's pixel budget needs
+	/// no corruption to reach this, so the walk decides rather than the
+	/// decoder.
+	#[test]
+	fn an_undecodable_animation_is_still_withheld() {
+		let cut = ANIMATED_GIF
+			.get(..NAMED_BYTES)
+			.unwrap_or(ANIMATED_GIF);
+
+		assert!(!Animate::Never.accepts_fallback(ANIMATED_GIF), "a settled animation");
+		assert!(Animate::Never.accepts_fallback(STILL_GIF), "a settled still answers");
+		assert!(Animate::Never.accepts_fallback(cut), "and so does one it could not settle");
+		assert!(Animate::Allowed.accepts_fallback(ANIMATED_GIF), "nothing is withheld here");
 	}
 
 	/// A settled walk names the container it read.
