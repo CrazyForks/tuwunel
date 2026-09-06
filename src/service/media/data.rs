@@ -296,7 +296,7 @@ impl Data {
 
 	/// Metadata for the row at these dimensions that best answers the request.
 	///
-	/// A row whose content type the request accepts wins when the prefix holds
+	/// A row of the variant the request asked for wins when the prefix holds
 	/// one, and otherwise any row does, so the caller can repair a variant it
 	/// cannot serve rather than refuse media the server holds. One cursor walk
 	/// harvests both, since a second seek would cost every fallback a scan.
@@ -309,23 +309,23 @@ impl Data {
 		let dim: &[u32] = &[dim.width, dim.height];
 		let prefix = (mxc, dim, Interfix);
 
-		let (accepted, rejected) = self
+		let (wanted, other) = self
 			.mediaid_file
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_fold((None, None), |(accepted, rejected), key: &[u8]| {
+			.ready_fold((None, None), |(wanted, other), key: &[u8]| {
 				// owning only what is retained; the rest of the prefix is walked
 				// past and never copied
-				match animate.accepts_type(key_content_type(key)) {
-					| true if accepted.is_none() => (Some(key.to_owned()), rejected),
-					| false if rejected.is_none() => (accepted, Some(key.to_owned())),
-					| _ => (accepted, rejected),
+				match animate.prefers_type(key_content_type(key)) {
+					| true if wanted.is_none() => (Some(key.to_owned()), other),
+					| false if other.is_none() => (wanted, Some(key.to_owned())),
+					| _ => (wanted, other),
 				}
 			})
 			.await;
 
-		let key = accepted
-			.or(rejected)
+		let key = wanted
+			.or(other)
 			.ok_or_else(|| err!(Request(NotFound("Media not found"))))?;
 
 		// the borrow the parse takes ends before the key is moved into the result

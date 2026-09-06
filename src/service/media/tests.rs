@@ -140,6 +140,20 @@ mod animate {
 		}
 	}
 
+	/// Each request prefers the variant it asked for.
+	///
+	/// A source that animates leaves both stored at a size, and which one a
+	/// lookup answers with must not rest on the order their keys fall in, since
+	/// a remote row carries the peer's own disposition ahead of its type.
+	#[test]
+	fn each_request_prefers_its_own_variant() {
+		assert!(Animate::Allowed.prefers_type(Some("image/gif")));
+		assert!(!Animate::Allowed.prefers_type(Some("image/png")));
+		assert!(!Animate::Allowed.prefers_type(None));
+		assert!(Animate::Never.prefers_type(Some("image/png")));
+		assert!(!Animate::Never.prefers_type(Some("image/gif")));
+	}
+
 	/// Withholding survives the shapes a content type arrives in.
 	///
 	/// These reach the classifier from remote servers and stored keys alike,

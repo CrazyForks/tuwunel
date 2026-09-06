@@ -759,7 +759,7 @@ impl Animate {
 	#[must_use]
 	pub fn allowed(self) -> bool { matches!(self, Self::Allowed) }
 
-	/// Returns true when content of this type may answer the request.
+	/// Returns true when content of this type may answer the request at all.
 	///
 	/// This reads the declared type, which whoever uploaded the picture chose,
 	/// so it is only for deciding between stored rows, where the pictures
@@ -769,6 +769,22 @@ impl Animate {
 	#[must_use]
 	pub fn accepts_type(self, content_type: Option<&str>) -> bool {
 		self.allowed() || !content_type.is_some_and(declares_animation)
+	}
+
+	/// Returns true when this type is the variant the request asked for.
+	///
+	/// A source that animates leaves both variants stored at a size, so which
+	/// one a lookup answers with must be stated rather than left to the order
+	/// their keys fall in, which a remote row's own disposition decides. The
+	/// other variant still answers when it is the only one there, so this
+	/// orders the rows rather than refusing any of them.
+	#[inline]
+	#[must_use]
+	pub fn prefers_type(self, content_type: Option<&str>) -> bool {
+		match self {
+			| Self::Allowed => content_type.is_some_and(declares_animation),
+			| Self::Never => !content_type.is_some_and(declares_animation),
+		}
 	}
 
 	/// Returns true when this picture may answer the request.
