@@ -21,7 +21,7 @@ use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
 	matrix::pdu::PduCount,
 	trace,
-	utils::{self, BoolExt, ReadyExt, stream::TryIgnore},
+	utils::{self, BoolExt, ReadyExt, hash::password as hash_password, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
@@ -379,7 +379,12 @@ impl Service {
 			.deserialized()
 	}
 
-	/// Hash and set the user's password to the Argon2 hash
+	/// Hashes and stores the user's password.
+	///
+	/// A real password is hashed at the configured Argon2id cost and marks the
+	/// account as password-origin. `None` stores the disabled marker and the
+	/// sentinel is stored verbatim; neither is hashed. Changing the password of
+	/// an account whose origin is neither password nor SSO is rejected.
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
 		// Cannot change the password of a LDAP user. There are two special cases :
 		// - a `None` password can be used to deactivate a LDAP user
@@ -400,25 +405,25 @@ impl Service {
 			}
 		}
 
-		match password.map(utils::hash::password) {
+		match password {
 			| None => {
 				self.db
 					.userid_password
 					.insert(user_id, PASSWORD_DISABLED);
 			},
-			| Some(Ok(_)) if password == Some(PASSWORD_SENTINEL) => {
+			| Some(PASSWORD_SENTINEL) => {
 				self.db
 					.userid_password
 					.insert(user_id, PASSWORD_SENTINEL);
 			},
-			| Some(Ok(hash)) => {
+			| Some(password) => {
+				let cost = self.services.config.password_hash_cost();
+				let hash = hash_password(password, cost).map_err(|e| {
+					err!(Request(InvalidParam("Password does not meet the requirements: {e}")))
+				})?;
+
 				self.db.userid_password.insert(user_id, hash);
 				self.db.userid_origin.insert(user_id, "password");
-			},
-			| Some(Err(e)) => {
-				return Err!(Request(InvalidParam(
-					"Password does not meet the requirements: {e}"
-				)));
 			},
 		}
 

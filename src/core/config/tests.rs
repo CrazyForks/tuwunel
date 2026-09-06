@@ -6,6 +6,7 @@ use std::{
 	sync::{Arc, Mutex, Once},
 };
 
+use argon2::Params;
 use figment::providers::Data;
 use tracing::{level_filters::LevelFilter, subscriber::set_global_default};
 use tracing_subscriber::fmt::{MakeWriter, fmt};
@@ -13,7 +14,10 @@ use tracing_subscriber::fmt::{MakeWriter, fmt};
 use super::*;
 use crate::{
 	config::proxy::{ProxySnapshot, parse_environment_proxy_url},
-	utils::BoolExt,
+	utils::{
+		BoolExt,
+		hash::{password, verify_password},
+	},
 };
 
 thread_local! {
@@ -787,6 +791,75 @@ fn proxy_snapshots_own_their_configured_and_environment_generations() {
 	assert_eq!(environment_snapshot.hosts().collect::<Vec<_>>(), ["environment.internal"]);
 	assert!(environment_snapshot.intercepts(&environment_url));
 	assert!(environment_snapshot.resolver_alias(&environment_url));
+}
+
+/// The shipped Argon2id cost is the OWASP recommendation the argon2 crate
+/// also carries as its own default.
+///
+/// Pinning one to the other makes a crate bump that moves the recommendation
+/// a decision rather than a silent change to how every new password is
+/// stored.
+#[test]
+fn argon2_defaults_are_the_owasp_recommendation() {
+	assert_eq!(default_argon2_m_cost(), Params::DEFAULT_M_COST);
+	assert_eq!(default_argon2_t_cost(), Params::DEFAULT_T_COST);
+	assert_eq!(default_argon2_p_cost(), Params::DEFAULT_P_COST);
+}
+
+/// A configured cost reaches the parameters a stored hash records.
+///
+/// The interoperability test images set a cheap cost in their own TOML, so
+/// this path is what makes them cheap. A hash carries its own parameters, so
+/// its encoded prefix is the observable proof the setting arrived.
+#[test]
+fn a_configured_cost_reaches_the_stored_hash() {
+	let config = config_from_toml("[global]\nargon2_m_cost = 64\nargon2_t_cost = 1\n")
+		.expect("the test-image cost should parse");
+
+	check(&config).expect("a cheap but valid cost should pass the config check");
+
+	let digest = password("temp123", config.password_hash_cost()).expect("digest");
+
+	assert!(digest.starts_with("$argon2id$v=19$m=64,t=1,p=1$"), "{digest}");
+	verify_password("temp123", &digest).expect("verified");
+}
+
+/// A cost Argon2id cannot accept fails startup rather than every registration.
+///
+/// The error names the directive at fault, so a memory floor violation, a zero
+/// pass count, and a zero lane count each point at their own key.
+#[test]
+fn an_impossible_cost_fails_the_config_check() {
+	for (toml, key) in [
+		("[global]\nargon2_m_cost = 8\nargon2_p_cost = 4\n", "argon2_m_cost"),
+		("[global]\nargon2_t_cost = 0\n", "argon2_t_cost"),
+		("[global]\nargon2_p_cost = 0\n", "argon2_p_cost"),
+	] {
+		let config = config_from_toml(toml).expect("the config should parse");
+		let error = check(&config).expect_err("the cost should be rejected");
+		let directive = format!("'{key}' directive");
+
+		assert!(error.to_string().contains(&directive), "{error}");
+	}
+}
+
+/// A cost below the weakest OWASP pair passes the check with a warning.
+///
+/// The interoperability test images run at such a cost on purpose, so the
+/// warning is the only in-server signal that new hashes are weaker than the
+/// default.
+#[test]
+fn a_weak_cost_passes_the_config_check_with_a_warning() {
+	for (toml, warns) in [
+		("[global]\n", false),
+		("[global]\nargon2_m_cost = 64\nargon2_t_cost = 1\n", true),
+	] {
+		let config = config_from_toml(toml).expect("the config should parse");
+		let (result, logs) = check_with_captured_logs(&config);
+
+		result.expect("a valid cost should pass the config check");
+		assert_eq!(logs.contains("below the weakest OWASP"), warns, "{toml}");
+	}
 }
 
 /// A documented default is published to operators through the generated

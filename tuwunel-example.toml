@@ -813,6 +813,44 @@
 #
 #mas_secret =
 
+# Size of the Argon2id working buffer used to hash a new password, in 1
+# KiB blocks.
+#
+# Each hash holds the buffer for its duration, so peak memory rises by
+# roughly this much for every password operation in flight, with no bound
+# on how many run at once. Stored hashes carry the values they were made
+# with, so a change reaches an account only when its password is next set.
+#
+# Lowering this weakens the hash against parallel cracking hardware unless
+# `argon2_t_cost` rises to compensate; the equivalent-strength pairs of
+# (`argon2_m_cost`, `argon2_t_cost`) are (47104, 1), (19456, 2), (12288,
+# 3), (9216, 4) and (7168, 5). The default and those pairs are the OWASP
+# Argon2id recommendation:
+# <https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#argon2id>
+#
+# reloadable: yes
+#
+#argon2_m_cost = 19456
+
+# Number of passes an Argon2id hash makes over its working buffer.
+#
+# Raising it scales the CPU cost of a hash without changing its memory
+# cost. See `argon2_m_cost` for the equivalent-strength pairs.
+#
+# reloadable: yes
+#
+#argon2_t_cost = 2
+
+# Number of lanes an Argon2id working buffer is divided into.
+#
+# Lanes are computed sequentially here, so raising this changes the hash
+# without buying any parallelism. `argon2_m_cost` must be at least eight
+# times this value.
+#
+# reloadable: yes
+#
+#argon2_p_cost = 1
+
 # Controls whether encrypted rooms and events are allowed.
 # reloadable: yes
 #

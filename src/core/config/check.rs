@@ -11,6 +11,7 @@ use std::{
 	time::Duration,
 };
 
+use argon2::Error as Argon2Error;
 use either::Either;
 use http::HeaderValue;
 use itertools::Itertools;
@@ -78,6 +79,7 @@ pub fn check(config: &Config) -> Result {
 	check_storage(config)?;
 	check_registration(config)?;
 	check_registration_terms(config)?;
+	check_password_hashing(config)?;
 	check_turn_and_media_misc(config)?;
 	check_url_previews(config)?;
 	check_room_version(config)?;
@@ -375,6 +377,33 @@ fn check_registration_terms(config: &Config) -> Result {
 				));
 			}
 		}
+	}
+
+	Ok(())
+}
+
+fn check_password_hashing(config: &Config) -> Result {
+	let cost = config.password_hash_cost();
+
+	cost.check().map_err(|e| match e {
+		| Argon2Error::TimeTooSmall => err!(Config("argon2_t_cost", "{e}")),
+		| Argon2Error::ThreadsTooFew | Argon2Error::ThreadsTooMany => {
+			err!(Config("argon2_p_cost", "{e}"))
+		},
+		| Argon2Error::MemoryTooLittle => err!(Config(
+			"argon2_m_cost",
+			"{e}; it needs at least eight blocks per lane of argon2_p_cost"
+		)),
+		| _ => err!(Config("argon2_m_cost", "{e}")),
+	})?;
+
+	if !cost.is_recommended() {
+		warn!(
+			?cost,
+			"The Argon2id cost is below the weakest OWASP recommendation, so new password \
+			 hashes are cheaper to crack than the default. See argon2_m_cost for the \
+			 recommended pairs."
+		);
 	}
 
 	Ok(())

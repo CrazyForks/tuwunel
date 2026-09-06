@@ -60,7 +60,7 @@ use self::{
 };
 use crate::{
 	Err, Result, err, implement, redacted_debug,
-	utils::{self, bytes::deserialize_bytesize_usize, sys},
+	utils::{self, bytes::deserialize_bytesize_usize, hash::Cost, sys},
 };
 
 // Later prefixes override earlier ones.
@@ -1047,6 +1047,50 @@ pub struct Config {
 	///
 	/// display: sensitive
 	pub mas_secret: Option<String>,
+
+	/// Size of the Argon2id working buffer used to hash a new password, in 1
+	/// KiB blocks.
+	///
+	/// Each hash holds the buffer for its duration, so peak memory rises by
+	/// roughly this much for every password operation in flight, with no bound
+	/// on how many run at once. Stored hashes carry the values they were made
+	/// with, so a change reaches an account only when its password is next set.
+	///
+	/// Lowering this weakens the hash against parallel cracking hardware unless
+	/// `argon2_t_cost` rises to compensate; the equivalent-strength pairs of
+	/// (`argon2_m_cost`, `argon2_t_cost`) are (47104, 1), (19456, 2), (12288,
+	/// 3), (9216, 4) and (7168, 5). The default and those pairs are the OWASP
+	/// Argon2id recommendation:
+	/// <https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#argon2id>
+	///
+	/// reloadable: yes
+	///
+	/// default: 19456
+	#[serde(default = "default_argon2_m_cost")]
+	pub argon2_m_cost: u32,
+
+	/// Number of passes an Argon2id hash makes over its working buffer.
+	///
+	/// Raising it scales the CPU cost of a hash without changing its memory
+	/// cost. See `argon2_m_cost` for the equivalent-strength pairs.
+	///
+	/// reloadable: yes
+	///
+	/// default: 2
+	#[serde(default = "default_argon2_t_cost")]
+	pub argon2_t_cost: u32,
+
+	/// Number of lanes an Argon2id working buffer is divided into.
+	///
+	/// Lanes are computed sequentially here, so raising this changes the hash
+	/// without buying any parallelism. `argon2_m_cost` must be at least eight
+	/// times this value.
+	///
+	/// reloadable: yes
+	///
+	/// default: 1
+	#[serde(default = "default_argon2_p_cost")]
+	pub argon2_p_cost: u32,
 
 	/// Controls whether encrypted rooms and events are allowed.
 	/// reloadable: yes
@@ -5242,6 +5286,22 @@ impl Config {
 	pub fn check(&self) -> Result { check(self) }
 }
 
+/// Argon2id cost parameters for hashing a new password.
+///
+/// The three settings are interdependent, so they travel as a unit rather than
+/// being read one at a time. Verification never consults them: the cost of
+/// checking a password comes from the stored hash.
+#[implement(Config)]
+#[inline]
+#[must_use]
+pub fn password_hash_cost(&self) -> Cost {
+	Cost {
+		m_cost: self.argon2_m_cost,
+		t_cost: self.argon2_t_cost,
+		p_cost: self.argon2_p_cost,
+	}
+}
+
 impl TlsConfig {
 	/// Returns the configured TLS certificate and key paths together.
 	///
@@ -5567,6 +5627,12 @@ fn default_url_preview_max_media_size() -> usize {
 fn default_url_preview_cache_ttl() -> u64 { 60 * 60 * 24 }
 
 fn default_new_user_displayname_suffix() -> String { "💕".to_owned() }
+
+fn default_argon2_m_cost() -> u32 { 19 * 1024 }
+
+fn default_argon2_t_cost() -> u32 { 2 }
+
+fn default_argon2_p_cost() -> u32 { 1 }
 
 fn default_sentry_endpoint() -> Option<Url> {
 	let url = "https://8994b1762a6a95af9502a7900edabc4c@o4509498990067712.ingest.us.sentry.io/4509498993213440"
