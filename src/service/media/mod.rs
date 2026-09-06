@@ -92,6 +92,8 @@ pub struct Service {
 	federation_mutex: MutexMap<String, ()>,
 	mxc_state: MXCState,
 	#[cfg(feature = "media_thumbnail")]
+	animated_thumbnail_slots: Arc<Semaphore>,
+	#[cfg(feature = "media_thumbnail")]
 	video_thumbnail_slots: Semaphore,
 	#[cfg(feature = "media_thumbnail")]
 	video_thumbnail_failures: Mutex<Failures>,
@@ -112,6 +114,14 @@ const REDIRECT_TTL: Duration = Duration::from_mins(5);
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
+		#[cfg(feature = "media_thumbnail")]
+		let animated_thumbnail_slots = Arc::new(Semaphore::new(
+			args.server
+				.config
+				.media_thumbnail_animated_concurrency
+				.max(1),
+		));
+
 		let service = Arc::new(Self {
 			db: Data::new(args.db),
 			services: args.services.clone(),
@@ -123,6 +133,8 @@ impl crate::Service for Service {
 			},
 			#[cfg(feature = "media_thumbnail")]
 			video_thumbnail_failures: Failures::new(FAILURES).into(),
+			#[cfg(feature = "media_thumbnail")]
+			animated_thumbnail_slots,
 			#[cfg(feature = "media_thumbnail")]
 			video_thumbnail_slots: Semaphore::new(
 				args.server

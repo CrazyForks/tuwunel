@@ -29,6 +29,13 @@ use crate::{
 	warn,
 };
 
+/// Slots either thumbnail concurrency knob may ask for.
+///
+/// The ceiling is an operator sanity bound rather than a limit of the semaphore
+/// beneath it, which accepts far more: a figure this large is a typo more often
+/// than an intention, and no host has the cores to spend it.
+const MAX_THUMBNAIL_CONCURRENCY: usize = 1024;
+
 /// Performs check() with additional checks specific to reloading old config
 /// with new config.
 pub fn reload(old: &Config, new: &Config) -> Result {
@@ -469,21 +476,25 @@ fn check_thumbnails(config: &Config) -> Result {
 		));
 	}
 
+	if unusable_concurrency(config.media_thumbnail_animated_concurrency) {
+		return Err!(Config(
+			"media_thumbnail_animated_concurrency",
+			"Animated thumbnail encodes permitted at once must be between 1 and \
+			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every encode waiting for a slot that \
+			 never frees, and the ceiling is far past any useful degree of parallelism."
+		));
+	}
+
 	Ok(())
 }
 
-/// Beyond this the semaphore sizing the extractions would itself be rejected,
-/// and no host has a use for that much video decoding at once.
-const MAX_VIDEO_THUMBNAIL_CONCURRENCY: usize = 1024;
-
 fn check_video_thumbnails(config: &Config) -> Result {
-	if !(1..=MAX_VIDEO_THUMBNAIL_CONCURRENCY).contains(&config.media_video_thumbnail_concurrency)
-	{
+	if unusable_concurrency(config.media_video_thumbnail_concurrency) {
 		return Err!(Config(
 			"media_video_thumbnail_concurrency",
 			"Video thumbnail programs permitted at once must be between 1 and \
-			 {MAX_VIDEO_THUMBNAIL_CONCURRENCY}: zero leaves every extraction waiting for a slot \
-			 that never frees, and the ceiling is far past any useful degree of parallelism."
+			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every extraction waiting for a slot that \
+			 never frees, and the ceiling is far past any useful degree of parallelism."
 		));
 	}
 
@@ -495,6 +506,14 @@ fn check_video_thumbnails(config: &Config) -> Result {
 	}
 
 	Ok(())
+}
+
+/// Whether a concurrency knob names a number of slots that cannot serve.
+///
+/// Zero is the load-bearing half: it leaves every request waiting on a slot
+/// that never frees, which reads as a hang rather than as a refusal.
+fn unusable_concurrency(slots: usize) -> bool {
+	!(1..=MAX_THUMBNAIL_CONCURRENCY).contains(&slots)
 }
 
 fn check_url_previews(config: &Config) -> Result {

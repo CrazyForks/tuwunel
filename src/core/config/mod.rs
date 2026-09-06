@@ -2800,6 +2800,19 @@ pub struct Config {
 	#[serde(default = "default_media_thumbnail_max_frames")]
 	pub media_thumbnail_max_frames: usize,
 
+	/// Animated thumbnail encodes permitted to run at once.
+	///
+	/// Quantizing a palette per frame costs far more than scaling a still, and
+	/// any remote server can ask for one, so an encode past this limit waits
+	/// for a slot rather than piling load onto the host. The still beside it is
+	/// generated after the animation, so a wait here delays both variants of
+	/// the request that triggered them. A restart is required to apply a
+	/// change.
+	///
+	/// default: 4
+	#[serde(default = "default_media_thumbnail_animated_concurrency")]
+	pub media_thumbnail_animated_concurrency: usize,
+
 	/// Program invoked to extract a still frame from a video, giving videos
 	/// uploaded without a thumbnail one anyway. Tuwunel decodes no video
 	/// itself; the frame is scaled and cropped like any other image and the
@@ -5479,6 +5492,8 @@ fn default_media_rc_create_burst_count() -> u32 { 50 }
 fn default_media_thumbnail_max_pixels() -> u64 { 50_000_000 }
 
 fn default_media_thumbnail_max_frames() -> usize { 50 }
+
+fn default_media_thumbnail_animated_concurrency() -> usize { 4 }
 
 fn default_media_video_thumbnail_timeout() -> u64 { 30 }
 

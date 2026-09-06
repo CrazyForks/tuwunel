@@ -51,11 +51,24 @@ pub(super) async fn store_animated(
 	let budget = config.media_thumbnail_max_pixels;
 	let requested = Dim::new(dim.width, dim.height, Some(dim.method.clone()));
 
+	// waiting here rather than inside the worker keeps the queue off the pool
+	let slots = self.animated_thumbnail_slots.clone();
+
+	let Ok(slot) = slots.acquire_owned().await else {
+		return Err!(debug_warn!("The animated thumbnail semaphore is closed."));
+	};
+
 	let encode = self
 		.services
 		.server
 		.runtime()
-		.spawn_blocking(move || encode_frames(&source, &requested, max_frames, budget));
+		.spawn_blocking(move || {
+			// the permit rides into the worker, since a cancelled request drops
+			// this future but never the encode it already started
+			let _slot = slot;
+
+			encode_frames(&source, &requested, max_frames, budget)
+		});
 
 	// a started worker runs to completion, but one still queued is dropped, so
 	// a cancelled request must not leave it to reach the pool

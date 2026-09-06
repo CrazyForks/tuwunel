@@ -40,11 +40,16 @@ than an upscale.
 | Option | Default | Description |
 |---|---|---|
 | `media_thumbnail_max_pixels` | `50000000` | Largest picture the thumbnailer will decode, in pixels. Anything larger is served without a thumbnail. Applies to uploaded pictures and to frames extracted from video. |
+| `media_thumbnail_animated` | `true` | Whether an animated thumbnail is generated for a picture that carries a frame sequence. Disabled, none is generated; a source served whole in a thumbnail's place, one cached while it was on, or a peer's own answer can still animate. |
+| `media_thumbnail_max_frames` | `50` | Frames an animated thumbnail carries at most. A longer source is truncated and loops short rather than being refused one. |
+| `media_thumbnail_animated_concurrency` | `4` | Animated encodes permitted to run at once. Quantizing a palette per frame costs far more than scaling a still, so an encode past this waits for a slot. A restart is required to apply a change. |
 
-A generated thumbnail is a PNG, and is served as `image/png` under the filename
+A still thumbnail is a PNG, and is served as `image/png` under the filename
 `thumbnail.png` rather than the content type or name of the file it came from.
-Thumbnails already cached before this was true keep the labelling they were
-stored with; only newly generated ones are relabelled.
+A request that permits animation, against a picture that carries a frame
+sequence, is answered with a GIF instead, served as `image/gif` under
+`thumbnail.gif`. Thumbnails already cached before this was true keep the
+labelling they were stored with; only newly generated ones are relabelled.
 
 ## Video thumbnails
 
@@ -165,8 +170,8 @@ grace period rather than by `media_video_thumbnail_timeout`.
 
 A configuration reload does not disturb work in flight. An extraction already
 under way keeps the deadline it computed at entry and finishes under it; the
-next request reads the new values. `media_video_thumbnail_concurrency` is the
-exception, as it sizes a semaphore built at startup.
+next request reads the new values. The two concurrency settings are the
+exception, as each sizes a semaphore built at startup.
 
 Two cases skip the orderly path. An in-place restart replaces the running image
 without unwinding, and a `SIGKILL` gives nothing a chance to run, so either can

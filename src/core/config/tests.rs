@@ -345,6 +345,22 @@ oidc_registration_access_token = "initial-access-token"
 }
 
 #[test]
+fn check_bounds_the_animated_thumbnail_concurrency() {
+	let cases = [
+		("the default", "[global]\n", true),
+		("zero", "[global]\nmedia_thumbnail_animated_concurrency = 0\n", false),
+		("the ceiling", "[global]\nmedia_thumbnail_animated_concurrency = 1024\n", true),
+		("past it", "[global]\nmedia_thumbnail_animated_concurrency = 1025\n", false),
+	];
+
+	for (name, toml, accepted) in cases {
+		let config = config_from_toml(toml).unwrap();
+
+		assert_eq!(check(&config).is_ok(), accepted, "{name}");
+	}
+}
+
+#[test]
 fn reload_rejects_none_to_some_and_some_to_none() {
 	let none = config_from_toml("[global]\n").unwrap();
 	let some = config_from_toml(
