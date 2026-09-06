@@ -150,9 +150,16 @@ impl super::Service {
 			return self.get_thumbnail(mxc, dim, animate, None).await;
 		}
 
-		let media = self
-			.fetch_remote_thumbnail(mxc, None, timeout_ms, dim, animate)
-			.await?;
+		// the sentinel names the original file rather than a size, and asking a
+		// peer to thumbnail at it leaves nothing this lookup can find next time
+		let media = match normalized.is_original() {
+			| true =>
+				self.fetch_remote_content(mxc, None, timeout_ms)
+					.await?,
+			| false =>
+				self.fetch_remote_thumbnail(mxc, None, timeout_ms, dim, animate)
+					.await?,
+		};
 
 		// a peer may ignore the parameter and this answers the caller directly,
 		// so the variant is repaired before it leaves rather than one request on

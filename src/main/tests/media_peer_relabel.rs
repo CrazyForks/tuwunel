@@ -1,21 +1,26 @@
 #![cfg(test)]
 #![cfg(feature = "media_thumbnail")]
 
-//! What a peer's mislabelled thumbnail is cached under.
+//! What a peer's picture is cached as, and how often it is asked for.
 //!
-//! A server federating with itself only ever meets its own honest labels, so
-//! the snapshot harness cannot reach the case this covers: a peer answering
-//! with a picture whose bytes contradict the type it declares. That is how an
-//! APNG ordinarily arrives, and the row a fetch leaves behind is all a later
-//! lookup has to go on, so the claim is corrected rather than stored.
+//! A server federating with itself only ever meets its own honest labels and
+//! its own cached rows, so the snapshot harness cannot reach either case here:
+//! a peer answering with a picture whose bytes contradict the type it declares,
+//! which is how an APNG ordinarily arrives, and a request past every bucket,
+//! which names the original file rather than a size to encode at.
 //!
-//! Two writes absorb a peer's picture and each is covered here, because the
-//! peer answers the two federation media endpoints in the shapes they each
-//! specify: the authenticated one in `multipart/mixed`, the legacy one as a
-//! bare body under a content type header.
+//! The peer answers each federation media endpoint in the shape that endpoint
+//! specifies, the authenticated one in `multipart/mixed` and the legacy one as
+//! a bare body under a content type header, and counts what it was asked for,
+//! since a request that stops recurring is visible in nothing else.
 
 use std::{
-	env::var, fs::remove_dir_all, net::TcpListener, path::PathBuf, process::id as process_id,
+	env::var,
+	fs::remove_dir_all,
+	net::TcpListener,
+	path::PathBuf,
+	process::id as process_id,
+	sync::atomic::{AtomicUsize, Ordering},
 	time::Duration,
 };
 
@@ -28,7 +33,7 @@ use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::ruma::api::client::media::get_content_thumbnail::v3::Request as LegacyRequest;
 use tuwunel_core::{
 	Err, Result, err,
-	ruma::{Mxc, ServerName, UInt, UserId, media::Method},
+	ruma::{Mxc, OwnedUserId, ServerName, UInt, UserId, media::Method},
 };
 use tuwunel_service::{
 	Services,
@@ -53,6 +58,12 @@ const GIF: &[u8] = &[
 /// a declared type worth contradicting rather than trusting.
 const DECLARED: &str = "image/png";
 
+/// What a still stood in for an animation is encoded as.
+///
+/// Every thumbnail this generates is a PNG, so a forbidding request answered
+/// with one is how the stand-in is told apart from the peer's own picture.
+const STILL: &str = "image/png";
+
 /// What the walk settles on, and so what the stored row has to carry.
 ///
 /// The two content types differing is the whole result, so this is the half
@@ -72,6 +83,17 @@ const BOUNDARY: &str = "peerstubmultipartboundary";
 const MEDIA_ID: &str = "peermislabelledthumbnailmediaid0";
 
 const LEGACY_MEDIA_ID: &str = "peermislabelledlegacythumbnailid";
+
+const OVERSIZED_MEDIA_ID: &str = "peeroversizedthumbnailmediaid000";
+
+const WITHHELD_MEDIA_ID: &str = "peeroversizedwithheldmediaid0000";
+
+/// Requests the peer has answered.
+///
+/// A request past every bucket has to stop reaching the peer once the original
+/// is cached, and nothing about the answer itself would show that; only the
+/// count the peer keeps can.
+static ANSWERED: AtomicUsize = AtomicUsize::new(0);
 
 const CERTIFICATE: &str = "../../nix/pkgs/complement/certificate.crt";
 
@@ -130,6 +152,8 @@ fn a_peers_mislabelled_thumbnail_is_cached_under_its_container() -> Result {
 		let stub = spawn(serve_peer(listener, certificate, private_key));
 		let outcome = exercise(&services, &peer).await;
 		let outcome = outcome.and(exercise_legacy(&services, &peer).await);
+		let outcome = outcome.and(exercise_oversized(&services, &peer).await);
+		let outcome = outcome.and(exercise_withheld(&services, &peer).await);
 
 		// a stub that never started reaches the caller only as a peer that did
 		// not answer, so its own error is reported in place of that symptom
@@ -182,8 +206,11 @@ async fn serve_peer(listener: TcpListener, certificate: PathBuf, private_key: Pa
 ///
 /// The parts and their separators are the shape the client half of the API
 /// writes, so a body assembled any other way would fail to parse before
-/// reaching anything this covers.
+/// reaching anything this covers. This is the half that counts its requests,
+/// since the authenticated endpoints are the ones a repeat would return to.
 async fn authenticated() -> impl IntoResponse {
+	ANSWERED.fetch_add(1, Ordering::Relaxed);
+
 	let head = format!(
 		"\r\n--{BOUNDARY}\r\ncontent-type: \
 		 application/json\r\n\r\n{{}}\r\n--{BOUNDARY}\r\ncontent-type: {DECLARED}\r\n\r\n"
@@ -211,7 +238,7 @@ async fn exercise(services: &Services, peer: &ServerName) -> Result {
 	let mxc = Mxc { server_name: peer, media_id: MEDIA_ID };
 
 	let dim = Dim::new(96, 96, None);
-	let user = UserId::parse_with_server_name("peerfixture", services.globals.server_name())?;
+	let user = fixture_user(services)?;
 
 	let fetched = services
 		.media
@@ -245,6 +272,12 @@ async fn exercise(services: &Services, peer: &ServerName) -> Result {
 	}
 
 	Ok(())
+}
+
+/// The local user every exercise fetches as.
+fn fixture_user(services: &Services) -> Result<OwnedUserId> {
+	UserId::parse_with_server_name("peerfixture", services.globals.server_name())
+		.map_err(Into::into)
 }
 
 /// The same claim over the legacy endpoint, which is a second write.
@@ -286,6 +319,110 @@ async fn exercise_legacy(services: &Services, peer: &ServerName) -> Result {
 
 	if cached != SETTLED {
 		return Err!("the legacy row was stored as {cached}, expected {SETTLED}");
+	}
+
+	Ok(())
+}
+
+/// A request past every bucket fetches the original, and then stops asking.
+///
+/// The sentinel every such request normalizes to names the original file, so
+/// asking the peer to thumbnail at it stored a row no later lookup could find
+/// and every repeat went back over federation. Fetching the original instead
+/// leaves the row where the lookup reads it, which is what the second request
+/// proves by never reaching the peer.
+async fn exercise_oversized(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: OVERSIZED_MEDIA_ID,
+	};
+
+	let dim = Dim::new(1024, 768, None);
+	let user = fixture_user(services)?;
+	let before = ANSWERED.load(Ordering::Relaxed);
+
+	let fetch = || {
+		services
+			.media
+			.get_or_fetch_thumbnail(&mxc, &dim, Animate::Allowed, TIMEOUT, &user)
+	};
+
+	let asked = || {
+		ANSWERED
+			.load(Ordering::Relaxed)
+			.saturating_sub(before)
+	};
+
+	let fetched = fetch().await?;
+
+	if fetched.content != GIF {
+		return Err!("the original did not reach the caller");
+	}
+
+	if asked() != 1 {
+		return Err!("the first request reached the peer {} times, expected 1", asked());
+	}
+
+	fetch().await?;
+
+	if asked() != 1 {
+		return Err!("the repeat went back to the peer, {} requests in total", asked());
+	}
+
+	Ok(())
+}
+
+/// The same fetch for a request that forbids animation, which is most of them.
+///
+/// An absent parameter forbids exactly as an explicit false does, so this is
+/// the ordinary shape rather than a corner: the original is fetched once, a
+/// still is stood in at the picture's own size, and the repeat is answered
+/// from the row that fetch left behind.
+async fn exercise_withheld(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: WITHHELD_MEDIA_ID,
+	};
+
+	let dim = Dim::new(1024, 768, None);
+	let user = fixture_user(services)?;
+	let before = ANSWERED.load(Ordering::Relaxed);
+
+	let fetch = || {
+		services
+			.media
+			.get_or_fetch_thumbnail(&mxc, &dim, Animate::from(None), TIMEOUT, &user)
+	};
+
+	let asked = || {
+		ANSWERED
+			.load(Ordering::Relaxed)
+			.saturating_sub(before)
+	};
+
+	let fetched = fetch().await?;
+
+	if fetched.content == GIF {
+		return Err!("a forbidding request was answered with the peer's animation");
+	}
+
+	let served = fetched
+		.content_type
+		.as_deref()
+		.unwrap_or_default();
+
+	if served != STILL {
+		return Err!("the stand-in was served as {served}, expected {STILL}");
+	}
+
+	if asked() != 1 {
+		return Err!("the first request reached the peer {} times, expected 1", asked());
+	}
+
+	fetch().await?;
+
+	if asked() != 1 {
+		return Err!("the repeat went back to the peer, {} requests in total", asked());
 	}
 
 	Ok(())
