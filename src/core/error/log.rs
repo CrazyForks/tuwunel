@@ -1,5 +1,6 @@
 use std::{convert::Infallible, error::Error as StdError, fmt, iter::successors};
 
+use itertools::Itertools;
 use tracing::Level;
 
 use super::Error;
@@ -13,10 +14,7 @@ use super::Error;
 /// makes these self-diagnosing without per-crate trace logging.
 #[must_use]
 pub fn error_chain(e: &dyn StdError) -> String {
-	successors(Some(e), |&e| e.source())
-		.map(ToString::to_string)
-		.collect::<Vec<_>>()
-		.join("; caused by: ")
+	successors(Some(e), |&e| e.source()).join("; caused by: ")
 }
 
 /// Logs an error and recovers with a default value in an infallible result.

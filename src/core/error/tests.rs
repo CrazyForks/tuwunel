@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Error as FmtError, io::Error as IoError};
 
 use http::StatusCode;
 use ruma::{
@@ -12,7 +12,7 @@ use ruma::{
 	},
 };
 
-use super::{Error, response::ruma_error_kind};
+use super::{Error, error_chain, response::ruma_error_kind};
 
 const REMOTE_MESSAGE: &str = "your session was revoked";
 
@@ -127,6 +127,27 @@ fn a_relayed_error_attributes_the_remote() {
 	assert!(
 		message.contains("remote.example"),
 		"a relayed message carries the remote's own text, so it must name whose it is"
+	);
+}
+
+#[test]
+fn a_single_error_chain_has_no_separator() {
+	assert_eq!(
+		error_chain(&FmtError),
+		FmtError.to_string(),
+		"a lone error is its own display text"
+	);
+}
+
+#[test]
+fn an_error_chain_separates_its_source() {
+	let source = IoError::other(FmtError);
+	let error = Error::Io(source);
+
+	assert_eq!(
+		error_chain(&error),
+		format!("{error}; caused by: {FmtError}"),
+		"a source is appended behind the separator"
 	);
 }
 
