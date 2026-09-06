@@ -513,7 +513,12 @@ pub(super) async fn store_still(
 	Ok(animated)
 }
 
-/// Generate a thumbnail
+/// Generate a thumbnail.
+///
+/// A source that animates yields both variants here rather than the one this
+/// request asked for. Generation runs only on a lookup miss, and the row it
+/// stores is what stops the next miss, so a variant left ungenerated would wait
+/// on a miss that the other variant has already made impossible.
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
 #[tracing::instrument(name = "generate", level = "debug", skip(self, data))]
@@ -525,15 +530,13 @@ async fn get_thumbnail_generate(
 	data: Metadata,
 ) -> Result<Media> {
 	let bytes = self.fetch_bytes(&data.key).await?;
-
-	// the source's own size decides this from its header, since a picture the
-	// request cannot improve on is better passed through below than re-encoded
-	if self.animation_wanted(animate, &bytes)
-		&& !dim.is_passthrough(&picture_dim(&bytes))?
-		&& let Ok(animated) = self.store_animated(mxc, dim, bytes.clone()).await
-	{
-		return Ok(animated);
-	}
+	let animated = match self.animates_at(dim, &bytes)? {
+		| true => self
+			.store_animated(mxc, dim, bytes.clone())
+			.await
+			.ok(),
+		| false => None,
+	};
 
 	let media = into_media(data, bytes.into());
 	let frame = self.video_frame(mxc, dim, &media).await;
@@ -547,7 +550,7 @@ async fn get_thumbnail_generate(
 		}
 
 		// Couldn't parse file to generate thumbnail, send original
-		return Ok(media);
+		return Ok(preferred(animate, animated, media));
 	};
 
 	drop(frame);
@@ -563,7 +566,9 @@ async fn get_thumbnail_generate(
 	// staged file, and the encode and the store must not hold it
 	drop(media);
 
-	self.store_thumbnail(mxc, dim, image).await
+	let still = self.store_thumbnail(mxc, dim, image).await?;
+
+	Ok(preferred(animate, animated, still))
 }
 
 /// Hands the original back in place of the thumbnail it cannot generate.
@@ -583,17 +588,34 @@ async fn get_thumbnail_generate(
 	self.get_thumbnail_saved(data).await
 }
 
-/// Whether this request takes the frames the source carries.
+/// Whether this source yields an animated variant at these dimensions.
 ///
-/// Only a request that asked for animation reaches the encoder, and only over
-/// a picture whose header says it holds a sequence, so a still never pays a
-/// decode that would yield one frame and be thrown away. A video is excluded by
-/// the same test, its container being none of the three that hold frames.
+/// Only a picture whose header says it holds a frame sequence reaches the
+/// encoder, so a still never pays a decode that would yield one frame and be
+/// thrown away, and a video is excluded by the same test since its container is
+/// none of the three that hold frames. A size the request cannot improve on is
+/// passed through whole below rather than re-encoded.
 #[cfg(feature = "media_thumbnail")]
 #[implement(super::Service)]
-#[inline]
-fn animation_wanted(&self, animate: Animate, content: &[u8]) -> bool {
-	animate.allowed() && self.services.config.media_thumbnail_animated && animates(content)
+fn animates_at(&self, dim: &Dim, content: &[u8]) -> Result<bool> {
+	if !self.services.config.media_thumbnail_animated || !animates(content) {
+		return Ok(false);
+	}
+
+	dim.is_passthrough(&picture_dim(content))
+		.map(|through| !through)
+}
+
+/// The variant this request asked for, keeping the still when it forbade one.
+///
+/// Both are already stored by the time this chooses, so the one not taken is
+/// what the next request of the other kind is answered with.
+#[cfg(feature = "media_thumbnail")]
+fn preferred(animate: Animate, animated: Option<Media>, still: Media) -> Media {
+	match animated.filter(|_| animate.allowed()) {
+		| Some(animated) => animated,
+		| None => still,
+	}
 }
 
 /// Encode a still PNG thumbnail at these dimensions and store it.
