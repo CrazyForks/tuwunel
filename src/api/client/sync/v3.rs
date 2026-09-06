@@ -108,9 +108,8 @@ struct RoomMetadata {
 
 struct UserMetadata {
 	witness: Option<Witness>,
-	#[expect(clippy::option_option)]
-	last_notification_read: Option<Option<u64>>,
-	thread_last_reads: Option<BTreeMap<OwnedEventId, u64>>,
+	last_notification_read: Option<u64>,
+	thread_last_reads: BTreeMap<OwnedEventId, u64>,
 	last_privateread_update: u64,
 	joined_since_last_sync: bool,
 }
@@ -1148,25 +1147,28 @@ async fn load_joined_room(
 	)
 	.await?;
 
+	let quiet_round = timeline_pdus.is_empty();
+
 	let joined_sender_member = take_sender_membership_for_join(
 		&mut state_events,
 		sender_user,
 		joined_since_last_sync,
-		timeline_pdus.is_empty(),
+		quiet_round,
 		initial,
 	);
 
 	let prev_batch =
 		compute_join_prev_batch(&timeline_pdus, joined_sender_member.as_ref(), since);
 
-	let in_window = |count: u64| count > since && count <= next_batch;
+	let in_window = in_window(since, next_batch);
 
 	let NotificationGates {
 		send_notification_counts,
 		send_notification_count_filter,
 	} = compute_notification_gates(
 		last_notification_read,
-		thread_last_reads.as_ref(),
+		&thread_last_reads,
+		quiet_round,
 		since,
 		in_window,
 	);
@@ -1201,7 +1203,7 @@ async fn load_joined_room(
 		heroes,
 		joined_member_count,
 		invited_member_count,
-		thread_last_reads.as_ref(),
+		quiet_round.then_some(&thread_last_reads),
 		send_notification_count_filter,
 		FinalizeJoinFlags {
 			encrypted,
@@ -1878,18 +1880,15 @@ async fn gather_user_metadata(
 			.state_get(shortstatehash, &StateEventType::RoomEncryption, "")
 	});
 
-	let last_notification_read = timeline_pdus.is_empty().then_async(|| {
-		services
-			.pusher
-			.last_notification_read(sender_user, room_id)
-			.ok()
-	});
+	// Busy rounds need these cursors too, to authorize an explicit zero count.
+	let last_notification_read = services
+		.pusher
+		.last_notification_read(sender_user, room_id)
+		.ok();
 
-	let thread_last_reads = timeline_pdus.is_empty().then_async(|| {
-		services
-			.pusher
-			.thread_last_notification_reads(sender_user, room_id)
-	});
+	let thread_last_reads = services
+		.pusher
+		.thread_last_notification_reads(sender_user, room_id);
 
 	let last_privateread_update = services
 		.read_receipt
@@ -1920,29 +1919,47 @@ async fn gather_user_metadata(
 	}
 }
 
-#[expect(clippy::option_option)]
-fn compute_notification_gates(
-	last_notification_read: Option<Option<u64>>,
-	thread_last_reads: Option<&BTreeMap<OwnedEventId, u64>>,
+/// The window a sync round reports a cursor advance in.
+///
+/// The lower bound is the round's own token and the upper bound is the
+/// response cutoff captured before the room is assembled, so a cursor stamped
+/// after that cutoff falls outside it.
+fn in_window(since: u64, next_batch: u64) -> impl Fn(u64) -> bool + Copy {
+	move |count| count > since && count <= next_batch
+}
+
+/// The gates deciding what notification counts a joined room reports.
+///
+/// A count reaches the client when the round carried timeline events or a read
+/// cursor advanced within the window. An explicit zero additionally needs a
+/// cursor newer than the request token, and because the response cutoff is
+/// captured before that cursor is read, a cursor past the cutoff repeats the
+/// zero until the token catches up.
+fn compute_notification_gates<F: Fn(u64) -> bool>(
+	last_notification_read: Option<u64>,
+	thread_last_reads: &BTreeMap<OwnedEventId, u64>,
+	quiet_round: bool,
 	since: u64,
-	in_window: impl Fn(u64) -> bool,
-) -> NotificationGates<impl Fn(&UInt) -> bool> {
-	let send_main_counts = last_notification_read
-		.flatten()
-		.is_none_or(&in_window);
+	in_window: F,
+) -> NotificationGates<impl Fn(&UInt) -> bool + use<F>> {
+	// Thread-only resets leave the main cursor alone, so without the thread leg
+	// a quiet round would never report them.
+	let send_notification_counts = !quiet_round
+		|| last_notification_read.is_none_or(&in_window)
+		|| thread_last_reads
+			.values()
+			.copied()
+			.any(&in_window);
 
-	let send_thread_counts =
-		thread_last_reads.is_none_or(|reads| reads.values().copied().any(&in_window));
+	let after_since = |count: u64| count > since;
 
-	// Send room-level counts when either the main read cursor or any thread
-	// cursor advanced within the window. Thread-only resets do not bump the
-	// main cursor, so without the thread leg they would never reach the
-	// client.
-	let send_notification_counts = send_main_counts || send_thread_counts;
-
-	let send_notification_resets = last_notification_read
-		.flatten()
-		.is_some_and(|last_count| last_count > since);
+	// A cursor newer than since means the client may still cache the pre-reset
+	// count, so allow an explicit zero to reconcile it.
+	let send_notification_resets = last_notification_read.is_some_and(&after_since)
+		|| thread_last_reads
+			.values()
+			.copied()
+			.any(&after_since);
 
 	let send_notification_count_filter =
 		move |count: &UInt| *count != uint!(0) || send_notification_resets;
@@ -2382,6 +2399,10 @@ async fn typings_event_for_user(
 mod tests {
 	use super::*;
 
+	const SINCE: u64 = 100;
+	const NEXT_BATCH: u64 = 200;
+	const INITIAL_SINCE: u64 = 0;
+
 	#[test]
 	fn state_after_wraps_into_named_variant() {
 		let events = StateEvents::default;
@@ -2403,4 +2424,103 @@ mod tests {
 		assert!(matches!(StateAfter::from((false, true)), StateAfter::Unstable));
 		assert!(matches!(StateAfter::from((true, true)), StateAfter::Unstable));
 	}
+
+	#[test]
+	fn busy_round_delivers_reset_zeros() {
+		let gates = notification_gates(Some(150), &no_threads(), false, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!((gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn busy_round_without_reset_suppresses_zeros() {
+		// A cursor at 50 advanced before this window, so it is not a reset.
+		let gates = notification_gates(Some(50), &no_threads(), false, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!(!(gates.send_notification_count_filter)(&uint!(0)));
+		assert!((gates.send_notification_count_filter)(&uint!(5)));
+	}
+
+	#[test]
+	fn busy_round_without_cursor_sends_counts() {
+		let gates = notification_gates(None, &no_threads(), false, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!(!(gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn quiet_round_with_advanced_cursor_sends_zeros() {
+		let gates = notification_gates(Some(150), &no_threads(), true, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!((gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn quiet_round_with_stale_cursor_sends_nothing() {
+		// A cursor at 50 advanced before this window, so nothing changed.
+		let gates = notification_gates(Some(50), &no_threads(), true, SINCE);
+
+		assert!(!gates.send_notification_counts);
+		assert!(!(gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn quiet_round_without_cursor_suppresses_zeros() {
+		let gates = notification_gates(None, &no_threads(), true, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!(!(gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn initial_sync_delivers_reset_zeros() {
+		// A client can start a fresh token while still caching a count, so an
+		// initial round must be able to reconcile it.
+		let gates = notification_gates(Some(150), &no_threads(), false, INITIAL_SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!((gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn cursor_past_the_cutoff_delivers_reset_zeros() {
+		// The response cutoff is captured before the cursor is read, so a
+		// cursor beyond it repeats the zero until the token catches up.
+		let gates = notification_gates(Some(NEXT_BATCH + 1), &no_threads(), false, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!((gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	#[test]
+	fn thread_only_reset_delivers_zeros() {
+		let root = EventId::parse("$thread:example.org").unwrap();
+		let thread_reads = BTreeMap::from([(root, 150)]);
+
+		let gates = notification_gates(None, &thread_reads, false, SINCE);
+
+		assert!(gates.send_notification_counts);
+		assert!((gates.send_notification_count_filter)(&uint!(0)));
+	}
+
+	fn notification_gates(
+		last_read: Option<u64>,
+		thread_reads: &BTreeMap<OwnedEventId, u64>,
+		quiet_round: bool,
+		since: u64,
+	) -> NotificationGates<impl Fn(&UInt) -> bool + use<>> {
+		compute_notification_gates(
+			last_read,
+			thread_reads,
+			quiet_round,
+			since,
+			in_window(since, NEXT_BATCH),
+		)
+	}
+
+	fn no_threads() -> BTreeMap<OwnedEventId, u64> { BTreeMap::new() }
 }
