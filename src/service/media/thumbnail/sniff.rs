@@ -6,9 +6,11 @@
 //! type says otherwise, or says nothing useful, as `image/png` does for an
 //! APNG.
 //!
-//! Every walk here fails closed, so an unreadable, truncated or unrecognized
-//! picture answers as animated and the cost of a wrong answer is a needless
-//! re-encode rather than a violation.
+//! A walk answers one of three states, because the two questions asked of it
+//! take opposite defaults. Whether a picture may be served fails closed, so an
+//! unreadable one is withheld and a wrong answer costs a needless re-encode
+//! rather than a violation; what a picture is names nothing the walk did not
+//! settle, since a guess there would be written down as fact.
 
 use tuwunel_core::utils::math::checked_ops;
 
@@ -95,16 +97,21 @@ pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 /// Walks the container its first bytes name.
+///
+/// A container that cannot hold a sequence answers `Absent`, and so does one
+/// whose walk reaches the end of its blocks without finding a second frame. A
+/// walk that runs out of picture, or meets a structure it does not know,
+/// answers `Unsettled` instead of guessing either way.
 fn sequence(bytes: &[u8]) -> Sequence {
 	let is_gif = GIF_MAGIC
 		.iter()
 		.any(|magic| bytes.starts_with(magic));
 
 	let (content_type, settled) = match bytes {
-		| _ if bytes.starts_with(PNG_MAGIC) => (APNG, png_animates(bytes)),
+		| _ if bytes.starts_with(PNG_MAGIC) => (APNG, png_sequence(bytes)),
 		| _ if bytes.starts_with(RIFF_MAGIC) && bytes.get(8..12) == Some(WEBP_MAGIC) =>
-			(WEBP, webp_animates(bytes)),
-		| _ if is_gif => (GIF, gif_animates(bytes)),
+			(WEBP, webp_sequence(bytes)),
+		| _ if is_gif => (GIF, gif_sequence(bytes)),
 		| _ => return Sequence::Absent,
 	};
 
@@ -119,7 +126,7 @@ fn sequence(bytes: &[u8]) -> Sequence {
 ///
 /// Each hop clears a whole chunk, so the walk advances by at least its twelve
 /// byte frame every time and ends when a hop lands past the picture.
-fn png_animates(bytes: &[u8]) -> Option<bool> {
+fn png_sequence(bytes: &[u8]) -> Option<bool> {
 	let mut rest = bytes.get(PNG_MAGIC.len()..)?;
 
 	loop {
@@ -151,7 +158,7 @@ fn png_animates(bytes: &[u8]) -> Option<bool> {
 /// and never walks. Only the two plain still forms answer as a still, since a
 /// chunk name neither they nor the extended header claim is a structure this
 /// does not recognize.
-fn webp_animates(bytes: &[u8]) -> Option<bool> {
+fn webp_sequence(bytes: &[u8]) -> Option<bool> {
 	let chunk = bytes.get(12..16)?;
 
 	match chunk {
@@ -169,7 +176,7 @@ fn webp_animates(bytes: &[u8]) -> Option<bool> {
 /// until a second image is found or the trailer ends them. Every block clears
 /// at least its own introducer and a terminating sub-block, so the offset
 /// rises on every pass and a walk that runs off the picture ends.
-fn gif_animates(bytes: &[u8]) -> Option<bool> {
+fn gif_sequence(bytes: &[u8]) -> Option<bool> {
 	let &screen = bytes.get(10)?;
 	let global_table = (screen & GIF_COLOR_TABLE != 0)
 		.then(|| color_table_len(screen))

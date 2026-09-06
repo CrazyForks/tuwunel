@@ -306,6 +306,14 @@ mod container {
 
 		assert!(animates(cut), "an unsettled walk still withholds");
 		assert!(animated_type(cut).is_none(), "but it names nothing");
+	}
+
+	/// A settled walk names the container it read.
+	///
+	/// That name is what an animating picture is stored under, so it has to be
+	/// the container's own rather than whatever the upload declared it to be.
+	#[test]
+	fn a_settled_walk_names_its_container() {
 		assert_eq!(animated_type(ANIMATED_PNG), Some("image/apng"));
 		assert_eq!(animated_type(STILL_PNG), None);
 	}
