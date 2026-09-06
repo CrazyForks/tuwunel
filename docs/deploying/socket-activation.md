@@ -88,9 +88,10 @@ of its own.
 
 ## Direct TLS
 
-Passed sockets carry TLS exactly like bound ones. Setting `tls.certs` and
-`tls.key` applies to every listener Tuwunel serves, so a socket unit listening
-on 443 serves HTTPS with no further configuration:
+Passed TCP sockets carry TLS exactly like bound TCP listeners. This requires a
+build with the `direct_tls` Cargo feature. Setting `tls.certs` and `tls.key`
+applies to every TCP listener Tuwunel serves, so a socket unit listening on 443
+serves HTTPS with no further configuration:
 
 ```toml
 [global.tls]
@@ -101,10 +102,10 @@ key = "/etc/tuwunel/tls/privkey.pem"
 `tls.dual_protocol` works on passed sockets too, serving HTTP and HTTPS on the
 same passed port.
 
-TLS is a property of the server, not of the individual socket, so passed and
-bound listeners cannot use different certificates or mix TLS with plaintext.
-Ports that should stay plaintext behind a proxy belong to a separate reverse
-proxy, not to a second socket unit.
+TLS is a server-wide property for TCP listeners, not a property of an individual
+socket. Passed and bound TCP listeners cannot use different certificates or mix
+TLS with plaintext. Unix sockets remain plaintext and can still be used behind
+a local reverse proxy.
 
 ## Unix sockets
 

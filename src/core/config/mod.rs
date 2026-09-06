@@ -677,40 +677,38 @@ pub struct Config {
 	#[serde(default = "default_fetch_prev_wait_ms")]
 	pub fetch_prev_wait_ms: u64,
 
-	/// Default/base connection timeout (seconds). This is used only by URL
-	/// previews and update/news endpoint checks.
+	/// Default connection timeout (seconds) for outbound HTTP clients;
+	/// individual clients may override it.
 	///
 	/// default: 10
 	#[serde(default = "default_request_conn_timeout")]
 	pub request_conn_timeout: u64,
 
-	/// Default/base request timeout (seconds). The time waiting to receive more
-	/// data from another server. This is used only by URL previews,
-	/// update/news, and misc endpoint checks.
+	/// Default read timeout (seconds) for outbound HTTP clients; individual
+	/// clients may override it.
 	///
 	/// default: 35
 	#[serde(default = "default_request_timeout")]
 	pub request_timeout: u64,
 
-	/// Default/base request total timeout (seconds). The time limit for a whole
-	/// request. This is set very high to not cancel healthy requests while
-	/// serving as a backstop. This is used only by URL previews and update/news
-	/// endpoint checks.
+	/// Default whole-request timeout (seconds) for outbound HTTP clients.
+	///
+	/// Set high enough not to cancel healthy requests while remaining a
+	/// backstop. Individual clients may override it.
 	///
 	/// default: 320
 	#[serde(default = "default_request_total_timeout")]
 	pub request_total_timeout: u64,
 
-	/// Default/base idle connection pool timeout (seconds). This is used only
-	/// by URL previews and update/news endpoint checks.
+	/// Default idle connection pool timeout (seconds) for outbound HTTP
+	/// clients; individual clients may override it.
 	///
 	/// default: 5
 	#[serde(default = "default_request_idle_timeout")]
 	pub request_idle_timeout: u64,
 
-	/// Default/base max idle connections per host. This is used only by URL
-	/// previews and update/news endpoint checks. Defaults to 1 as generally the
-	/// same open connection can be re-used.
+	/// Default maximum idle connections per host for outbound HTTP clients;
+	/// individual clients may override it.
 	///
 	/// default: 1
 	#[serde(default = "default_request_idle_per_host")]
@@ -3930,7 +3928,8 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize, Default)]
 #[config_example_generator(filename = "tuwunel-example.toml", section = "global.tls")]
 pub struct TlsConfig {
-	/// Path to a valid TLS certificate file.
+	/// Path to a valid TLS certificate file; this section requires a build with
+	/// the `direct_tls` Cargo feature.
 	///
 	/// example: "/path/to/my/certificate.crt"
 	pub certs: Option<String>,

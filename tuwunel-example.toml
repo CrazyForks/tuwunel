@@ -503,32 +503,30 @@
 #
 #fetch_prev_wait_ms = 750
 
-# Default/base connection timeout (seconds). This is used only by URL
-# previews and update/news endpoint checks.
+# Default connection timeout (seconds) for outbound HTTP clients;
+# individual clients may override it.
 #
 #request_conn_timeout = 10
 
-# Default/base request timeout (seconds). The time waiting to receive more
-# data from another server. This is used only by URL previews,
-# update/news, and misc endpoint checks.
+# Default read timeout (seconds) for outbound HTTP clients; individual
+# clients may override it.
 #
 #request_timeout = 35
 
-# Default/base request total timeout (seconds). The time limit for a whole
-# request. This is set very high to not cancel healthy requests while
-# serving as a backstop. This is used only by URL previews and update/news
-# endpoint checks.
+# Default whole-request timeout (seconds) for outbound HTTP clients.
+#
+# Set high enough not to cancel healthy requests while remaining a
+# backstop. Individual clients may override it.
 #
 #request_total_timeout = 320
 
-# Default/base idle connection pool timeout (seconds). This is used only
-# by URL previews and update/news endpoint checks.
+# Default idle connection pool timeout (seconds) for outbound HTTP
+# clients; individual clients may override it.
 #
 #request_idle_timeout = 5
 
-# Default/base max idle connections per host. This is used only by URL
-# previews and update/news endpoint checks. Defaults to 1 as generally the
-# same open connection can be re-used.
+# Default maximum idle connections per host for outbound HTTP clients;
+# individual clients may override it.
 #
 #request_idle_per_host = 1
 
@@ -3360,7 +3358,8 @@
 
 #[global.tls]
 
-# Path to a valid TLS certificate file.
+# Path to a valid TLS certificate file; this section requires a build with
+# the `direct_tls` Cargo feature.
 #
 # example: "/path/to/my/certificate.crt"
 #
