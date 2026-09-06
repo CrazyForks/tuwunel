@@ -704,12 +704,14 @@ async fn handle_edu_direct_to_device(
 		.add_txnid(sender, None, message_id, &[]);
 }
 
-/// A local account we store or forward to-device events for: one that is
-/// active, or claimed by an appservice namespace so its puppet events reach the
-/// bridge.
+/// A local account we store or forward to-device events for.
+///
+/// Qualifying accounts are active, the server user once its account exists, or
+/// claimed by an appservice namespace so its puppet events reach the bridge.
 async fn to_device_deliverable(services: &Services, user_id: &UserId) -> bool {
 	services.globals.user_is_local(user_id)
-		&& (services.users.is_active(user_id).await
+		&& ((user_id == services.globals.server_user && services.users.exists(user_id).await)
+			|| services.users.is_active(user_id).await
 			|| services
 				.appservice
 				.is_interested_in_user(user_id)
