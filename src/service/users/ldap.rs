@@ -8,7 +8,7 @@ use ldap3::{
 };
 use ruma::UserId;
 use tokio::{fs::read as read_file, task::JoinHandle};
-use tuwunel_core::{Result, debug, err, error, implement, result::LogErr, trace};
+use tuwunel_core::{Result, debug, defer, err, error, implement, result::LogErr, trace};
 
 /// Cap LDAP connection setup so a hung directory cannot pin a login attempt.
 const CONN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,7 +28,9 @@ pub async fn search_ldap(&self, user_id: &UserId) -> Result<Vec<(String, bool)>>
 
 	let config = &self.services.config.ldap;
 
-	let (driver, mut ldap) = self.ldap_connect().await?;
+	let (driver, mut ldap) = self.ldap_connect(user_id.as_str()).await?;
+	let abort = driver.abort_handle();
+	defer! {{ abort.abort(); }};
 
 	match (&config.bind_dn, &config.bind_password_file) {
 		| (Some(bind_dn), Some(bind_password_file)) => {
@@ -135,7 +137,9 @@ pub async fn auth_ldap(&self, user_dn: &str, password: &str) -> Result {
 		)))));
 	}
 
-	let (driver, mut ldap) = self.ldap_connect().await?;
+	let (driver, mut ldap) = self.ldap_connect(user_dn).await?;
+	let abort = driver.abort_handle();
+	defer! {{ abort.abort(); }};
 
 	ldap.simple_bind(user_dn, password)
 		.await
@@ -156,7 +160,7 @@ pub async fn auth_ldap(&self, user_dn: &str, password: &str) -> Result {
 }
 
 #[implement(super::Service)]
-async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
+async fn ldap_connect(&self, principal: &str) -> Result<(JoinHandle<()>, Ldap)> {
 	let uri = self
 		.services
 		.config
@@ -181,7 +185,7 @@ async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
 	let (conn, ldap) = LdapConnAsync::from_url_with_settings(settings, uri)
 		.await
 		.map_err(|e| {
-			error!(%e, "LDAP connection setup error");
+			error!(?principal, %e, "LDAP connection setup error");
 			err!(Ldap("LDAP connection failed"))
 		})?;
 
