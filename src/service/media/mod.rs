@@ -40,7 +40,7 @@ use url::Url;
 
 #[cfg(feature = "media_thumbnail")]
 use self::video::{FAILURES, Failures, sweep_staging_dir};
-use self::{data::Data, preview::Agent, remote::Fetch, thumbnail::animated_type};
+use self::{data::Data, preview::Agent, remote::Fetch, thumbnail::stored_type};
 pub use self::{
 	data::Metadata,
 	preview::UrlPreviewData,
@@ -261,7 +261,7 @@ impl Service {
 		content_type: Option<&str>,
 		file: &[u8],
 	) -> Result {
-		let content_type = animated_type(file).or(content_type);
+		let content_type = stored_type(file, content_type);
 
 		// Width, Height = 0 if it's not a thumbnail
 		let key = self.db.create_file_metadata(

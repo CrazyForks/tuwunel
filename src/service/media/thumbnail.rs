@@ -30,7 +30,7 @@ use super::{Media, data::Metadata};
 pub(super) mod animate;
 mod sniff;
 
-pub(super) use sniff::{animated_type, animates};
+pub(super) use sniff::{animated_type, animates, stored_type};
 
 /// Content type of every thumbnail tuwunel generates.
 #[cfg(feature = "media_thumbnail")]

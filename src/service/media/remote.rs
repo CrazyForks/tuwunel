@@ -17,7 +17,7 @@ use tuwunel_core::{
 };
 use url::Url;
 
-use super::{Animate, Dim, Media, preview::Agent, thumbnail::animated_type};
+use super::{Animate, Dim, Media, preview::Agent, thumbnail::stored_type};
 use crate::{
 	client::read_response_capped,
 	federation::scheme::{FedAuth, FedPath},
@@ -219,9 +219,7 @@ async fn handle_thumbnail_file(
 		None,
 	);
 
-	// a peer's declared type is its own claim, and a later lookup holds the key
-	// rather than the picture it would need to catch a wrong one
-	let content_type = animated_type(&content.file).or(content.content_type.as_deref());
+	let content_type = stored_type(&content.file, content.content_type.as_deref());
 
 	self.upload_thumbnail(mxc, Some(&content_disposition), content_type, dim, &content.file)
 		.await
@@ -423,7 +421,9 @@ pub async fn fetch_remote_thumbnail_legacy(
 	let animate = Animate::from(body.animated);
 
 	if animate.accepts_picture(&response.file) {
-		self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
+		let content_type = stored_type(&response.file, response.content_type.as_deref());
+
+		self.upload_thumbnail(&mxc, None, content_type, &dim, &response.file)
 			.await?;
 
 		return Ok(response);

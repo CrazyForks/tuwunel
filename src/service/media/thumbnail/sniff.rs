@@ -83,12 +83,25 @@ pub(in super::super) fn animates(bytes: &[u8]) -> bool {
 	!matches!(sequence(bytes), Sequence::Absent)
 }
 
-/// The content type an animating picture ought to be stored under.
+/// The content type a picture ought to be stored under.
+///
+/// A settled walk names the container itself, and the declared type stands
+/// where the walk settled nothing. The label is what a lookup goes on wherever
+/// the picture is not in hand: choosing between the rows at a size walks keys
+/// alone, and a redirect hands the object over without reading it.
+pub(in super::super) fn stored_type<'a>(
+	bytes: &[u8],
+	declared: Option<&'a str>,
+) -> Option<&'a str> {
+	animated_type(bytes).or(declared)
+}
+
+/// The container type a picture's own bytes name.
 ///
 /// Only a settled walk answers `Some`, since this names what a picture is
 /// rather than deciding what may be served, and a guess would be recorded as
-/// fact. An unsettled walk leaves the declared type in place, where the picture
-/// itself is still read before anything is served from it.
+/// fact. `stored_type` is where an unsettled walk falls back to the type the
+/// picture was declared under.
 pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
 	match sequence(bytes) {
 		| Sequence::Present(content_type) => Some(content_type),
