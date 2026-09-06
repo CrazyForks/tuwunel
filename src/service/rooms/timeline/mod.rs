@@ -6,6 +6,9 @@ mod pdus;
 mod purge;
 mod redact;
 
+#[cfg(test)]
+mod tests;
+
 use std::{fmt::Write, sync::Arc};
 
 use async_trait::async_trait;
@@ -402,11 +405,14 @@ async fn count_to_id(
 
 #[implement(Service)]
 fn pdu_count_to_id(shortroomid: ShortRoomId, count: PduCount, dir: Direction) -> RawPduId {
-	// +1 so we don't send the base event
-	let pdu_id = PduId {
-		shortroomid,
-		count: count.saturating_inc(dir),
+	// In raw key order, backfilled zero precedes every stored row. It has no base
+	// event, so retaining it keeps the `from` bound exclusive.
+	let count = match (count, dir) {
+		| (PduCount::Backfilled(0), Direction::Forward) => count,
+		| _ => count.saturating_inc(dir),
 	};
+
+	let pdu_id = PduId { shortroomid, count };
 
 	pdu_id.into()
 }

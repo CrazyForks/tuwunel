@@ -1,9 +1,5 @@
 use axum::extract::State;
-use futures::{
-	FutureExt, StreamExt, TryFutureExt,
-	future::{Either, ready},
-	pin_mut,
-};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::Either, pin_mut};
 use ruma::{
 	DeviceId, RoomId, UInt, UserId,
 	api::{
@@ -193,17 +189,16 @@ pub(crate) async fn get_messages(
 
 	let shortroomid = services.short.get_shortroomid(room_id).await?;
 	let mut scanned = None;
-	let mut reached_to = false;
+	let reached_to = |count: PduCount| {
+		to.is_some_and(|to| match dir {
+			| Direction::Forward => count >= to,
+			| Direction::Backward => count <= to,
+		})
+	};
+
 	let events: Vec<_> = it
 		.inspect(|(count, _)| scanned = Some(*count))
-		.take_while(|(count, _)| {
-			reached_to = to.is_some_and(|to| match dir {
-				| Direction::Forward => *count >= to,
-				| Direction::Backward => *count <= to,
-			});
-
-			ready(!reached_to)
-		})
+		.ready_take_while(|(count, _)| !reached_to(*count))
 		.ready_filter_map(|item| event_filter(item, filter))
 		.wide_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
 		.wide_filter_map(|item| event_filters(services, sender_user, item, bypass_visibility))
@@ -244,7 +239,10 @@ pub(crate) async fn get_messages(
 		.collect()
 		.await;
 
-	let exhausted = matches!(dir, Direction::Backward) && events.len() < limit && !reached_to;
+	// `inspect` records the rejected boundary item, distinguishing a `to` stop
+	// from stream exhaustion.
+	let stopped_at_to = scanned.is_some_and(reached_to);
+	let exhausted = matches!(dir, Direction::Backward) && events.len() < limit && !stopped_at_to;
 	let next_token = if exhausted { scanned } else { events.last().map(at!(0)) };
 
 	let chunk = events

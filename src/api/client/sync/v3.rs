@@ -114,6 +114,13 @@ struct UserMetadata {
 	joined_since_last_sync: bool,
 }
 
+struct GateInputs<'a> {
+	last_notification_read: Option<u64>,
+	thread_last_reads: &'a BTreeMap<OwnedEventId, u64>,
+	quiet_round: bool,
+	since: u64,
+}
+
 struct NotificationGates<F> {
 	send_notification_counts: bool,
 	send_notification_count_filter: F,
@@ -1166,10 +1173,12 @@ async fn load_joined_room(
 		send_notification_counts,
 		send_notification_count_filter,
 	} = compute_notification_gates(
-		last_notification_read,
-		&thread_last_reads,
-		quiet_round,
-		since,
+		GateInputs {
+			last_notification_read,
+			thread_last_reads: &thread_last_reads,
+			quiet_round,
+			since,
+		},
 		in_window,
 	);
 
@@ -1936,10 +1945,12 @@ fn in_window(since: u64, next_batch: u64) -> impl Fn(u64) -> bool + Copy {
 /// captured before that cursor is read, a cursor past the cutoff repeats the
 /// zero until the token catches up.
 fn compute_notification_gates<F: Fn(u64) -> bool>(
-	last_notification_read: Option<u64>,
-	thread_last_reads: &BTreeMap<OwnedEventId, u64>,
-	quiet_round: bool,
-	since: u64,
+	GateInputs {
+		last_notification_read,
+		thread_last_reads,
+		quiet_round,
+		since,
+	}: GateInputs<'_>,
 	in_window: F,
 ) -> NotificationGates<impl Fn(&UInt) -> bool + use<F>> {
 	// Thread-only resets leave the main cursor alone, so without the thread leg
@@ -2514,10 +2525,12 @@ mod tests {
 		since: u64,
 	) -> NotificationGates<impl Fn(&UInt) -> bool + use<>> {
 		compute_notification_gates(
-			last_read,
-			thread_reads,
-			quiet_round,
-			since,
+			GateInputs {
+				last_notification_read: last_read,
+				thread_last_reads: thread_reads,
+				quiet_round,
+				since,
+			},
 			in_window(since, NEXT_BATCH),
 		)
 	}

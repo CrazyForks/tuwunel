@@ -26,10 +26,8 @@ async fn set_private_marker(
 		.await
 		.map_err(|_| err!(Request(NotFound("Event not found."))))?;
 
-	// A backfilled event has no forward position; its position is below every
-	// live event, so storing it can never advance the marker.
 	let PduCount::Normal(count) = count else {
-		debug!(%user_id, %room_id, %event, "Backfilled event was requested to be marked as read");
+		debug!(%user_id, %room_id, %event, "Skipping private read marker at a backfilled event");
 		return Ok(false);
 	};
 
