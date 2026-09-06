@@ -35,7 +35,7 @@ use ruma::{
 };
 use tokio::time;
 use tuwunel_core::{
-	Result, at,
+	Error, Result, at, debug,
 	debug::INFO_SPAN_LEVEL,
 	debug_error, err,
 	error::{inspect_debug_log, inspect_log},
@@ -889,7 +889,7 @@ async fn load_left_room(
 			services
 				.timeline
 				.get_shortstatehash(room_id, count)
-				.inspect_err(inspect_debug_log)
+				.inspect_err(log_horizon_error)
 				.ok()
 		});
 
@@ -1021,6 +1021,19 @@ async fn load_left_room(
 				.collect(),
 		},
 	}))
+}
+
+/// Records a failed horizon read, quietly when the row is simply absent.
+///
+/// `append_to_state` writes no state hash for a room's `m.room.create` event,
+/// there being no state before it, so the first window of every room misses
+/// here by design. An absent row reads the same whatever left it absent, so
+/// the loud path is what remains: a fault that is not a miss at all.
+fn log_horizon_error(error: &Error) {
+	match error.is_not_found() {
+		| true => debug!(?error, "no shortstatehash at the window's first event"),
+		| false => inspect_debug_log(error),
+	}
 }
 
 fn in_timeline(timeline_pdus: &[(PduCount, PduEvent)]) -> impl Fn(&PduEvent) -> bool + use<> {
@@ -1629,7 +1642,7 @@ async fn gather_room_metadata(
 			services
 				.timeline
 				.get_shortstatehash(room_id, count)
-				.inspect_err(inspect_debug_log)
+				.inspect_err(log_horizon_error)
 		});
 
 	// MSC4222 `state_after` semantics: state at the *end* of the timeline
