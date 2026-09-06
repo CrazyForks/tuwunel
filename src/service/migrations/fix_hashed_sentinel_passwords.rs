@@ -1,10 +1,6 @@
 use tuwunel_core::{
-	Result, debug, err, info,
-	utils::{
-		ReadyExt,
-		hash::{password, verify_password},
-		stream::TryExpect,
-	},
+	Result, debug, info,
+	utils::{ReadyExt, hash::verify_password, stream::TryExpect},
 	warn,
 };
 
@@ -21,14 +17,8 @@ pub(super) async fn fix_hashed_sentinel_passwords(services: &Services) -> Result
 	let db = &services.db;
 	let cork = db.cork_and_sync();
 	let userid_password = db["userid_password"].clone();
-	let hashed_sentinel = password(PASSWORD_SENTINEL).map_err(|e| {
-		err!("Could not apply migration: failed to hash sentinel password: {e:?}")
-	})?;
 
-	warn!(
-		"Fixing occurrences of password-hash {hashed_sentinel:?} generated from \
-		 {PASSWORD_SENTINEL:?}"
-	);
+	warn!(sentinel = %PASSWORD_SENTINEL, "Fixing occurrences of hashed sentinel passwords");
 
 	let (checked, good, bad) = userid_password
 		.stream()
