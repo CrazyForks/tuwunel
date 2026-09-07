@@ -55,14 +55,32 @@ pub(super) async fn get_count_etag(
 	let count = services
 		.key_backups
 		.count_keys(sender_user, version)
-		.map(TryInto::try_into);
+		.map(|count| count.try_into().map_err(Error::from));
 
 	let etag = services
 		.key_backups
 		.get_etag(sender_user, version)
-		.map(Ok);
+		.map(|result| result.map(|etag| etag.to_string()));
 
-	Ok(try_join(count, etag).await?)
+	try_join(count, etag).await
+}
+
+pub(super) async fn check_backup_exists(
+	services: &Services,
+	sender_user: &UserId,
+	version: &str,
+) -> Result {
+	let algorithm = services
+		.key_backups
+		.get_backup(sender_user, version)
+		.map(|result| result.map(drop));
+
+	let etag = services
+		.key_backups
+		.get_etag(sender_user, version)
+		.map(|result| result.map(drop));
+
+	try_join(algorithm, etag).await.map(drop)
 }
 
 pub(super) async fn check_backup_version(
@@ -70,20 +88,22 @@ pub(super) async fn check_backup_version(
 	sender_user: &UserId,
 	version: &str,
 ) -> Result {
-	services
+	let current_version = services
 		.key_backups
 		.get_latest_backup_version(sender_user)
-		.await
-		.ok()
-		.filter(|current| current.as_str() != version)
-		.map_or(Ok(()), |current_version| {
-			let data = WrongRoomKeysVersionErrorData::new(current_version);
-			let kind = ErrorKind::WrongRoomKeysVersion(data);
+		.await?;
 
-			Err(Error::Request(
-				kind,
-				"You may only manipulate the most recently created version of the backup.".into(),
-				StatusCode::BAD_REQUEST,
-			))
-		})
+	if current_version == version {
+		return Ok(());
+	}
+
+	let data = WrongRoomKeysVersionErrorData::new(current_version);
+	let kind = ErrorKind::WrongRoomKeysVersion(data);
+	let error = Error::Request(
+		kind,
+		"You may only manipulate the most recently created version of the backup.".into(),
+		StatusCode::BAD_REQUEST,
+	);
+
+	Err(error)
 }

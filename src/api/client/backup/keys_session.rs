@@ -4,7 +4,7 @@ use ruma::api::client::backup::{
 };
 use tuwunel_core::{Result, err};
 
-use super::{check_backup_version, get_count_etag};
+use super::{check_backup_exists, check_backup_version, get_count_etag};
 use crate::Ruma;
 
 /// # `PUT /_matrix/client/r0/room_keys/keys/{roomId}/{sessionId}`
@@ -48,8 +48,14 @@ pub(crate) async fn get_backup_keys_for_session_route(
 		.key_backups
 		.get_session(body.sender_user(), &body.version, &body.room_id, &body.session_id)
 		.await
-		.map_err(|_| {
-			err!(Request(NotFound(debug_error!("Backup key not found for this user's session."))))
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Request(NotFound(debug_error!(
+					"Backup key not found for this user's session."
+				))))
+			} else {
+				error
+			}
 		})?;
 
 	Ok(get_backup_keys_for_session::v3::Response { key_data })
@@ -62,10 +68,14 @@ pub(crate) async fn delete_backup_keys_for_session_route(
 	State(services): State<crate::State>,
 	body: Ruma<delete_backup_keys_for_session::v3::Request>,
 ) -> Result<delete_backup_keys_for_session::v3::Response> {
-	services
-		.key_backups
-		.delete_room_key(body.sender_user(), &body.version, &body.room_id, &body.session_id)
-		.await;
+	check_backup_exists(&services, body.sender_user(), &body.version).await?;
+
+	services.key_backups.delete_room_key(
+		body.sender_user(),
+		&body.version,
+		&body.room_id,
+		&body.session_id,
+	);
 
 	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
 

@@ -8,7 +8,10 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, err, implement,
-	utils::stream::{ReadyExt, TryIgnore},
+	utils::{
+		TryReadyExt,
+		stream::{ReadyExt, TryIgnore},
+	},
 };
 use tuwunel_database::{Deserialized, Ignore, Interfix, Json, Map};
 
@@ -242,6 +245,7 @@ fn is_better_key(old: &Raw<KeyBackupData>, new: &Raw<KeyBackupData>) -> Result<b
 #[implement(Service)]
 pub async fn count_keys(&self, user_id: &UserId, version: &str) -> usize {
 	let prefix = (user_id, version);
+
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&prefix)
@@ -250,16 +254,14 @@ pub async fn count_keys(&self, user_id: &UserId, version: &str) -> usize {
 }
 
 #[implement(Service)]
-pub async fn get_etag(&self, user_id: &UserId, version: &str) -> String {
+pub async fn get_etag(&self, user_id: &UserId, version: &str) -> Result<u64> {
 	let key = (user_id, version);
+
 	self.db
 		.backupid_etag
 		.qry(&key)
 		.await
 		.deserialized::<u64>()
-		.as_ref()
-		.map(ToString::to_string)
-		.expect("Backup has no etag.")
 }
 
 #[implement(Service)]
@@ -330,44 +332,64 @@ pub async fn get_session(
 }
 
 #[implement(Service)]
-pub async fn delete_all_keys(&self, user_id: &UserId, version: &str) {
+pub async fn delete_all_keys(&self, user_id: &UserId, version: &str) -> Result {
 	let key = (user_id, version, Interfix);
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
-		.ignore_err()
-		.ready_for_each(|outdated_key| self.db.backupkeyid_backup.remove(outdated_key))
-		.await;
+		.ready_try_for_each(|outdated_key| {
+			self.db.backupkeyid_backup.remove(outdated_key);
+			Ok(())
+		})
+		.await?;
+
+	self.bump_etag(user_id, version);
+
+	Ok(())
 }
 
 #[implement(Service)]
-pub async fn delete_room_keys(&self, user_id: &UserId, version: &str, room_id: &RoomId) {
+fn bump_etag(&self, user_id: &UserId, version: &str) {
+	let etag = self.services.globals.next_count();
+
+	self.db
+		.backupid_etag
+		.put((user_id, version), *etag);
+}
+
+#[implement(Service)]
+pub async fn delete_room_keys(
+	&self,
+	user_id: &UserId,
+	version: &str,
+	room_id: &RoomId,
+) -> Result {
 	let key = (user_id, version, room_id, Interfix);
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
-		.ignore_err()
-		.ready_for_each(|outdated_key| {
+		.ready_try_for_each(|outdated_key| {
 			self.db.backupkeyid_backup.remove(outdated_key);
+			Ok(())
 		})
-		.await;
+		.await?;
+
+	self.bump_etag(user_id, version);
+
+	Ok(())
 }
 
 #[implement(Service)]
-pub async fn delete_room_key(
+pub fn delete_room_key(
 	&self,
 	user_id: &UserId,
 	version: &str,
 	room_id: &RoomId,
 	session_id: &str,
 ) {
-	let key = (user_id, version, room_id, session_id);
 	self.db
 		.backupkeyid_backup
-		.keys_prefix_raw(&key)
-		.ignore_err()
-		.ready_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
-		})
-		.await;
+		.del((user_id, version, room_id, session_id));
+
+	self.bump_etag(user_id, version);
 }

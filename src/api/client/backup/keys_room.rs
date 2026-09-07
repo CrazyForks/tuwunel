@@ -5,7 +5,7 @@ use ruma::api::client::backup::{
 };
 use tuwunel_core::{Result, utils::stream::IterStream};
 
-use super::{check_backup_version, get_count_etag};
+use super::{check_backup_exists, check_backup_version, get_count_etag};
 use crate::Ruma;
 
 /// # `PUT /_matrix/client/r0/room_keys/keys/{roomId}`
@@ -26,13 +26,13 @@ pub(crate) async fn add_backup_keys_for_room_route(
 		.iter()
 		.stream()
 		.map(Ok)
-		.try_for_each(|(sid, kd)| {
+		.try_for_each(|(session_id, key_data)| {
 			services.key_backups.add_key(
 				body.sender_user(),
 				&body.version,
 				&body.room_id,
-				sid,
-				kd,
+				session_id,
+				key_data,
 			)
 		})
 		.await?;
@@ -64,10 +64,12 @@ pub(crate) async fn delete_backup_keys_for_room_route(
 	State(services): State<crate::State>,
 	body: Ruma<delete_backup_keys_for_room::v3::Request>,
 ) -> Result<delete_backup_keys_for_room::v3::Response> {
+	check_backup_exists(&services, body.sender_user(), &body.version).await?;
+
 	services
 		.key_backups
 		.delete_room_keys(body.sender_user(), &body.version, &body.room_id)
-		.await;
+		.await?;
 
 	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
 
