@@ -1,9 +1,12 @@
 use axum::extract::State;
-use futures::{StreamExt, TryStreamExt};
-use ruma::api::client::backup::{add_backup_keys, delete_backup_keys, get_backup_keys};
+use ruma::api::client::backup::{
+	add_backup_keys::{self, v3::Response as AddResponse},
+	delete_backup_keys::{self, v3::Response as DeleteResponse},
+	get_backup_keys::{self, v3::Response as GetResponse},
+};
 use tuwunel_core::{Result, utils::stream::IterStream};
 
-use super::{check_backup_exists, check_backup_version, get_count_etag};
+use super::format_count_etag;
 use crate::Ruma;
 
 /// # `PUT /_matrix/client/r0/room_keys/keys`
@@ -18,31 +21,25 @@ pub(crate) async fn add_backup_keys_route(
 	State(services): State<crate::State>,
 	body: Ruma<add_backup_keys::v3::Request>,
 ) -> Result<add_backup_keys::v3::Response> {
-	check_backup_version(&services, body.sender_user(), &body.version).await?;
-
-	body.rooms
+	let keys = body
+		.rooms
 		.iter()
 		.flat_map(|(room_id, room)| {
 			room.sessions
 				.iter()
 				.map(move |(session_id, key_data)| (room_id, session_id, key_data))
 		})
-		.stream()
-		.map(Ok)
-		.try_for_each(|(room_id, session_id, key_data)| {
-			services.key_backups.add_key(
-				body.sender_user(),
-				&body.version,
-				room_id,
-				session_id,
-				key_data,
-			)
-		})
+		.map(|(room_id, session_id, key_data)| (room_id.as_ref(), session_id.as_str(), key_data))
+		.stream();
+
+	let metadata = services
+		.key_backups
+		.add_keys(body.sender_user(), &body.version, keys)
 		.await?;
 
-	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
+	let (count, etag) = format_count_etag(metadata)?;
 
-	Ok(add_backup_keys::v3::Response { count, etag })
+	Ok(AddResponse { count, etag })
 }
 
 /// # `GET /_matrix/client/r0/room_keys/keys`
@@ -57,7 +54,7 @@ pub(crate) async fn get_backup_keys_route(
 		.get_all(body.sender_user(), &body.version)
 		.await;
 
-	Ok(get_backup_keys::v3::Response { rooms })
+	Ok(GetResponse { rooms })
 }
 
 /// # `DELETE /_matrix/client/r0/room_keys/keys`
@@ -67,14 +64,12 @@ pub(crate) async fn delete_backup_keys_route(
 	State(services): State<crate::State>,
 	body: Ruma<delete_backup_keys::v3::Request>,
 ) -> Result<delete_backup_keys::v3::Response> {
-	check_backup_exists(&services, body.sender_user(), &body.version).await?;
-
-	services
+	let metadata = services
 		.key_backups
 		.delete_all_keys(body.sender_user(), &body.version)
 		.await?;
 
-	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
+	let (count, etag) = format_count_etag(metadata)?;
 
-	Ok(delete_backup_keys::v3::Response { count, etag })
+	Ok(DeleteResponse { count, etag })
 }

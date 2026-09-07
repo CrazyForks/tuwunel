@@ -1,22 +1,33 @@
-use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
+use std::{cmp::Ordering, collections::BTreeMap, module_path, sync::Arc};
 
-use futures::StreamExt;
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, future::try_join};
+use http::StatusCode;
 use ruma::{
-	OwnedRoomId, RoomId, UInt, UserId,
-	api::client::backup::{BackupAlgorithm, KeyBackupData, RoomKeyBackup},
+	OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
+	api::{
+		client::backup::{BackupAlgorithm, KeyBackupData, RoomKeyBackup},
+		error::{ErrorKind, WrongRoomKeysVersionErrorData},
+	},
 	serde::Raw,
 };
 use tuwunel_core::{
 	Err, Result, err, implement,
 	utils::{
-		TryReadyExt,
+		MutexMap,
 		stream::{ReadyExt, TryIgnore},
 	},
 };
 use tuwunel_database::{Deserialized, Ignore, Interfix, Json, Map};
 
+type Key<'a> = (&'a RoomId, &'a str, &'a Raw<KeyBackupData>);
+type StoredKey<'a> = (Ignore, Ignore, &'a RoomId, &'a str);
+type StoredKeyVal<'a> = (StoredKey<'a>, Raw<KeyBackupData>);
+type StoredRoomKeyVal<'a> = ((Ignore, Ignore, Ignore, &'a str), Raw<KeyBackupData>);
+type VersionKey<'a> = (&'a UserId, &'a str);
+
 pub struct Service {
 	db: Data,
+	mutex: MutexMap<OwnedUserId, ()>,
 	services: Arc<crate::services::OnceServices>,
 }
 
@@ -34,19 +45,21 @@ impl crate::Service for Service {
 				backupid_etag: args.db["backupid_etag"].clone(),
 				backupkeyid_backup: args.db["backupkeyid_backup"].clone(),
 			},
+			mutex: MutexMap::new(),
 			services: args.services.clone(),
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str { crate::service::make_name(module_path!()) }
 }
 
 #[implement(Service)]
-pub fn create_backup(
+pub async fn create_backup(
 	&self,
 	user_id: &UserId,
 	backup_metadata: &Raw<BackupAlgorithm>,
 ) -> Result<String> {
+	let _backup_lock = self.mutex.lock(user_id).await;
 	let version = self.services.globals.next_count();
 	let count = self.services.globals.next_count();
 
@@ -63,11 +76,13 @@ pub fn create_backup(
 
 #[implement(Service)]
 pub async fn delete_backup(&self, user_id: &UserId, version: &str) {
+	let _backup_lock = self.mutex.lock(user_id).await;
 	let key = (user_id, version);
 	self.db.backupid_algorithm.del(key);
 	self.db.backupid_etag.del(key);
 
 	let key = (user_id, version, Interfix);
+
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
@@ -85,6 +100,7 @@ pub async fn update_backup<'a>(
 	version: &'a str,
 	backup_metadata: &Raw<BackupAlgorithm>,
 ) -> Result<&'a str> {
+	let _backup_lock = self.mutex.lock(user_id).await;
 	let key = (user_id, version);
 	if self
 		.db
@@ -108,21 +124,20 @@ pub async fn update_backup<'a>(
 
 #[implement(Service)]
 pub async fn get_latest_backup_version(&self, user_id: &UserId) -> Result<String> {
-	type Key<'a> = (&'a UserId, &'a str);
-
 	let key = (user_id, Interfix);
-	let mut versions: Vec<_> = self
+	let latest = self
 		.db
 		.backupid_algorithm
 		.keys_from(&key)
 		.ignore_err()
-		.ready_take_while(|(user_id_, _): &Key<'_>| *user_id_ == user_id)
-		.ready_filter_map(|(_, version): Key<'_>| version.parse::<u64>().ok())
-		.collect()
+		.ready_take_while(|(user_id_, _): &VersionKey<'_>| *user_id_ == user_id)
+		.ready_filter_map(|(_, version): VersionKey<'_>| version.parse::<u64>().ok())
+		.ready_fold(None, |latest: Option<u64>, version| {
+			Some(latest.map_or(version, |latest| latest.max(version)))
+		})
 		.await;
 
-	versions.sort_unstable();
-	let Some(latest) = versions.last() else {
+	let Some(latest) = latest else {
 		return Err!(Request(NotFound("No backup versions found")));
 	};
 
@@ -156,8 +171,62 @@ pub async fn get_backup(&self, user_id: &UserId, version: &str) -> Result<Raw<Ba
 		.deserialized()
 }
 
+/// Adds a stream of room keys to the latest backup version.
+///
+/// The stream is drained serially while this user's backup mutations are
+/// locked. The returned count and etag describe the completed operation.
 #[implement(Service)]
-pub async fn add_key(
+pub async fn add_keys<'a, S>(
+	&self,
+	user_id: &UserId,
+	version: &str,
+	keys: S,
+) -> Result<(usize, u64)>
+where
+	S: Stream<Item = Key<'a>> + Send,
+{
+	let _backup_lock = self.mutex.lock(user_id).await;
+
+	self.check_backup_version(user_id, version)
+		.await?;
+
+	let key = (user_id, version);
+
+	self.db
+		.backupid_algorithm
+		.qry(&key)
+		.await
+		.map_err(|_| err!(Request(NotFound("Tried to update nonexistent backup."))))?;
+
+	keys.map(Ok)
+		.try_for_each(async |(room_id, session_id, key_data)| {
+			self.add_key(user_id, version, room_id, session_id, key_data)
+				.await
+		})
+		.await?;
+
+	self.get_count_etag(user_id, version).await
+}
+
+#[implement(Service)]
+async fn check_backup_version(&self, user_id: &UserId, version: &str) -> Result {
+	let current_version = self.get_latest_backup_version(user_id).await?;
+
+	if current_version == version {
+		return Ok(());
+	}
+
+	let status = StatusCode::BAD_REQUEST;
+	let data = WrongRoomKeysVersionErrorData::new(current_version);
+	let kind = ErrorKind::WrongRoomKeysVersion(data);
+	let message =
+		"You may only manipulate the most recently created version of the backup.".into();
+
+	Err!(Request(kind, message, status))
+}
+
+#[implement(Service)]
+async fn add_key(
 	&self,
 	user_id: &UserId,
 	version: &str,
@@ -165,17 +234,6 @@ pub async fn add_key(
 	session_id: &str,
 	key_data: &Raw<KeyBackupData>,
 ) -> Result {
-	let key = (user_id, version);
-	if self
-		.db
-		.backupid_algorithm
-		.qry(&key)
-		.await
-		.is_err()
-	{
-		return Err!(Request(NotFound("Tried to update nonexistent backup.")));
-	}
-
 	// Keep the existing key unless the incoming one is preferable per MSC1219.
 	let replace = match self
 		.get_session(user_id, version, room_id, session_id)
@@ -189,6 +247,7 @@ pub async fn add_key(
 		return Ok(());
 	}
 
+	let key = (user_id, version);
 	let count = self.services.globals.next_count();
 	let mut txn = self.services.db.txn();
 
@@ -202,8 +261,8 @@ pub async fn add_key(
 	Ok(())
 }
 
-/// Per MSC1219: prefer verified, then lower `first_message_index`, then lower
-/// `forwarded_count`; equal on all three keeps the existing key.
+// Per MSC1219: prefer verified, then lower `first_message_index`, then lower
+// `forwarded_count`; equal on all three keeps the existing key.
 fn is_better_key(old: &Raw<KeyBackupData>, new: &Raw<KeyBackupData>) -> Result<bool> {
 	let old_verified = old
 		.get_field::<bool>("is_verified")?
@@ -242,9 +301,21 @@ fn is_better_key(old: &Raw<KeyBackupData>, new: &Raw<KeyBackupData>) -> Result<b
 	}
 }
 
+/// Reads a backup's current key count and etag.
+///
+/// Mutation callers keep the user lock across this method. Other callers
+/// receive two independent current observations without snapshot semantics.
+#[implement(Service)]
+pub async fn get_count_etag(&self, user_id: &UserId, version: &str) -> Result<(usize, u64)> {
+	let count = self.count_keys(user_id, version).map(Ok);
+	let etag = self.get_etag(user_id, version);
+
+	try_join(count, etag).await
+}
+
 #[implement(Service)]
 pub async fn count_keys(&self, user_id: &UserId, version: &str) -> usize {
-	let prefix = (user_id, version);
+	let prefix = (user_id, version, Interfix);
 
 	self.db
 		.backupkeyid_backup
@@ -270,27 +341,25 @@ pub async fn get_all(
 	user_id: &UserId,
 	version: &str,
 ) -> BTreeMap<OwnedRoomId, RoomKeyBackup> {
-	type Key<'a> = (Ignore, Ignore, &'a RoomId, &'a str);
-	type KeyVal<'a> = (Key<'a>, Raw<KeyBackupData>);
-
-	let mut rooms = BTreeMap::<OwnedRoomId, RoomKeyBackup>::new();
 	let default = || RoomKeyBackup { sessions: BTreeMap::new() };
-
 	let prefix = (user_id, version, Interfix);
+
 	self.db
 		.backupkeyid_backup
 		.stream_prefix(&prefix)
 		.ignore_err()
-		.ready_for_each(|((_, _, room_id, session_id), key_backup_data): KeyVal<'_>| {
+		.ready_fold(BTreeMap::new(), |mut rooms, row: StoredKeyVal<'_>| {
+			let ((_, _, room_id, session_id), key_backup_data) = row;
+
 			rooms
 				.entry(room_id.into())
 				.or_insert_with(default)
 				.sessions
 				.insert(session_id.into(), key_backup_data);
-		})
-		.await;
 
-	rooms
+			rooms
+		})
+		.await
 }
 
 #[implement(Service)]
@@ -300,14 +369,13 @@ pub async fn get_room(
 	version: &str,
 	room_id: &RoomId,
 ) -> BTreeMap<String, Raw<KeyBackupData>> {
-	type KeyVal<'a> = ((Ignore, Ignore, Ignore, &'a str), Raw<KeyBackupData>);
-
 	let prefix = (user_id, version, room_id, Interfix);
+
 	self.db
 		.backupkeyid_backup
 		.stream_prefix(&prefix)
 		.ignore_err()
-		.map(|((.., session_id), key_backup_data): KeyVal<'_>| {
+		.map(|((.., session_id), key_backup_data): StoredRoomKeyVal<'_>| {
 			(session_id.to_owned(), key_backup_data)
 		})
 		.collect()
@@ -332,29 +400,46 @@ pub async fn get_session(
 }
 
 #[implement(Service)]
-pub async fn delete_all_keys(&self, user_id: &UserId, version: &str) -> Result {
+pub async fn delete_all_keys(&self, user_id: &UserId, version: &str) -> Result<(usize, u64)> {
+	let _backup_lock = self.mutex.lock(user_id).await;
+
+	self.check_backup_exists(user_id, version).await?;
+
 	let key = (user_id, version, Interfix);
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
-		.ready_try_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
-			Ok(())
-		})
-		.await?;
+		.ignore_err()
+		.ready_for_each(|outdated_key| self.db.backupkeyid_backup.remove(outdated_key))
+		.await;
 
-	self.bump_etag(user_id, version);
+	let etag = self.bump_etag(user_id, version);
 
-	Ok(())
+	Ok((0, etag))
 }
 
 #[implement(Service)]
-fn bump_etag(&self, user_id: &UserId, version: &str) {
+async fn check_backup_exists(&self, user_id: &UserId, version: &str) -> Result {
+	let algorithm = self
+		.get_backup(user_id, version)
+		.map(|result| result.map(drop));
+
+	let etag = self
+		.get_etag(user_id, version)
+		.map(|result| result.map(drop));
+
+	try_join(algorithm, etag).await.map(drop)
+}
+
+#[implement(Service)]
+fn bump_etag(&self, user_id: &UserId, version: &str) -> u64 {
 	let etag = self.services.globals.next_count();
 
 	self.db
 		.backupid_etag
 		.put((user_id, version), *etag);
+
+	*etag
 }
 
 #[implement(Service)]
@@ -363,33 +448,44 @@ pub async fn delete_room_keys(
 	user_id: &UserId,
 	version: &str,
 	room_id: &RoomId,
-) -> Result {
+) -> Result<(usize, u64)> {
+	let _backup_lock = self.mutex.lock(user_id).await;
+
+	self.check_backup_exists(user_id, version).await?;
+
 	let key = (user_id, version, room_id, Interfix);
+
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
-		.ready_try_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
-			Ok(())
-		})
-		.await?;
+		.ignore_err()
+		.ready_for_each(|outdated_key| self.db.backupkeyid_backup.remove(outdated_key))
+		.await;
 
-	self.bump_etag(user_id, version);
+	let etag = self.bump_etag(user_id, version);
+	let count = self.count_keys(user_id, version).await;
 
-	Ok(())
+	Ok((count, etag))
 }
 
 #[implement(Service)]
-pub fn delete_room_key(
+pub async fn delete_room_key(
 	&self,
 	user_id: &UserId,
 	version: &str,
 	room_id: &RoomId,
 	session_id: &str,
-) {
+) -> Result<(usize, u64)> {
+	let _backup_lock = self.mutex.lock(user_id).await;
+
+	self.check_backup_exists(user_id, version).await?;
+
 	self.db
 		.backupkeyid_backup
 		.del((user_id, version, room_id, session_id));
 
-	self.bump_etag(user_id, version);
+	let etag = self.bump_etag(user_id, version);
+	let count = self.count_keys(user_id, version).await;
+
+	Ok((count, etag))
 }

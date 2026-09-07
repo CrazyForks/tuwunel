@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-use std::{env::var, fs::remove_dir_all, net::TcpListener, process::id as process_id};
+use std::{
+	env::var, fs::remove_dir_all, iter::once, net::TcpListener, process::id as process_id,
+};
 
 use futures::future::join;
 use reqwest::StatusCode;
@@ -13,6 +15,7 @@ use tuwunel_core::{
 		api::client::backup::{BackupAlgorithm, KeyBackupData},
 		serde::Raw,
 	},
+	utils::stream::IterStream,
 };
 use tuwunel_service::Services;
 
@@ -78,7 +81,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	let old = services
 		.key_backups
-		.create_backup(user, &algorithm)?;
+		.create_backup(user, &algorithm)
+		.await?;
 
 	for (room, session) in [
 		(room_a.as_ref(), "a1"),
@@ -87,20 +91,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		(room_b.as_ref(), "b2"),
 		(room_c.as_ref(), "c1"),
 	] {
-		services
-			.key_backups
-			.add_key(user, &old, room, session, &key)
-			.await?;
+		add_key(services, user, &old, room, session, &key).await?;
 	}
 
 	let latest = services
 		.key_backups
-		.create_backup(user, &algorithm)?;
-
-	services
-		.key_backups
-		.add_key(user, &latest, &room_a, "latest", &key)
+		.create_backup(user, &algorithm)
 		.await?;
+
+	add_key(services, user, &latest, &room_a, "latest", &key).await?;
 
 	assert_eq!(
 		services
@@ -116,6 +115,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 	assert_eq!(body["errcode"], "M_WRONG_ROOM_KEYS_VERSION", "{body}");
+	assert_eq!(body["current_version"], latest, "{body}");
 
 	let initial_etag = services
 		.key_backups
@@ -140,6 +140,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.key_backups
 		.get_session(user, &old, &room_a, "a10")
 		.await?;
+
 	services
 		.key_backups
 		.get_session(user, &old, &room_b, "b1")
@@ -162,6 +163,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.key_backups
 		.get_session(user, &old, &room_a, "a10")
 		.await?;
+
 	services
 		.key_backups
 		.get_session(user, &old, &room_c, "c1")
@@ -189,23 +191,19 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	assert_not_found(status, &body);
 
-	assert_eq!(
-		services
-			.key_backups
-			.count_keys(user, &missing_algorithm)
-			.await,
-		1,
-		"failed DELETE removed keys",
-	);
+	let remaining_keys = services
+		.key_backups
+		.count_keys(user, &missing_algorithm)
+		.await;
 
-	assert_eq!(
-		services
-			.key_backups
-			.get_etag(user, &missing_algorithm)
-			.await?,
-		original_etag,
-		"failed DELETE changed the etag",
-	);
+	assert_eq!(remaining_keys, 1, "failed DELETE removed keys");
+
+	let failed_etag = services
+		.key_backups
+		.get_etag(user, &missing_algorithm)
+		.await?;
+
+	assert_eq!(failed_etag, original_etag, "failed DELETE changed the etag");
 
 	let missing_etag =
 		seeded_backup(services, user, room_c.as_ref(), "missing-etag", &algorithm, &key).await?;
@@ -217,23 +215,19 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	assert_not_found(status, &body);
 
-	assert_eq!(
-		services
-			.key_backups
-			.count_keys(user, &missing_etag)
-			.await,
-		1,
-		"failed DELETE removed keys",
-	);
+	let remaining_keys = services
+		.key_backups
+		.count_keys(user, &missing_etag)
+		.await;
 
-	assert!(
-		services
-			.key_backups
-			.get_etag(user, &missing_etag)
-			.await
-			.is_err(),
-		"failed DELETE recreated the missing etag",
-	);
+	assert_eq!(remaining_keys, 1, "failed DELETE removed keys");
+
+	let missing_etag_result = services
+		.key_backups
+		.get_etag(user, &missing_etag)
+		.await;
+
+	assert!(missing_etag_result.is_err(), "failed DELETE recreated the missing etag");
 
 	Ok(())
 }
@@ -248,14 +242,29 @@ async fn seeded_backup(
 ) -> Result<String> {
 	let version = services
 		.key_backups
-		.create_backup(user, algorithm)?;
+		.create_backup(user, algorithm)
+		.await?;
+
+	add_key(services, user, &version, room, session, key).await?;
+
+	Ok(version)
+}
+
+async fn add_key(
+	services: &Services,
+	user: &UserId,
+	version: &str,
+	room: &RoomId,
+	session: &str,
+	key: &Raw<KeyBackupData>,
+) -> Result {
+	let keys = once((room, session, key)).stream();
 
 	services
 		.key_backups
-		.add_key(user, &version, room, session, key)
-		.await?;
-
-	Ok(version)
+		.add_keys(user, version, keys)
+		.await
+		.map(drop)
 }
 
 async fn delete(client: &Client<'_>, path: &str, version: &str) -> Result<(StatusCode, Value)> {

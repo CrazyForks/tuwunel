@@ -1,10 +1,14 @@
+use std::iter::once;
+
 use axum::extract::State;
 use ruma::api::client::backup::{
-	add_backup_keys_for_session, delete_backup_keys_for_session, get_backup_keys_for_session,
+	add_backup_keys_for_session::{self, v3::Response as AddResponse},
+	delete_backup_keys_for_session::{self, v3::Response as DeleteResponse},
+	get_backup_keys_for_session::{self, v3::Response as GetResponse},
 };
-use tuwunel_core::{Result, err};
+use tuwunel_core::{Result, err, utils::stream::IterStream};
 
-use super::{check_backup_exists, check_backup_version, get_count_etag};
+use super::format_count_etag;
 use crate::Ruma;
 
 /// # `PUT /_matrix/client/r0/room_keys/keys/{roomId}/{sessionId}`
@@ -19,22 +23,17 @@ pub(crate) async fn add_backup_keys_for_session_route(
 	State(services): State<crate::State>,
 	body: Ruma<add_backup_keys_for_session::v3::Request>,
 ) -> Result<add_backup_keys_for_session::v3::Response> {
-	check_backup_version(&services, body.sender_user(), &body.version).await?;
+	let keys =
+		once((body.room_id.as_ref(), body.session_id.as_str(), &body.session_data)).stream();
 
-	services
+	let metadata = services
 		.key_backups
-		.add_key(
-			body.sender_user(),
-			&body.version,
-			&body.room_id,
-			&body.session_id,
-			&body.session_data,
-		)
+		.add_keys(body.sender_user(), &body.version, keys)
 		.await?;
 
-	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
+	let (count, etag) = format_count_etag(metadata)?;
 
-	Ok(add_backup_keys_for_session::v3::Response { count, etag })
+	Ok(AddResponse { count, etag })
 }
 
 /// # `GET /_matrix/client/r0/room_keys/keys/{roomId}/{sessionId}`
@@ -58,7 +57,7 @@ pub(crate) async fn get_backup_keys_for_session_route(
 			}
 		})?;
 
-	Ok(get_backup_keys_for_session::v3::Response { key_data })
+	Ok(GetResponse { key_data })
 }
 
 /// # `DELETE /_matrix/client/r0/room_keys/keys/{roomId}/{sessionId}`
@@ -68,16 +67,12 @@ pub(crate) async fn delete_backup_keys_for_session_route(
 	State(services): State<crate::State>,
 	body: Ruma<delete_backup_keys_for_session::v3::Request>,
 ) -> Result<delete_backup_keys_for_session::v3::Response> {
-	check_backup_exists(&services, body.sender_user(), &body.version).await?;
+	let metadata = services
+		.key_backups
+		.delete_room_key(body.sender_user(), &body.version, &body.room_id, &body.session_id)
+		.await?;
 
-	services.key_backups.delete_room_key(
-		body.sender_user(),
-		&body.version,
-		&body.room_id,
-		&body.session_id,
-	);
+	let (count, etag) = format_count_etag(metadata)?;
 
-	let (count, etag) = get_count_etag(&services, body.sender_user(), &body.version).await?;
-
-	Ok(delete_backup_keys_for_session::v3::Response { count, etag })
+	Ok(DeleteResponse { count, etag })
 }

@@ -1,5 +1,8 @@
 use axum::extract::State;
-use ruma::api::client::backup::{create_backup_version, get_latest_backup_info};
+use ruma::api::client::backup::{
+	create_backup_version::{self, v3::Response as CreateResponse},
+	get_latest_backup_info::{self, v3::Response as GetLatestResponse},
+};
 use tuwunel_core::{Result, err};
 
 use super::{get_count_etag, validate_algorithm_shape};
@@ -17,9 +20,10 @@ pub(crate) async fn create_backup_version_route(
 
 	let version = services
 		.key_backups
-		.create_backup(body.sender_user(), &body.algorithm)?;
+		.create_backup(body.sender_user(), &body.algorithm)
+		.await?;
 
-	Ok(create_backup_version::v3::Response { version })
+	Ok(CreateResponse { version })
 }
 
 /// # `GET /_matrix/client/r0/room_keys/version`
@@ -40,5 +44,5 @@ pub(crate) async fn get_latest_backup_info_route(
 
 	let (count, etag) = get_count_etag(&services, body.sender_user(), &version).await?;
 
-	Ok(get_latest_backup_info::v3::Response { algorithm, count, etag, version })
+	Ok(GetLatestResponse { algorithm, count, etag, version })
 }

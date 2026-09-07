@@ -4,13 +4,7 @@ mod keys_session;
 mod version;
 mod version_id;
 
-use futures::{FutureExt, future::try_join};
-use http::StatusCode;
-use ruma::{
-	CanonicalJsonValue, UInt, UserId,
-	api::error::{ErrorKind, WrongRoomKeysVersionErrorData},
-	serde::Raw,
-};
+use ruma::{CanonicalJsonValue, UInt, UserId, serde::Raw};
 use serde::Deserialize;
 use tuwunel_core::{Error, Result};
 use tuwunel_service::Services;
@@ -52,58 +46,16 @@ pub(super) async fn get_count_etag(
 	sender_user: &UserId,
 	version: &str,
 ) -> Result<(UInt, String)> {
-	let count = services
+	let metadata = services
 		.key_backups
-		.count_keys(sender_user, version)
-		.map(|count| count.try_into().map_err(Error::from));
-
-	let etag = services
-		.key_backups
-		.get_etag(sender_user, version)
-		.map(|result| result.map(|etag| etag.to_string()));
-
-	try_join(count, etag).await
-}
-
-pub(super) async fn check_backup_exists(
-	services: &Services,
-	sender_user: &UserId,
-	version: &str,
-) -> Result {
-	let algorithm = services
-		.key_backups
-		.get_backup(sender_user, version)
-		.map(|result| result.map(drop));
-
-	let etag = services
-		.key_backups
-		.get_etag(sender_user, version)
-		.map(|result| result.map(drop));
-
-	try_join(algorithm, etag).await.map(drop)
-}
-
-pub(super) async fn check_backup_version(
-	services: &Services,
-	sender_user: &UserId,
-	version: &str,
-) -> Result {
-	let current_version = services
-		.key_backups
-		.get_latest_backup_version(sender_user)
+		.get_count_etag(sender_user, version)
 		.await?;
 
-	if current_version == version {
-		return Ok(());
-	}
+	format_count_etag(metadata)
+}
 
-	let data = WrongRoomKeysVersionErrorData::new(current_version);
-	let kind = ErrorKind::WrongRoomKeysVersion(data);
-	let error = Error::Request(
-		kind,
-		"You may only manipulate the most recently created version of the backup.".into(),
-		StatusCode::BAD_REQUEST,
-	);
+pub(super) fn format_count_etag((count, etag): (usize, u64)) -> Result<(UInt, String)> {
+	let count = count.try_into().map_err(Error::from)?;
 
-	Err(error)
+	Ok((count, etag.to_string()))
 }
