@@ -104,6 +104,7 @@ if test -n "$skip"; then
 fi
 
 run_playwright "$out/results-expected.json" \
+	--output=playwright/test-results/expected \
 	--grep="$run" \
 	--grep-invert="$pass1_invert" \
 	--shard="$shard" \
@@ -121,6 +122,7 @@ fi
 
 if test -n "$knownfail_mine"; then
 	run_playwright "$out/results-knownfail.json" \
+		--output=playwright/test-results/knownfail \
 		"${pass2[@]}" \
 		--retries=0 \
 		2>&1 | tee -a "$out/output.log" \
