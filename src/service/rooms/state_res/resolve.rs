@@ -14,7 +14,7 @@ use std::{
 	vec::IntoIter,
 };
 
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{OwnedEventId, events::StateEventType, room_version_rules::RoomVersionRules};
 use tuwunel_core::{
 	Result, debug,
@@ -24,7 +24,7 @@ use tuwunel_core::{
 	trace,
 	utils::{
 		BoolExt,
-		stream::{BroadbandExt, IterStream},
+		stream::{BroadbandExt, IterStream, ReadyExt},
 	},
 };
 
@@ -128,7 +128,7 @@ where
 	States: Stream<Item = StateMap<OwnedEventId>> + Send,
 	AuthSets: Stream<Item = AuthSet<OwnedEventId>> + Send,
 	FetchExists: Fn(OwnedEventId) -> ExistsFut + Sync,
-	ExistsFut: Future<Output = bool> + Send,
+	ExistsFut: Future<Output = Result<bool>> + Send,
 	FetchEvent: Fn(OwnedEventId) -> EventFut + Sync,
 	EventFut: Future<Output = Result<Pdu>> + Send,
 	Pdu: Event + Clone,
@@ -161,7 +161,7 @@ where
 	//    auth difference. Don't honor events that don't exist.
 	let full_conflicted_set =
 		full_conflicted_set(rules, conflicted_states, auth_sets, fetch, exists, hydra_backports)
-			.await;
+			.await?;
 
 	// 1. Select the set X of all power events that appear in the full conflicted
 	//    set. For each such power event P, enlarge X by adding the events in the
@@ -276,11 +276,11 @@ async fn full_conflicted_set<AuthSets, FetchExists, ExistsFut, FetchEvent, Event
 	fetch: &FetchEvent,
 	exists: &FetchExists,
 	hydra_backports: bool,
-) -> ConflictedSet
+) -> Result<ConflictedSet>
 where
 	AuthSets: Stream<Item = AuthSet<OwnedEventId>> + Send,
 	FetchExists: Fn(OwnedEventId) -> ExistsFut + Sync,
-	ExistsFut: Future<Output = bool> + Send,
+	ExistsFut: Future<Output = Result<bool>> + Send,
 	FetchEvent: Fn(OwnedEventId) -> EventFut + Sync,
 	EventFut: Future<Output = Result<Pdu>> + Send,
 	Pdu: Event,
@@ -315,10 +315,15 @@ where
 
 	auth_difference(auth_sets)
 		.chain(conflicted_state_ids)
-		.broad_filter_map(async |id| exists(id.clone()).await.then_some(id))
+		.broad_then(async |id| {
+			exists(id.clone())
+				.map_ok(|exists| exists.then_some(id))
+				.await
+		})
+		.ready_filter_map(Result::transpose)
 		.chain(conflicted_subgraph)
-		.collect::<ConflictedSet>()
-		.inspect(|set| debug!(count = set.len(), "full conflicted set"))
-		.inspect(|set| trace!(?set, "full conflicted set"))
+		.try_collect::<ConflictedSet>()
+		.inspect_ok(|set| debug!(count = set.len(), "full conflicted set"))
+		.inspect_ok(|set| trace!(?set, "full conflicted set"))
 		.await
 }

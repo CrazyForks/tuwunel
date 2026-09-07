@@ -92,7 +92,7 @@ pub(crate) const ENV_PREFIXES: [&str; 3] = ["CONDUIT_", "CONDUWUIT_", "TUWUNEL_"
 "#,
 	ignore = "catchall well_known tls ldap jwt appservice identity_provider storage_provider \
 	          registration_terms smtp",
-	hidden = "allow_invalid_tls_certificates",
+	hidden = "allow_invalid_tls_certificates resolve_state_locally_shadow",
 	forbidden = "database_restore_backup force_migration"
 )]
 pub struct Config {
@@ -662,6 +662,9 @@ pub struct Config {
 
 	/// reloadable: yes
 	/// default: 1024
+	///
+	/// This limits how many prior events one recovery traversal visits. Raising
+	/// it increases recovery work; it is not a count of network requests.
 	#[serde(default = "default_max_fetch_prev_events")]
 	pub max_fetch_prev_events: u16,
 
@@ -1192,14 +1195,14 @@ pub struct Config {
 	#[serde(default = "default_resolve_state_locally_max")]
 	pub resolve_state_locally_max: usize,
 
-	/// Validation mode for local state derivation: compute the local result,
-	/// then fetch /state_ids anyway, compare the two, and log any divergence
-	/// while the fetched state remains authoritative. Federation load is
-	/// unchanged. For operators soaking resolve_state_locally before trusting
-	/// it. No effect unless resolve_state_locally is enabled.
+	/// Legacy compatibility switch for local state derivation.
+	///
+	/// A configured value of true disables local derivation and its memo
+	/// shortcut. Use `resolve_state_locally = false` in new configurations.
 	///
 	/// reloadable: yes
-	#[serde(default = "true_fn")]
+	/// display: hidden
+	#[serde(default)]
 	pub resolve_state_locally_shadow: bool,
 
 	/// Soft cap on the number of forward extremities tracked per room. When
@@ -1793,7 +1796,8 @@ pub struct Config {
 	/// `now + refresh_token_ttl`. A session in continuous use never expires.
 	/// When `false`, the deadline is fixed at first issuance and rotation
 	/// carries it forward, forcing re-auth after `refresh_token_ttl`
-	/// regardless of activity.
+	/// regardless of activity. This setting applies only to tokens issued with
+	/// a nonzero refresh-token TTL; a zero TTL issues tokens without expiry.
 	///
 	/// reloadable: yes
 	/// default: true
@@ -1813,7 +1817,8 @@ pub struct Config {
 	/// signalled with `soft_logout: false`. The next session is a brand-new
 	/// device, so the client cannot recover E2EE history from local state
 	/// alone; this is the CWE-613 stance and trades usability for that
-	/// guarantee.
+	/// guarantee. Tokens issued with a zero refresh-token TTL do not expire,
+	/// and changing the current TTL does not erase an expiry already stored.
 	///
 	/// reloadable: yes
 	/// default: false
@@ -2229,10 +2234,10 @@ pub struct Config {
 	pub rocksdb_direct_io: bool,
 
 	/// Amount of threads that RocksDB will use for parallelism on database
-	/// operations such as cleanup, sync, flush, compaction, etc. Set to 0 to
-	/// use all your logical threads. Defaults to your CPU logical thread count.
+	/// operations such as cleanup, sync, flush and compaction. The stored value
+	/// 0 selects the available logical thread count, with a minimum of two.
 	///
-	/// default: varies by system
+	/// default: 0
 	#[serde(default = "default_rocksdb_parallelism_threads")]
 	pub rocksdb_parallelism_threads: usize,
 
@@ -2483,6 +2488,8 @@ pub struct Config {
 	/// display: sensitive
 	pub emergency_password: Option<String>,
 
+	/// Suffix stripped from the gateway URL before constructing a push request.
+	///
 	/// reloadable: yes
 	/// default: "/_matrix/push/v1/notify"
 	#[serde(default = "default_notification_push_path")]
@@ -2705,6 +2712,9 @@ pub struct Config {
 	#[serde(default)]
 	pub request_legacy_media: bool,
 
+	/// When true, remote legacy content and thumbnail fetching is permitted.
+	/// When false, those remote legacy requests are rejected.
+	///
 	/// reloadable: yes
 	#[serde(default = "true_fn")]
 	pub freeze_legacy_media: bool,
@@ -2794,7 +2804,8 @@ pub struct Config {
 	/// deadline spans the wait for a free slot, staging the video and the
 	/// program itself, so a queue cannot compound it into a multiple. On
 	/// expiry the program and anything it spawned are killed and the video is
-	/// served without a thumbnail.
+	/// served without a thumbnail. Extraction requires a nonempty
+	/// `media_video_thumbnail_command`.
 	///
 	/// reloadable: yes
 	/// default: 30
@@ -2806,7 +2817,8 @@ pub struct Config {
 	/// for a slot instead of piling load onto the host. A slot is held from
 	/// staging the video through to the program exiting, so this also bounds
 	/// how many staged videos occupy the staging directory at once. Raise it
-	/// where cores are spare; a restart is required to apply a change.
+	/// where cores are spare; a restart is required to apply a change. This
+	/// setting applies only when `media_video_thumbnail_command` is nonempty.
 	///
 	/// default: 1
 	#[serde(default = "default_media_video_thumbnail_concurrency")]
@@ -2817,6 +2829,7 @@ pub struct Config {
 	/// thumbnail rather than written out, and a frame past it is refused
 	/// rather than decoded from a truncation. Accepts an integer byte count or
 	/// a string with SI/IEC suffix such as "128 MiB".
+	/// Extraction requires a nonempty `media_video_thumbnail_command`.
 	///
 	/// reloadable: yes
 	/// default: 128 MiB
@@ -2830,7 +2843,9 @@ pub struct Config {
 	/// file per running program, removed as soon as it exits. Leave unset to
 	/// use a `tmp` subdirectory of the database path, which keeps large videos
 	/// off the memory-backed `/tmp` a service manager commonly provides. Files
-	/// left behind by a killed server are reclaimed at startup.
+	/// left behind by a killed server are reclaimed at startup, including when
+	/// `media_video_thumbnail_command` is empty. Extraction itself requires a
+	/// nonempty command.
 	///
 	/// reloadable: yes
 	/// example: "/var/tmp/tuwunel"
@@ -3549,12 +3564,13 @@ pub struct Config {
 	/// Sets the number of worker threads in the frontend-pool of the database.
 	/// This number should reflect the I/O capabilities of the system,
 	/// such as the queue-depth or the number of simultaneous requests in
-	/// flight. Defaults to 32 times the number of CPU cores.
+	/// flight. The default is four times the available CPU thread count,
+	/// clamped from 32 through 1024.
 	///
 	/// Note: This value is only used if db_pool_affinity is disabled or not
 	/// detected on the system, otherwise it is determined automatically.
 	///
-	/// default: 32
+	/// default: varies by system
 	#[serde(default = "default_db_pool_workers")]
 	pub db_pool_workers: usize,
 
@@ -3775,7 +3791,7 @@ pub struct Config {
 	#[serde(default)]
 	pub appservice_dir: Option<PathBuf>,
 
-	/// Skip database migration on startup. This option is intended for
+	/// Apply pending database migrations on startup. This option is intended for
 	/// developer debugging and testing only. Never set this option to false
 	/// unless you have been instructed to do so. Setting this option to false
 	/// may cause permanent damage and permanent loss of data.
@@ -3785,9 +3801,10 @@ pub struct Config {
 	/// schema changes may be expected by the current codebase but may not be
 	/// available when this option is set to false.
 	///
-	/// Setting this option to false will have no effect if no new migrations
-	/// are to be applied. New migrations are applied once during any execution
-	/// where this option is set to true (which is the default).
+	/// Setting this option to false is accepted only after the required local
+	/// state memo invalidation has run once. Start once with this option true if
+	/// startup reports that prerequisite missing. With the marker present,
+	/// false continues to skip migrations as configured.
 	#[serde(default = "true_fn")]
 	pub database_migrations: bool,
 

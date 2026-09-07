@@ -171,6 +171,8 @@ fn residue_is_preserved_but_dangerous_controls_are_dropped() {
 	let document = concat!(
 		"[global]\n",
 		"server_name = \"residue.example\"\n",
+		"resolve_state_locally = true\n",
+		"resolve_state_locally_shadow = true\n",
 		"unknown_future_option = \"preserved\"\n",
 		"allow_invalid_tls_certificates = true\n",
 		"database_restore_backup = 4\n",
@@ -194,6 +196,11 @@ fn residue_is_preserved_but_dangerous_controls_are_dropped() {
 	assert!(rendered.contains("# UNDOCUMENTED: `allow_invalid_tls_certificates`"));
 	assert!(rendered.contains("# DEPRECATED: `name_attribute`"));
 	assert_eq!(values["unknown_future_option"].as_str(), Some("preserved"));
+	assert_eq!(values["resolve_state_locally"].as_bool(), Some(true));
+	assert_eq!(values["resolve_state_locally_shadow"].as_bool(), Some(true));
+	assert!(rendered.contains(
+		"# UNDOCUMENTED: `resolve_state_locally_shadow` is valid but omitted from the example"
+	));
 	assert_eq!(values["allow_invalid_tls_certificates"].as_bool(), Some(true));
 	assert_eq!(values["ldap"]["name_attribute"].as_str(), Some("cn"));
 	assert!(!values.contains_key("database_restore_backup"));
@@ -227,6 +234,7 @@ fn residue_is_preserved_but_dangerous_controls_are_dropped() {
 			.contains_key("name_attribute")
 	);
 	assert_eq!(stripped_values["allow_invalid_tls_certificates"].as_bool(), Some(true));
+	assert_eq!(stripped_values["resolve_state_locally_shadow"].as_bool(), Some(true),);
 	assert!(stripped_rendered.contains("unknown_future_option = \"preserved\""));
 	assert!(stripped_rendered.contains("name_attribute = \"cn\""));
 }

@@ -413,7 +413,9 @@ async fn resolve_state_at_incoming_event(
 	}
 
 	let config = &self.services.server.config;
-	let enabled = config.resolve_state_locally && config.resolve_state_locally_max > 0;
+	let enabled = config.resolve_state_locally
+		&& config.resolve_state_locally_max > 0
+		&& !config.resolve_state_locally_shadow;
 
 	if enabled {
 		match self
@@ -430,12 +432,6 @@ async fn resolve_state_at_incoming_event(
 		}
 	}
 
-	let mode = if config.resolve_state_locally_shadow {
-		WalkMode::Shadow
-	} else {
-		WalkMode::Active
-	};
-
 	let local = enabled
 		.then_async(|| {
 			self.state_at_incoming_local(
@@ -443,19 +439,16 @@ async fn resolve_state_at_incoming_event(
 				incoming_pdu,
 				room_version,
 				create_event_id,
-				mode,
+				WalkMode::Active,
 			)
-			.boxed()
 		})
 		.await
 		.transpose()?
 		.flatten();
 
-	let shadow = match (mode, local) {
-		| (WalkMode::Active, Some(state)) => return Ok((state, ResolvedVia::Local)),
-		| (WalkMode::Shadow, local) => local,
-		| (WalkMode::Active, None) => None,
-	};
+	if let Some(state) = local {
+		return Ok((state, ResolvedVia::Local));
+	}
 
 	let state = self
 		.fetch_state(
@@ -469,11 +462,6 @@ async fn resolve_state_at_incoming_event(
 		.boxed()
 		.await?
 		.expect("fetch_state always resolves state to some");
-
-	if let Some(local) = shadow {
-		self.compare_shadow(room_id, incoming_pdu.event_id(), &local, &state)
-			.await;
-	}
 
 	Ok((state, ResolvedVia::Fetch))
 }

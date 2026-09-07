@@ -339,8 +339,9 @@ pub(super) enum DebugCommand {
 		dir: String,
 	},
 
-	/// - Run a read-only local state derivation for one stored event and report
-	///   the outcome
+	/// - Run a diagnostic local state derivation for one stored event and report
+	///   the outcome without writing room state, resolved-state memos, or
+	///   production counters
 	StateAtIncoming {
 		/// An event ID (a $ followed by the base64 reference hash)
 		event_id: OwnedEventId,

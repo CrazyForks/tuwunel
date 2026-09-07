@@ -5,7 +5,7 @@ use std::{
 	sync::atomic::{AtomicUsize, Ordering},
 };
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use maplit::hashmap;
 use rand::seq::SliceRandom;
 use ruma::{
@@ -31,7 +31,7 @@ use tuwunel_core::{
 };
 
 use super::{
-	AuthSet, ConflictedSet, StateMap,
+	AuthSet, ConflictMap, ConflictedSet, StateMap,
 	power_sort::{
 		add_event_auth_chain, is_power_event_id, power_level_for_sender, power_sort as sort_power,
 	},
@@ -481,7 +481,7 @@ async fn event_map_none() {
 		state_sets.into_iter().stream(),
 		auth_chains.into_iter().stream(),
 		&async |id| ev_map.get(&id).cloned().ok_or_else(not_found),
-		&async |id| ev_map.contains_key(&id),
+		&async |id| Ok(ev_map.contains_key(&id)),
 		false,
 	)
 	.await
@@ -646,7 +646,7 @@ async fn ban_with_auth_chains2() {
 		state_sets.into_iter().stream(),
 		auth_chains.into_iter().stream(),
 		&async |id| ev_map.get(&id).cloned().ok_or_else(not_found),
-		&async |id| ev_map.contains_key(&id),
+		&async |id| Ok(ev_map.contains_key(&id)),
 		false,
 	)
 	.await
@@ -1004,8 +1004,9 @@ async fn conflicted_subgraph_excludes_visited_side_branch() {
 		super::conflicted_subgraph_dfs(&conflicted, &async |id| {
 			events.get(&id).cloned().ok_or_else(not_found)
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await
+		.expect("conflicted subgraph should resolve");
 
 	subgraph.sort_unstable();
 
@@ -1066,8 +1067,9 @@ async fn conflicted_subgraph_waits_for_inflight_convergence() {
 
 			events.get(&id).cloned().ok_or_else(not_found)
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await
+		.expect("conflicted subgraph should resolve");
 
 	subgraph.sort_unstable();
 
@@ -1097,10 +1099,102 @@ async fn conflicted_subgraph_prunes_self_referential_auth_edge() {
 	let subgraph: Vec<OwnedEventId> = super::conflicted_subgraph_dfs(&conflicted, &async |id| {
 		events.get(&id).cloned().ok_or_else(not_found)
 	})
-	.collect()
-	.await;
+	.try_collect()
+	.await
+	.expect("conflicted subgraph should resolve");
 
 	assert!(subgraph.is_empty(), "a cyclic auth edge lies on no conflicted path");
+}
+
+#[tokio::test]
+async fn conflicted_subgraph_distinguishes_missing_from_failure() {
+	let topic = || to_raw_json_value(&json!({})).unwrap();
+	let s = event_id("S");
+	let t = event_id("T");
+	let missing = event_id("MISSING");
+
+	let events: HashMap<OwnedEventId, PduEvent> = vec![
+		to_pdu_event(
+			"S",
+			alice(),
+			TimelineEventType::RoomTopic,
+			Some(""),
+			topic(),
+			&["MISSING"],
+			&[],
+		),
+		to_init_pdu_event("T", alice(), TimelineEventType::RoomTopic, Some(""), topic()),
+	]
+	.into_iter()
+	.map(|event| (event.event_id().to_owned(), event))
+	.collect();
+
+	let conflicted = vec![&s, &t];
+	let missing_result: Result<Vec<OwnedEventId>> =
+		super::conflicted_subgraph_dfs(&conflicted, &async |id| {
+			events.get(&id).cloned().ok_or_else(not_found)
+		})
+		.try_collect()
+		.await;
+
+	let missing_result = missing_result.expect("missing auth event should prune the path");
+
+	assert!(missing_result.is_empty(), "{missing_result:?}");
+
+	let failure =
+		super::conflicted_subgraph_dfs(&conflicted, &async |id| match events.get(&id) {
+			| Some(event) => Ok(event.clone()),
+			| None if id == missing => Err(err!(Database("injected subgraph fetch failure"))),
+			| None => Err(not_found()),
+		})
+		.try_collect::<Vec<OwnedEventId>>()
+		.await;
+
+	assert!(matches!(failure, Err(Error::Database(..))));
+}
+
+#[tokio::test]
+async fn full_conflicted_set_distinguishes_missing_from_failure() {
+	let a = event_id("A");
+	let b = event_id("B");
+	let conflicted: ConflictMap<OwnedEventId> = [(
+		(StateEventType::RoomTopic, "".into()),
+		[a.clone(), b.clone()].into_iter().collect(),
+	)]
+	.into();
+
+	let auth_sets = Vec::<AuthSet<OwnedEventId>>::new();
+	let fetch = async |_id| -> Result<PduEvent> { Err(not_found()) };
+
+	let filtered = super::full_conflicted_set(
+		&RoomVersionRules::V6,
+		conflicted.clone(),
+		auth_sets.clone().into_iter().stream(),
+		&fetch,
+		&async |id| Ok(id != a),
+		false,
+	)
+	.await
+	.expect("missing conflicted event should be omitted");
+
+	let expected: ConflictedSet = once(b.clone()).collect();
+
+	assert_eq!(filtered, expected);
+
+	let failure = super::full_conflicted_set(
+		&RoomVersionRules::V6,
+		conflicted,
+		auth_sets.into_iter().stream(),
+		&fetch,
+		&async |id| match id {
+			| id if id == b => Err(err!(Database("injected existence failure"))),
+			| _ => Ok(true),
+		},
+		false,
+	)
+	.await;
+
+	assert!(matches!(failure, Err(Error::Database(..))));
 }
 
 // `mainline_sort`: events with no power-levels ancestor in their auth chain

@@ -1,9 +1,16 @@
-use std::{borrow::Borrow, collections::HashMap, sync::Arc};
+use std::{
+	borrow::Borrow,
+	collections::HashMap,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
-	Result, err, implement,
+	Result, err, error, implement,
 	matrix::room_version,
 	trace,
 	utils::stream::{IterStream, ReadyExt, TryWidebandExt, WidebandExt},
@@ -76,7 +83,7 @@ pub async fn resolve_state(
 
 	trace!("Resolving state");
 	let state = self
-		.state_resolution(room_id, room_version, fork_states, auth_chains)
+		.state_resolution(room_id, room_version, fork_states, auth_chains, None)
 		.await?;
 
 	trace!("State resolution done.");
@@ -115,19 +122,48 @@ pub(super) async fn state_resolution<StateSets, AuthSets>(
 	room_version: &RoomVersionId,
 	state_sets: StateSets,
 	auth_chains: AuthSets,
+	complete: Option<&AtomicBool>,
 ) -> Result<StateMap<OwnedEventId>>
 where
 	StateSets: Stream<Item = StateMap<OwnedEventId>> + Send,
 	AuthSets: Stream<Item = AuthSet<OwnedEventId>> + Send,
 {
+	let fetch = async |event_id: OwnedEventId| match self.event_fetch(&event_id).await {
+		| Err(error) if complete.is_some() && error.is_not_found() => {
+			if let Some(complete) = complete {
+				complete.store(false, Ordering::Relaxed);
+			}
+
+			Err(err!(Database("State resolution references missing event {event_id}.")))
+		},
+		| result => result,
+	};
+
+	let exists = async |event_id: OwnedEventId| match self.event_exists(&event_id).await {
+		| Ok(false) if complete.is_some() => {
+			if let Some(complete) = complete {
+				complete.store(false, Ordering::Relaxed);
+			}
+
+			Err(err!(Database("State resolution references missing event {event_id}.")))
+		},
+		| result => result,
+	};
+
 	state_res::resolve(
 		&room_version::rules(room_version)?,
 		state_sets,
 		auth_chains,
-		&async |event_id: OwnedEventId| self.event_fetch(&event_id).await,
-		&async |event_id: OwnedEventId| self.event_exists(&event_id).await,
+		&fetch,
+		&exists,
 		self.services.server.config.hydra_backports,
 	)
-	.map_err(|e| err!(error!("State resolution failed: {e:?}")))
+	.inspect_err(|error| {
+		if let Some(complete) = complete {
+			complete.store(false, Ordering::Relaxed);
+		}
+
+		error!(?error, "State resolution failed.");
+	})
 	.await
 }

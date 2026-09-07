@@ -7,9 +7,12 @@ use tuwunel_core::{
 	matrix::{Event, StateKey},
 };
 
-use super::events::{
-	JoinRule, RoomCreateEvent, RoomJoinRulesEvent, RoomMemberEvent, RoomPowerLevelsEvent,
-	RoomThirdPartyInviteEvent, member::RoomMemberEventResultExt,
+use super::{
+	event_auth::auth_input_error,
+	events::{
+		JoinRule, RoomCreateEvent, RoomJoinRulesEvent, RoomMemberEvent, RoomPowerLevelsEvent,
+		RoomThirdPartyInviteEvent, member::RoomMemberEventResultExt,
+	},
 };
 
 pub(super) trait FetchStateExt<Pdu: Event> {
@@ -36,6 +39,7 @@ where
 	async fn room_create_event(&self) -> Result<RoomCreateEvent<Pdu>> {
 		self(StateEventType::RoomCreate, "".into())
 			.await
+			.map_err(auth_input_error)
 			.map(RoomCreateEvent::new)
 			.map_err(|error| {
 				if error.is_not_found() {
@@ -49,21 +53,25 @@ where
 	async fn user_membership(&self, user_id: &UserId) -> Result<MembershipState> {
 		self(StateEventType::RoomMember, user_id.as_str().into())
 			.await
+			.map_err(auth_input_error)
 			.map(RoomMemberEvent::new)
 			.membership()
+			.map_err(auth_input_error)
 	}
 
 	async fn room_power_levels_event(&self) -> Result<Option<RoomPowerLevelsEvent<Pdu>>> {
 		self(StateEventType::RoomPowerLevels, "".into())
 			.await
+			.map_err(auth_input_error)
 			.map(RoomPowerLevelsEvent::new)
 			.map(Some)
 			.or_else(|error| error.is_not_found().then_some(None).ok_or(error))
 	}
 
 	async fn join_rule(&self) -> Result<JoinRule> {
-		self(StateEventType::RoomJoinRules, "".into())
+		let event = self(StateEventType::RoomJoinRules, "".into())
 			.await
+			.map_err(auth_input_error)
 			.map(RoomJoinRulesEvent::new)
 			.map_err(|error| {
 				if error.is_not_found() {
@@ -71,8 +79,9 @@ where
 				} else {
 					error
 				}
-			})?
-			.join_rule()
+			})?;
+
+		event.join_rule().map_err(auth_input_error)
 	}
 
 	async fn room_third_party_invite_event(
@@ -81,6 +90,7 @@ where
 	) -> Result<Option<RoomThirdPartyInviteEvent<Pdu>>> {
 		self(StateEventType::RoomThirdPartyInvite, token.into())
 			.await
+			.map_err(auth_input_error)
 			.map(RoomThirdPartyInviteEvent::new)
 			.map(Some)
 			.or_else(|error| error.is_not_found().then_some(None).ok_or(error))

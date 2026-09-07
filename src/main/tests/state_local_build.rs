@@ -20,6 +20,7 @@ use std::{
 use futures::{
 	StreamExt, TryStreamExt,
 	future::{BoxFuture, join, ready},
+	pin_mut,
 };
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
@@ -29,7 +30,7 @@ use tuwunel_core::{
 	matrix::{PduEvent, pdu::into_outgoing_federation},
 	pdu::PduBuilder,
 	ruma::{
-		CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, UserId,
+		CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
 		events::{
 			StateEventType,
 			room::{
@@ -53,13 +54,14 @@ use tuwunel_service::{
 #[derive(Clone, Copy)]
 enum Case {
 	Disabled,
+	MaxDisabled,
+	LegacyDisabled,
 	Baseline,
 	MissingStateDiff,
 	MissingEventReverse,
 	MissingStateKeyReverse,
 	MissingNamedPdu,
 	MissingAuthAncestor,
-	MalformedAuthAncestor,
 	CorruptChainCache,
 	DirectMemoFailure,
 	WalkMemoFailure,
@@ -67,30 +69,39 @@ enum Case {
 	SiblingStateMiss,
 	UnpolledChain,
 	InteriorForkSentinel,
+	V12ResolverFailure,
+	CurrentStateAuthFailure,
 }
 
 #[derive(Clone, Copy)]
 enum AncestorFailure {
 	Missing,
-	Malformed,
 	InteriorFork,
+	V12InteriorFork,
 }
 
 #[derive(Clone, Copy)]
 enum PduFailure {
 	Missing,
-	Malformed,
+	MalformedMembership,
 }
 
-const CASES: [Case; 15] = [
+#[derive(Clone, Copy)]
+enum CacheHandling {
+	Clear,
+	Preserve,
+}
+
+const CASES: [Case; 18] = [
 	Case::Disabled,
+	Case::MaxDisabled,
+	Case::LegacyDisabled,
 	Case::Baseline,
 	Case::MissingStateDiff,
 	Case::MissingEventReverse,
 	Case::MissingStateKeyReverse,
 	Case::MissingNamedPdu,
 	Case::MissingAuthAncestor,
-	Case::MalformedAuthAncestor,
 	Case::CorruptChainCache,
 	Case::DirectMemoFailure,
 	Case::WalkMemoFailure,
@@ -98,6 +109,8 @@ const CASES: [Case; 15] = [
 	Case::SiblingStateMiss,
 	Case::UnpolledChain,
 	Case::InteriorForkSentinel,
+	Case::V12ResolverFailure,
+	Case::CurrentStateAuthFailure,
 ];
 
 #[test]
@@ -117,19 +130,30 @@ fn run_case(case: Case) -> Result {
 	let db_path =
 		PathBuf::from(root).join(format!("tuwunel-state-local-build-{name}-{}", process_id()));
 
-	let resolve_state_locally = !matches!(case, Case::Disabled);
+	let args = {
+		let mut args = Args::default_test(&["fresh", "cleanup"]);
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+		args.option.extend([
+			format!("database_path={db_path:?}"),
+			"address=[\"127.0.0.1\"]".to_owned(),
+			format!("port={port}"),
+			"listening=true".to_owned(),
+			"log_enable=false".to_owned(),
+			format!("resolve_state_locally={}", !matches!(case, Case::Disabled)),
+		]);
 
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-		"log_enable=false".to_owned(),
-		format!("resolve_state_locally={resolve_state_locally}"),
-		"resolve_state_locally_shadow=false".to_owned(),
-	]);
+		match case {
+			| Case::MaxDisabled => args
+				.option
+				.push("resolve_state_locally_max=0".to_owned()),
+			| Case::LegacyDisabled => args
+				.option
+				.push("resolve_state_locally_shadow=true".to_owned()),
+			| _ => {},
+		}
+
+		args
+	};
 
 	let runtime = Runtime::new(Some(&args)).map_err(&case_error)?;
 	let server = Server::new(Some(&args), Some(&runtime)).map_err(&case_error)?;
@@ -165,13 +189,14 @@ fn run_case(case: Case) -> Result {
 fn case_name(case: Case) -> &'static str {
 	match case {
 		| Case::Disabled => "disabled",
+		| Case::MaxDisabled => "max-disabled",
+		| Case::LegacyDisabled => "legacy-disabled",
 		| Case::Baseline => "baseline",
 		| Case::MissingStateDiff => "missing-state-diff",
 		| Case::MissingEventReverse => "missing-event-reverse",
 		| Case::MissingStateKeyReverse => "missing-state-key-reverse",
 		| Case::MissingNamedPdu => "missing-named-pdu",
 		| Case::MissingAuthAncestor => "missing-auth-ancestor",
-		| Case::MalformedAuthAncestor => "malformed-auth-ancestor",
 		| Case::CorruptChainCache => "corrupt-chain-cache",
 		| Case::DirectMemoFailure => "direct-memo-failure",
 		| Case::WalkMemoFailure => "walk-memo-failure",
@@ -179,6 +204,8 @@ fn case_name(case: Case) -> &'static str {
 		| Case::SiblingStateMiss => "sibling-state-miss",
 		| Case::UnpolledChain => "unpolled-chain",
 		| Case::InteriorForkSentinel => "interior-fork-sentinel",
+		| Case::V12ResolverFailure => "v12-resolver-failure",
+		| Case::CurrentStateAuthFailure => "current-state-auth-failure",
 	}
 }
 
@@ -228,13 +255,6 @@ fn exercise_case<'a>(
 			user_id,
 			AncestorFailure::Missing,
 		)),
-		| Case::MalformedAuthAncestor => Box::pin(auth_ancestor_failure(
-			services,
-			base,
-			token,
-			user_id,
-			AncestorFailure::Malformed,
-		)),
 		| Case::CorruptChainCache =>
 			Box::pin(corrupt_chain_cache_rebuilds(services, base, token, user_id)),
 		| Case::DirectMemoFailure =>
@@ -253,7 +273,16 @@ fn exercise_case<'a>(
 			user_id,
 			AncestorFailure::InteriorFork,
 		)),
-		| Case::Disabled => Box::pin(async move {
+		| Case::V12ResolverFailure => Box::pin(auth_ancestor_failure(
+			services,
+			base,
+			token,
+			user_id,
+			AncestorFailure::V12InteriorFork,
+		)),
+		| Case::CurrentStateAuthFailure =>
+			Box::pin(current_state_auth_failure(services, base, token, user_id)),
+		| Case::Disabled | Case::MaxDisabled | Case::LegacyDisabled => Box::pin(async move {
 			let room_id = create_room(services, base, token).await?;
 
 			disabled_local_build_ignores_planted_memo(services, user_id, &room_id).await
@@ -276,6 +305,14 @@ async fn enabled_baseline(
 	held_multi_prev_fork_resolves_locally(services, user_id, &fork_room)
 		.await
 		.map_err(|error| step_error("held multi-prev fork", error))?;
+
+	let v12_fork_room = create_room_version(services, base, token, &RoomVersionId::V12)
+		.await
+		.map_err(|error| step_error("v12 conflicted fork", error))?;
+
+	held_conflicted_fork_resolves_locally(services, user_id, &v12_fork_room)
+		.await
+		.map_err(|error| step_error("v12 conflicted fork", error))?;
 
 	let denial_room = create_room(services, base, token)
 		.await
@@ -439,7 +476,7 @@ async fn missing_named_pdu(
 		.timeline
 		.add_pdu_outlier(&top.event_id, &top_json);
 
-	corrupt_timeline_pdu(services, &missing, PduFailure::Missing).await?;
+	corrupt_timeline_pdu(services, &missing, PduFailure::Missing, CacheHandling::Clear).await?;
 	suppress_upgrade(services, fork.event_id.as_ref())?;
 
 	let before_report = services.event_handler.state_local_metrics();
@@ -480,13 +517,15 @@ async fn auth_ancestor_failure(
 	user_id: &UserId,
 	failure: AncestorFailure,
 ) -> Result {
-	let pdu_failure = match failure {
-		| AncestorFailure::Malformed => PduFailure::Malformed,
-		| AncestorFailure::Missing | AncestorFailure::InteriorFork => PduFailure::Missing,
+	let interior =
+		matches!(failure, AncestorFailure::InteriorFork | AncestorFailure::V12InteriorFork);
+
+	let room_id = match failure {
+		| AncestorFailure::V12InteriorFork =>
+			create_room_version(services, base, token, &RoomVersionId::V12).await?,
+		| _ => create_room(services, base, token).await?,
 	};
 
-	let interior = matches!(failure, AncestorFailure::InteriorFork);
-	let room_id = create_room(services, base, token).await?;
 	let ancestor = verified_replaced_membership_ancestor(services, &room_id, user_id).await?;
 	let (left, right, fork, fork_json) = held_state_fork(services, user_id, &room_id).await?;
 	let (top, top_json) = if interior {
@@ -502,8 +541,25 @@ async fn auth_ancestor_failure(
 	} else {
 		(fork.clone(), fork_json)
 	};
+	let cached_auth_chain = match failure {
+		| AncestorFailure::InteriorFork | AncestorFailure::V12InteriorFork =>
+			Some(prime_local_auth_chain(services, top.event_id.as_ref()).await?),
+		| _ => None,
+	};
 
-	corrupt_timeline_pdu(services, &ancestor, pdu_failure).await?;
+	let cache_handling = match cached_auth_chain {
+		| Some(_) => CacheHandling::Preserve,
+		| None => CacheHandling::Clear,
+	};
+	corrupt_timeline_pdu(services, &ancestor, PduFailure::Missing, cache_handling).await?;
+
+	if let Some(key) = cached_auth_chain {
+		services.db["authchainkey_authchain"]
+			.exists(&key)
+			.await
+			.map_err(|error| err!("warmed auth-chain row was not preserved: {error}"))?;
+	}
+
 	suppress_upgrade(services, left.event_id.as_ref())?;
 	suppress_upgrade(services, right.event_id.as_ref())?;
 
@@ -513,8 +569,8 @@ async fn auth_ancestor_failure(
 
 	let context = match failure {
 		| AncestorFailure::Missing => "missing auth ancestor",
-		| AncestorFailure::Malformed => "malformed auth ancestor",
 		| AncestorFailure::InteriorFork => "interior fork sentinel",
+		| AncestorFailure::V12InteriorFork => "v12 resolver failure",
 	};
 
 	assert_unevaluable(services, top.event_id.as_ref(), context).await?;
@@ -615,7 +671,7 @@ async fn unpolled_chain_stays_clear(
 	let ancestor = verified_replaced_membership_ancestor(services, &room_id, user_id).await?;
 	let (left, right, top, top_json) = held_message_fork(services, user_id, &room_id).await?;
 
-	corrupt_timeline_pdu(services, &ancestor, PduFailure::Missing).await?;
+	corrupt_timeline_pdu(services, &ancestor, PduFailure::Missing, CacheHandling::Clear).await?;
 	suppress_upgrade(services, left.event_id.as_ref())?;
 	suppress_upgrade(services, right.event_id.as_ref())?;
 
@@ -728,14 +784,14 @@ async fn degree_one_state_miss(
 	let (incoming, incoming_json) =
 		sign_message(services, user_id, &room_id, "degree one top").await?;
 
+	services
+		.timeline
+		.add_pdu_outlier(&incoming.event_id, &incoming_json);
+
 	let corrupt_state = services
 		.state
 		.pdu_shortstatehash(&boundary)
 		.await?;
-
-	services
-		.timeline
-		.add_pdu_outlier(&incoming.event_id, &incoming_json);
 
 	assert_ne!(intact_state, corrupt_state, "degree one fixture reused the intact state");
 	restore_room_state(services, &room_id, intact_state, &anchor).await;
@@ -985,10 +1041,35 @@ async fn remove_short_row(services: &Services, map_name: &str, short: u64) -> Re
 	Ok(())
 }
 
+async fn prime_local_auth_chain(services: &Services, event_id: &EventId) -> Result<Vec<u8>> {
+	services.clear_cache().await;
+
+	let report = services
+		.event_handler
+		.local_state_report(event_id)
+		.await?;
+
+	assert_eq!(report.fallback, None, "auth-chain priming walk fell back");
+	assert!(report.state_len.is_some(), "auth-chain priming walk produced no state");
+
+	let cache = services.db.get("authchainkey_authchain")?;
+	let keys = cache.raw_keys();
+
+	pin_mut!(keys);
+	let key = keys
+		.next()
+		.await
+		.transpose()?
+		.ok_or_else(|| err!("auth-chain priming walk wrote no cache row"))?;
+
+	Ok(key.to_vec())
+}
+
 async fn corrupt_timeline_pdu(
 	services: &Services,
 	event_id: &EventId,
 	failure: PduFailure,
+	cache_handling: CacheHandling,
 ) -> Result {
 	let pdu_id = services
 		.timeline
@@ -1005,33 +1086,34 @@ async fn corrupt_timeline_pdu(
 		.await
 		.map_err(|error| err!("timeline PDU row unavailable for {event_id}: {error}"))?;
 
-	let failure_name = match failure {
+	match failure {
 		| PduFailure::Missing => {
 			pdus.remove(&pdu_id);
-			"missing"
 		},
-		| PduFailure::Malformed => {
-			pdus.insert(&pdu_id, b"{");
-			"malformed"
-		},
-	};
+		| PduFailure::MalformedMembership => {
+			let stored = pdus.get(&pdu_id).await?;
+			let mut pdu: Value = serde_json::from_slice(stored.as_ref())?;
 
-	services.clear_cache().await;
+			pdu["content"]["membership"] = Value::Bool(true);
+
+			pdus.insert(&pdu_id, serde_json::to_vec(&pdu)?);
+		},
+	}
+
+	match cache_handling {
+		| CacheHandling::Clear => services.clear_cache().await,
+		| CacheHandling::Preserve => {},
+	}
 
 	let result = services.timeline.get_pdu_from_id(&pdu_id).await;
-	let Err(error) = result else {
-		return Err!("{failure_name} timeline PDU {event_id} remained readable");
-	};
 
-	match failure {
-		| PduFailure::Missing => assert!(
-			error.is_not_found(),
-			"missing timeline PDU {event_id} returned an unexpected error: {error}"
-		),
-		| PduFailure::Malformed => assert!(
-			matches!(&error, Error::Json(_)),
-			"malformed timeline PDU {event_id} returned an unexpected error: {error}"
-		),
+	match (failure, result) {
+		| (PduFailure::Missing, Err(error)) if error.is_not_found() => {},
+		| (PduFailure::MalformedMembership, Ok(_)) => {},
+		| (PduFailure::Missing, result) =>
+			return Err!("missing timeline PDU {event_id} returned {result:?}"),
+		| (PduFailure::MalformedMembership, result) =>
+			return Err!("valid malformed-membership PDU {event_id} returned {result:?}"),
 	}
 
 	Ok(())
@@ -1141,8 +1223,6 @@ async fn assert_fetches(
 
 	let after = services.event_handler.state_local_metrics();
 
-	assert_one_settled_walk(before, after, expected, context);
-
 	let Err(error) = result else {
 		return Err!("{context} did not fall through to federation fetch");
 	};
@@ -1153,6 +1233,8 @@ async fn assert_fetches(
 	{
 		return Err!("{context} failed before federation fetch: {error}");
 	}
+
+	assert_one_settled_walk(before, after, expected, context);
 
 	assert!(
 		services
@@ -1538,6 +1620,174 @@ async fn held_multi_prev_fork_resolves_locally(
 			services.timeline.pdu_exists(parent).await,
 			"held parent disappeared from the outlier store"
 		);
+	}
+
+	Ok(())
+}
+
+async fn current_state_auth_failure(
+	services: &Services,
+	base: &str,
+	token: &str,
+	user_id: &UserId,
+) -> Result {
+	let room_id = create_room(services, base, token).await?;
+	let incoming_id =
+		append_message(services, user_id, &room_id, "current-state dependency failure").await?;
+	let incoming = services.timeline.get_pdu(&incoming_id).await?;
+	let incoming_json = services
+		.timeline
+		.get_pdu_json(&incoming_id)
+		.await?;
+
+	verified_replaced_membership_ancestor(services, &room_id, user_id).await?;
+
+	let current_membership = services
+		.state_accessor
+		.room_state_get(&room_id, &StateEventType::RoomMember, user_id.as_str())
+		.await?;
+	corrupt_timeline_pdu(
+		services,
+		current_membership.event_id.as_ref(),
+		PduFailure::MalformedMembership,
+		CacheHandling::Clear,
+	)
+	.await?;
+
+	services.db["eventid_pduid"].remove(incoming.event_id.as_bytes());
+	services
+		.timeline
+		.add_pdu_outlier(&incoming.event_id, &incoming_json);
+	let room_version = services.state.get_room_version(&room_id).await?;
+	let incoming_json = into_outgoing_federation(incoming_json, &room_version);
+
+	let result = services
+		.event_handler
+		.handle_incoming_pdu(
+			services.globals.server_name(),
+			&room_id,
+			incoming.event_id.as_ref(),
+			incoming_json,
+			true,
+		)
+		.await;
+
+	assert!(
+		result.is_err(),
+		"current-state dependency failure returned {result:?}; incoming {}; dependency {}",
+		incoming.event_id,
+		current_membership.event_id,
+	);
+
+	assert!(
+		!services
+			.pdu_metadata
+			.is_event_soft_failed(incoming.event_id.as_ref())
+			.await,
+		"current-state dependency failure persisted a soft-fail marker",
+	);
+
+	assert!(
+		services
+			.timeline
+			.non_outlier_pdu_exists(incoming.event_id.as_ref())
+			.await
+			.is_err_and(|error| error.is_not_found()),
+		"current-state dependency failure reached the timeline",
+	);
+
+	assert!(
+		services
+			.timeline
+			.pdu_exists(incoming.event_id.as_ref())
+			.await,
+		"current-state dependency failure lost the outlier",
+	);
+
+	assert_no_memo(services, incoming.event_id.as_ref()).await
+}
+
+async fn held_conflicted_fork_resolves_locally(
+	services: &Services,
+	user_id: &UserId,
+	room_id: &RoomId,
+) -> Result {
+	let (left, right, top, top_json) = held_state_fork(services, user_id, room_id).await?;
+
+	suppress_upgrade(services, left.event_id.as_ref())?;
+	suppress_upgrade(services, right.event_id.as_ref())?;
+
+	let shortstatehash = services
+		.state
+		.get_room_shortstatehash(room_id)
+		.await?;
+
+	let expected_state_len = services
+		.state_accessor
+		.state_full_ids(shortstatehash)
+		.count()
+		.await;
+
+	let before_report = services.event_handler.state_local_metrics();
+	let report = services
+		.event_handler
+		.local_state_report(top.event_id.as_ref())
+		.await?;
+
+	let after_report = services.event_handler.state_local_metrics();
+
+	assert_eq!(after_report, before_report, "local state diagnostic changed production metrics");
+	assert_eq!(report.forks, 1, "v12 local traversal missed the conflicted fork");
+	assert_eq!(report.memo_hits, 0, "v12 local traversal used a memo");
+	assert_eq!(report.gate_drops, 0, "v12 local traversal dropped an event");
+	assert_eq!(report.fallback, None, "v12 local traversal used federation");
+	assert_eq!(
+		report.state_len,
+		Some(
+			expected_state_len
+				.checked_add(1)
+				.expect("state length fits in usize")
+		),
+		"v12 resolution did not add exactly one conflicted state key",
+	);
+
+	let room_version = services.state.get_room_version(room_id).await?;
+
+	assert_eq!(room_version, RoomVersionId::V12, "test room changed version");
+
+	let top_json = into_outgoing_federation(top_json, &room_version);
+	let before = services.event_handler.state_local_metrics();
+
+	services
+		.event_handler
+		.handle_incoming_pdu(
+			services.globals.server_name(),
+			room_id,
+			top.event_id.as_ref(),
+			top_json,
+			true,
+		)
+		.await?;
+
+	let after = services.event_handler.state_local_metrics();
+
+	assert_one_settled_walk(before, after, ExpectedWalkOutcome::Resolved, "v12 conflicted fork");
+	services
+		.timeline
+		.non_outlier_pdu_exists(top.event_id.as_ref())
+		.await?;
+
+	for parent in [left.event_id.as_ref(), right.event_id.as_ref()] {
+		assert!(
+			services
+				.timeline
+				.non_outlier_pdu_exists(parent)
+				.await
+				.is_err_and(|error| error.is_not_found()),
+			"v12 held parent unexpectedly reached the timeline",
+		);
+
+		assert!(services.timeline.pdu_exists(parent).await, "v12 held parent was lost");
 	}
 
 	Ok(())
@@ -2094,13 +2344,32 @@ async fn wait_until_ready(services: &Services, base: &str) -> Result {
 }
 
 async fn create_room(services: &Services, base: &str, token: &str) -> Result<OwnedRoomId> {
+	create_room_with_body(services, base, token, json!({})).await
+}
+
+async fn create_room_version(
+	services: &Services,
+	base: &str,
+	token: &str,
+	room_version: &RoomVersionId,
+) -> Result<OwnedRoomId> {
+	create_room_with_body(services, base, token, json!({ "room_version": room_version.as_str() }))
+		.await
+}
+
+async fn create_room_with_body(
+	services: &Services,
+	base: &str,
+	token: &str,
+	body: Value,
+) -> Result<OwnedRoomId> {
 	let response = services
 		.client
 		.clients
 		.default
 		.post(format!("{base}/_matrix/client/v3/createRoom"))
 		.bearer_auth(token)
-		.json(&json!({}))
+		.json(&body)
 		.send()
 		.await?
 		.error_for_status()?

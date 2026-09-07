@@ -19,7 +19,7 @@ mod tests;
 #[cfg(test)]
 use super::test_utils;
 use super::{
-	FetchStateExt,
+	FetchStateExt, auth_input_error,
 	events::{
 		JoinRule, RoomCreateEvent, RoomMemberEvent, RoomPowerLevelsIntField,
 		member::ThirdPartyInvite, power_levels::RoomPowerLevelsEventOptionExt,
@@ -56,7 +56,9 @@ where
 	// MSC4361: in a non-federating room, reject members whose state_key
 	// belongs to a remote server. The existing `m.federate` check at the
 	// top of `auth_check` only covers the sender's domain.
-	if !room_create_event.federate()?
+	if !room_create_event
+		.federate()
+		.map_err(auth_input_error)?
 		&& target_user.server_name() != room_create_event.sender().server_name()
 	{
 		return Err!(
@@ -143,8 +145,13 @@ where
 	Fut: Future<Output = Result<Pdu>> + Send,
 	Pdu: Event,
 {
-	let creator = room_create_event.creator(rules)?;
-	let creators = room_create_event.creators(rules)?;
+	let creator = room_create_event
+		.creator(rules)
+		.map_err(auth_input_error)?;
+
+	let creators = room_create_event
+		.creators(rules)
+		.map_err(auth_input_error)?;
 
 	let mut prev_events = room_member_event.prev_events();
 
@@ -224,11 +231,13 @@ where
 
 		let room_power_levels_event = fetch_state.room_power_levels_event().await?;
 
-		let authorized_via_user_power_level =
-			room_power_levels_event.user_power_level(&authorized_via_user, creators, rules)?;
+		let authorized_via_user_power_level = room_power_levels_event
+			.user_power_level(&authorized_via_user, creators, rules)
+			.map_err(auth_input_error)?;
 
 		let invite_power_level = room_power_levels_event
-			.get_as_int_or_default(RoomPowerLevelsIntField::Invite, rules)?;
+			.get_as_int_or_default(RoomPowerLevelsIntField::Invite, rules)
+			.map_err(auth_input_error)?;
 
 		if authorized_via_user_power_level < invite_power_level {
 			return Err!("`join_authorised_via_users_server` does not have enough power");
@@ -295,12 +304,17 @@ where
 
 	let room_power_levels_event = room_power_levels_event?;
 
-	let creators = room_create_event.creators(rules)?;
-	let sender_power_level =
-		room_power_levels_event.user_power_level(room_member_event.sender(), creators, rules)?;
+	let creators = room_create_event
+		.creators(rules)
+		.map_err(auth_input_error)?;
 
-	let invite_power_level =
-		room_power_levels_event.get_as_int_or_default(RoomPowerLevelsIntField::Invite, rules)?;
+	let sender_power_level = room_power_levels_event
+		.user_power_level(room_member_event.sender(), creators, rules)
+		.map_err(auth_input_error)?;
+
+	let invite_power_level = room_power_levels_event
+		.get_as_int_or_default(RoomPowerLevelsIntField::Invite, rules)
+		.map_err(auth_input_error)?;
 
 	// Since v1, if the sender’s power level is greater than or equal to the invite
 	// level, allow. Otherwise, reject.
@@ -360,7 +374,10 @@ where
 	}
 
 	let signatures = third_party_invite.signatures()?;
-	let public_keys = room_third_party_invite_event.public_keys()?;
+	let public_keys = room_third_party_invite_event
+		.public_keys()
+		.map_err(auth_input_error)?;
+
 	let signed_canonical_json = third_party_invite.signed_canonical_json()?;
 
 	// Since v1, if any signature in signed matches any public key in the
@@ -462,18 +479,20 @@ where
 		return Err!("cannot kick if sender is not joined");
 	}
 
-	let creators = room_create_event.creators(rules)?;
+	let creators = room_create_event
+		.creators(rules)
+		.map_err(auth_input_error)?;
+
 	let current_target_user_membership = current_target_user_membership?;
 	let room_power_levels_event = room_power_levels_event?;
 
-	let sender_power_level = room_power_levels_event.user_power_level(
-		room_member_event.sender(),
-		creators.clone(),
-		rules,
-	)?;
+	let sender_power_level = room_power_levels_event
+		.user_power_level(room_member_event.sender(), creators.clone(), rules)
+		.map_err(auth_input_error)?;
 
-	let ban_power_level =
-		room_power_levels_event.get_as_int_or_default(RoomPowerLevelsIntField::Ban, rules)?;
+	let ban_power_level = room_power_levels_event
+		.get_as_int_or_default(RoomPowerLevelsIntField::Ban, rules)
+		.map_err(auth_input_error)?;
 
 	// Since v1, if the target user’s current membership state is ban, and the
 	// sender’s power level is less than the ban level, reject.
@@ -483,11 +502,13 @@ where
 		return Err!("sender does not have enough power to unban");
 	}
 
-	let kick_power_level =
-		room_power_levels_event.get_as_int_or_default(RoomPowerLevelsIntField::Kick, rules)?;
+	let kick_power_level = room_power_levels_event
+		.get_as_int_or_default(RoomPowerLevelsIntField::Kick, rules)
+		.map_err(auth_input_error)?;
 
-	let target_user_power_level =
-		room_power_levels_event.user_power_level(target_user, creators, rules)?;
+	let target_user_power_level = room_power_levels_event
+		.user_power_level(target_user, creators, rules)
+		.map_err(auth_input_error)?;
 
 	// Since v1, if the sender’s power level is greater than or equal to the kick
 	// level, and the target user’s power level is less than the sender’s power
@@ -530,19 +551,21 @@ where
 
 	let room_power_levels_event = room_power_levels_event?;
 
-	let creators = room_create_event.creators(rules)?;
+	let creators = room_create_event
+		.creators(rules)
+		.map_err(auth_input_error)?;
 
-	let sender_power_level = room_power_levels_event.user_power_level(
-		room_member_event.sender(),
-		creators.clone(),
-		rules,
-	)?;
+	let sender_power_level = room_power_levels_event
+		.user_power_level(room_member_event.sender(), creators.clone(), rules)
+		.map_err(auth_input_error)?;
 
-	let ban_power_level =
-		room_power_levels_event.get_as_int_or_default(RoomPowerLevelsIntField::Ban, rules)?;
+	let ban_power_level = room_power_levels_event
+		.get_as_int_or_default(RoomPowerLevelsIntField::Ban, rules)
+		.map_err(auth_input_error)?;
 
-	let target_user_power_level =
-		room_power_levels_event.user_power_level(target_user, creators, rules)?;
+	let target_user_power_level = room_power_levels_event
+		.user_power_level(target_user, creators, rules)
+		.map_err(auth_input_error)?;
 
 	// If the sender’s power level is greater than or equal to the ban level, and
 	// the target user’s power level is less than the sender’s power level, allow.

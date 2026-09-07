@@ -62,6 +62,7 @@ pub fn check(config: &Config) -> Result {
 	warn!("Note: tuwunel was built without optimisations (i.e. debug build)");
 
 	warn_deprecated(config);
+	warn_legacy_state_local(config);
 	warn_unknown_key(config)?;
 
 	#[cfg(all(
@@ -91,6 +92,15 @@ pub fn check(config: &Config) -> Result {
 	check_email(config)?;
 
 	Ok(())
+}
+
+fn warn_legacy_state_local(config: &Config) {
+	if config.resolve_state_locally_shadow {
+		warn!(
+			"resolve_state_locally_shadow is deprecated; use resolve_state_locally=false to \
+			 disable local state derivation."
+		);
+	}
 }
 
 fn check_observability(config: &Config) -> Result {

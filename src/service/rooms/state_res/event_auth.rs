@@ -179,7 +179,7 @@ where
 		.and_then(async |event_id: &EventId| match fetch_event(event_id.to_owned()).await {
 			| Ok(auth_event) => Ok(auth_event),
 			| Err(e) if e.is_not_found() => Err!(Request(NotFound("auth event {event_id}: {e}"))),
-			| Err(e) => Err(e),
+			| Err(e) => Err(auth_input_error(e)),
 		})
 		.ready_try_fold(seen_auth_types, |mut seen_auth_types, auth_event| {
 			let event_id = auth_event.event_id();
@@ -250,11 +250,14 @@ where
 				)))
 			})?;
 
-		let Ok(room_create_event) = fetch_event(room_create_event_id.clone()).await else {
-			return Err!(Request(NotFound(
-				"failed to find `m.room.create` event {room_create_event_id}"
-			)));
-		};
+		let room_create_event = fetch_event(room_create_event_id.clone())
+			.await
+			.map_err(|error| match error {
+				| error if error.is_not_found() => err!(Request(NotFound(
+					"failed to find `m.room.create` event {room_create_event_id}"
+				))),
+				| error => auth_input_error(error),
+			})?;
 
 		if room_create_event.rejected() {
 			return Err!("rejected `m.room.create` event {room_create_event_id}");
@@ -324,7 +327,10 @@ where
 	// and the sender domain of the event does not match the sender domain of the
 	// create event, reject.
 	let room_create_event = room_create_event?;
-	let federate = room_create_event.federate()?;
+	let federate = room_create_event
+		.federate()
+		.map_err(auth_input_error)?;
+
 	if !federate
 		&& room_create_event.sender().server_name() != incoming_event.sender().server_name()
 	{
@@ -375,19 +381,21 @@ where
 
 	let current_room_power_levels_event = current_room_power_levels_event?;
 
-	let creators = room_create_event.creators(&rules.authorization)?;
-	let sender_power_level = current_room_power_levels_event.user_power_level(
-		sender,
-		creators.clone(),
-		&rules.authorization,
-	)?;
+	let creators = room_create_event
+		.creators(&rules.authorization)
+		.map_err(auth_input_error)?;
+
+	let sender_power_level = current_room_power_levels_event
+		.user_power_level(sender, creators.clone(), &rules.authorization)
+		.map_err(auth_input_error)?;
 
 	// Since v1, if type is m.room.third_party_invite:
 	if *incoming_event.event_type() == TimelineEventType::RoomThirdPartyInvite {
 		// Since v1, allow if and only if sender's current power level is greater than
 		// or equal to the invite level.
 		let invite_power_level = current_room_power_levels_event
-			.get_as_int_or_default(RoomPowerLevelsIntField::Invite, &rules.authorization)?;
+			.get_as_int_or_default(RoomPowerLevelsIntField::Invite, &rules.authorization)
+			.map_err(auth_input_error)?;
 
 		if sender_power_level < invite_power_level {
 			return Err!(
@@ -402,11 +410,13 @@ where
 
 	// Since v1, if the event type's required power level is greater than the
 	// sender's power level, reject.
-	let event_type_power_level = current_room_power_levels_event.event_power_level(
-		incoming_event.event_type(),
-		incoming_event.state_key(),
-		&rules.authorization,
-	)?;
+	let event_type_power_level = current_room_power_levels_event
+		.event_power_level(
+			incoming_event.event_type(),
+			incoming_event.state_key(),
+			&rules.authorization,
+		)
+		.map_err(auth_input_error)?;
 
 	if sender_power_level < event_type_power_level {
 		return Err!(
@@ -577,7 +587,10 @@ where
 	// ban, redact, kick, invite check if they were added, changed or removed. For
 	// each found alteration:
 	for field in RoomPowerLevelsIntField::ALL {
-		let current_power_level = current_room_power_levels_event.get_as_int(*field, rules)?;
+		let current_power_level = current_room_power_levels_event
+			.get_as_int(*field, rules)
+			.map_err(auth_input_error)?;
+
 		let new_power_level = power_levels::get_value(&new_int_fields, field).copied();
 
 		if current_power_level == new_power_level {
@@ -604,7 +617,10 @@ where
 	// Since v1, for each entry being added to, or changed in, the events property:
 	// - Since v1, if the new value is higher than the sender's current power level,
 	//   reject.
-	let current_events = current_room_power_levels_event.events(rules)?;
+	let current_events = current_room_power_levels_event
+		.events(rules)
+		.map_err(auth_input_error)?;
+
 	check_power_level_maps(
 		current_events.as_deref(),
 		new_events.as_deref(),
@@ -629,7 +645,10 @@ where
 	// - Since v6, if the new value is higher than the sender's current power level,
 	//   reject.
 	if rules.limit_notifications_power_levels {
-		let current_notifications = current_room_power_levels_event.notifications(rules)?;
+		let current_notifications = current_room_power_levels_event
+			.notifications(rules)
+			.map_err(auth_input_error)?;
+
 		check_power_level_maps(
 			current_notifications.as_deref(),
 			new_notifications.as_deref(),
@@ -653,7 +672,10 @@ where
 	// Since v1, for each entry being added to, or changed in, the users property:
 	// - Since v1, if the new value is greater than the sender’s current power
 	//   level, reject.
-	let current_users = current_room_power_levels_event.users(rules)?;
+	let current_users = current_room_power_levels_event
+		.users(rules)
+		.map_err(auth_input_error)?;
+
 	check_power_level_maps(
 		current_users.as_deref(),
 		new_users.as_deref(),
@@ -745,7 +767,8 @@ where
 {
 	let redact_level = current_room_power_levels_event
 		.cloned()
-		.get_as_int_or_default(RoomPowerLevelsIntField::Redact, rules)?;
+		.get_as_int_or_default(RoomPowerLevelsIntField::Redact, rules)
+		.map_err(auth_input_error)?;
 
 	// v1-v2, if the sender’s power level is greater than or equal to the redact
 	// level, allow.
@@ -768,4 +791,12 @@ where
 
 	// Otherwise, reject.
 	Err!("`m.room.redaction` event did not pass any of the allow rules")
+}
+
+pub(super) fn auth_input_error(error: Error) -> Error {
+	match error {
+		| error @ (Error::Err(..) | Error::Request(InvalidParam, ..)) =>
+			err!(Database("invalid authorization dependency: {error}")),
+		| error => error,
+	}
 }

@@ -200,7 +200,7 @@ where
 
 	trace!("Resolving state");
 	let Ok(new_state) = self
-		.state_resolution(room_id, room_version, fork_states, auth_chain_sets)
+		.state_resolution(room_id, room_version, fork_states, auth_chain_sets, None)
 		.inspect_ok(|_| trace!("State resolution done."))
 		.await
 	else {

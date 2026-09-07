@@ -487,8 +487,10 @@
 #
 #media_rc_create_burst_count = 50
 
-# This item is undocumented. Please contribute documentation for it.
 # reloadable: yes
+#
+# This limits how many prior events one recovery traversal visits. Raising
+# it increases recovery work; it is not a count of network requests.
 #
 #max_fetch_prev_events = 1024
 
@@ -943,16 +945,6 @@
 # reloadable: yes
 #
 #resolve_state_locally_max = 256
-
-# Validation mode for local state derivation: compute the local result,
-# then fetch /state_ids anyway, compare the two, and log any divergence
-# while the fetched state remains authoritative. Federation load is
-# unchanged. For operators soaking resolve_state_locally before trusting
-# it. No effect unless resolve_state_locally is enabled.
-#
-# reloadable: yes
-#
-#resolve_state_locally_shadow = true
 
 # Soft cap on the number of forward extremities tracked per room. When
 # applying an incoming federation event would leave the room's frontier
@@ -1489,7 +1481,8 @@
 # `now + refresh_token_ttl`. A session in continuous use never expires.
 # When `false`, the deadline is fixed at first issuance and rotation
 # carries it forward, forcing re-auth after `refresh_token_ttl`
-# regardless of activity.
+# regardless of activity. This setting applies only to tokens issued with
+# a nonzero refresh-token TTL; a zero TTL issues tokens without expiry.
 #
 # reloadable: yes
 #
@@ -1508,7 +1501,8 @@
 # signalled with `soft_logout: false`. The next session is a brand-new
 # device, so the client cannot recover E2EE history from local state
 # alone; this is the CWE-613 stance and trades usability for that
-# guarantee.
+# guarantee. Tokens issued with a zero refresh-token TTL do not expire,
+# and changing the current TTL does not erase an expiry already stored.
 #
 # reloadable: yes
 #
@@ -1886,10 +1880,10 @@
 #rocksdb_direct_io = true
 
 # Amount of threads that RocksDB will use for parallelism on database
-# operations such as cleanup, sync, flush, compaction, etc. Set to 0 to
-# use all your logical threads. Defaults to your CPU logical thread count.
+# operations such as cleanup, sync, flush and compaction. The stored value
+# 0 selects the available logical thread count, with a minimum of two.
 #
-#rocksdb_parallelism_threads = varies by system
+#rocksdb_parallelism_threads = 0
 
 # Maximum number of LOG files RocksDB will keep. This must *not* be set to
 # 0. It must be at least 1. Defaults to 3 as these are not very useful
@@ -2119,7 +2113,8 @@
 #
 #emergency_password =
 
-# This item is undocumented. Please contribute documentation for it.
+# Suffix stripped from the gateway URL before constructing a push request.
+#
 # reloadable: yes
 #
 #notification_push_path = "/_matrix/push/v1/notify"
@@ -2334,7 +2329,9 @@
 #
 #request_legacy_media = false
 
-# This item is undocumented. Please contribute documentation for it.
+# When true, remote legacy content and thumbnail fetching is permitted.
+# When false, those remote legacy requests are rejected.
+#
 # reloadable: yes
 #
 #freeze_legacy_media = true
@@ -2421,7 +2418,8 @@
 # deadline spans the wait for a free slot, staging the video and the
 # program itself, so a queue cannot compound it into a multiple. On
 # expiry the program and anything it spawned are killed and the video is
-# served without a thumbnail.
+# served without a thumbnail. Extraction requires a nonempty
+# `media_video_thumbnail_command`.
 #
 # reloadable: yes
 #
@@ -2432,7 +2430,8 @@
 # for a slot instead of piling load onto the host. A slot is held from
 # staging the video through to the program exiting, so this also bounds
 # how many staged videos occupy the staging directory at once. Raise it
-# where cores are spare; a restart is required to apply a change.
+# where cores are spare; a restart is required to apply a change. This
+# setting applies only when `media_video_thumbnail_command` is nonempty.
 #
 #media_video_thumbnail_concurrency = 1
 
@@ -2441,6 +2440,7 @@
 # thumbnail rather than written out, and a frame past it is refused
 # rather than decoded from a truncation. Accepts an integer byte count or
 # a string with SI/IEC suffix such as "128 MiB".
+# Extraction requires a nonempty `media_video_thumbnail_command`.
 #
 # reloadable: yes
 #
@@ -2450,7 +2450,9 @@
 # file per running program, removed as soon as it exits. Leave unset to
 # use a `tmp` subdirectory of the database path, which keeps large videos
 # off the memory-backed `/tmp` a service manager commonly provides. Files
-# left behind by a killed server are reclaimed at startup.
+# left behind by a killed server are reclaimed at startup, including when
+# `media_video_thumbnail_command` is empty. Extraction itself requires a
+# nonempty command.
 #
 # reloadable: yes
 # example: "/var/tmp/tuwunel"
@@ -3099,12 +3101,13 @@
 # Sets the number of worker threads in the frontend-pool of the database.
 # This number should reflect the I/O capabilities of the system,
 # such as the queue-depth or the number of simultaneous requests in
-# flight. Defaults to 32 times the number of CPU cores.
+# flight. The default is four times the available CPU thread count,
+# clamped from 32 through 1024.
 #
 # Note: This value is only used if db_pool_affinity is disabled or not
 # detected on the system, otherwise it is determined automatically.
 #
-#db_pool_workers = 32
+#db_pool_workers = varies by system
 
 # When db_pool_affinity is enabled and detected, the size of any worker
 # group will not exceed the determined value. This is necessary when
@@ -3293,7 +3296,7 @@
 #
 #appservice_dir = ""
 
-# Skip database migration on startup. This option is intended for
+# Apply pending database migrations on startup. This option is intended for
 # developer debugging and testing only. Never set this option to false
 # unless you have been instructed to do so. Setting this option to false
 # may cause permanent damage and permanent loss of data.
@@ -3303,9 +3306,10 @@
 # schema changes may be expected by the current codebase but may not be
 # available when this option is set to false.
 #
-# Setting this option to false will have no effect if no new migrations
-# are to be applied. New migrations are applied once during any execution
-# where this option is set to true (which is the default).
+# Setting this option to false is accepted only after the required local
+# state memo invalidation has run once. Start once with this option true if
+# startup reports that prerequisite missing. With the marker present,
+# false continues to skip migrations as configured.
 #
 #database_migrations = true
 

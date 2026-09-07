@@ -22,6 +22,7 @@ use tuwunel_database::Deserialized;
 use self::{
 	account_status::migrate_account_status,
 	clear_servername_status::clear_servername_status,
+	clear_state_local_error_memos::clear_state_local_error_memos,
 	email_bindings::migrate_email_bindings,
 	fix_bad_double_separator_in_state_cache::fix_bad_double_separator_in_state_cache,
 	fix_hashed_sentinel_passwords::fix_hashed_sentinel_passwords,
@@ -41,6 +42,7 @@ use crate::Services;
 
 mod account_status;
 mod clear_servername_status;
+mod clear_state_local_error_memos;
 mod conduit;
 mod email_bindings;
 mod fix_bad_double_separator_in_state_cache;
@@ -73,6 +75,8 @@ const SERVER_NAME_KEY: &[u8] = b"server_name";
 
 const FORCE_MIGRATION_DELAY: Duration = Duration::from_secs(15);
 
+const CLEAR_STATE_LOCAL_ERROR_MEMOS: &str = "clear_state_local_error_memos";
+
 /// A marker written by a sibling conduwuit-lineage server but never by tuwunel.
 /// Its presence identifies a foreign database at a higher schema number even
 /// after tuwunel has stamped its own `server_name`, so a database opened by
@@ -96,6 +100,14 @@ pub(crate) async fn migrations(services: &Services) -> Result {
 	}
 
 	if !services.config.database_migrations {
+		if !marker_present(services, CLEAR_STATE_LOCAL_ERROR_MEMOS).await? {
+			return Err!(Config(
+				"database_migrations",
+				"Local state memo invalidation is pending. Enable database_migrations for one \
+				 startup, then this setting may be disabled again."
+			));
+		}
+
 		warn!("Skipping database migrations due to configuration...");
 		return Ok(());
 	}
@@ -240,6 +252,7 @@ async fn fresh(services: &Services) -> Result {
 	db["global"].insert("migrate_profile_keys_to_useridprofilekey", []);
 	db["global"].insert("rebuild_thread_activity", []);
 	db["global"].insert("clear_servername_status", []);
+	db["global"].insert(CLEAR_STATE_LOCAL_ERROR_MEMOS, []);
 	db["global"].insert("adopt_foreign_account_status", []);
 	db["global"].insert("adopt_foreign_email_bindings", []);
 	mark_clean_injectivity(services);
@@ -351,6 +364,10 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 
 	if pending(services, "clear_servername_status").await? {
 		clear_servername_status(services).await?;
+	}
+
+	if pending(services, CLEAR_STATE_LOCAL_ERROR_MEMOS).await? {
+		clear_state_local_error_memos(services).await?;
 	}
 
 	services.server.check_running()?;

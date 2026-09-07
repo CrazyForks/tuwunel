@@ -13,7 +13,10 @@ use tracing_subscriber::fmt::{MakeWriter, fmt};
 
 use super::*;
 use crate::{
-	config::proxy::{ProxySnapshot, parse_environment_proxy_url},
+	config::{
+		check::reload,
+		proxy::{ProxySnapshot, parse_environment_proxy_url},
+	},
 	utils::{
 		BoolExt,
 		hash::{password, verify_password},
@@ -89,6 +92,76 @@ fn ip_source_absent_parses_as_none() {
 	let config = config_from_toml("[global]\n").unwrap();
 
 	assert_eq!(config.ip_source, None);
+}
+
+#[test]
+fn legacy_state_local_switch_is_recognized_and_warned() {
+	let default = config_from_toml("[global]\n").unwrap();
+	let disabled = config_from_toml(
+		"[global]
+resolve_state_locally = true
+resolve_state_locally_shadow = true
+",
+	)
+	.unwrap();
+
+	assert!(!default.resolve_state_locally_shadow);
+	assert!(disabled.resolve_state_locally_shadow);
+
+	let (result, logs) = check_with_captured_logs(&disabled);
+
+	result.expect("legacy state-local switch should pass config check");
+	assert!(logs.contains("use resolve_state_locally=false"));
+}
+
+#[test]
+fn unrelated_unknown_key_remains_strictly_rejected() {
+	let config = config_from_toml(
+		"[global]
+error_on_unknown_config_opts = true
+resolve_state_locally_shadow = false
+unrelated_unknown_key = true
+",
+	)
+	.unwrap();
+
+	let (result, _) = check_with_captured_logs(&config);
+
+	assert!(result.is_err(), "strict checking accepted an unrelated unknown key");
+}
+
+#[test]
+fn legacy_state_local_switch_is_reloadable() {
+	let enabled = config_from_toml(
+		"[global]\nresolve_state_locally = true\nresolve_state_locally_shadow = false\n",
+	)
+	.unwrap();
+
+	let disabled = config_from_toml(
+		"[global]\nresolve_state_locally = true\nresolve_state_locally_shadow = true\n",
+	)
+	.unwrap();
+
+	reload(&enabled, &disabled).expect("legacy state-local switch should reload");
+}
+
+#[test]
+fn malformed_legacy_state_local_switch_is_rejected() {
+	let result = config_from_toml(
+		r#"[global]
+		resolve_state_locally_shadow = "false"
+"#,
+	);
+
+	let Err(error) = result else {
+		panic!("a string parsed as the legacy boolean switch");
+	};
+
+	assert!(
+		error
+			.to_string()
+			.contains("resolve_state_locally_shadow")
+	);
 }
 
 #[test]
@@ -287,7 +360,7 @@ ip_source = "rightmost_x_forwarded_for"
 	)
 	.unwrap();
 
-	let err = check::reload(&none, &some).unwrap_err();
+	let err = reload(&none, &some).unwrap_err();
 	assert!(
 		err.to_string().contains("'ip_source'")
 			&& err
@@ -296,7 +369,7 @@ ip_source = "rightmost_x_forwarded_for"
 		"{err}"
 	);
 
-	let err = check::reload(&some, &none).unwrap_err();
+	let err = reload(&some, &none).unwrap_err();
 	assert!(
 		err.to_string().contains("'ip_source'")
 			&& err
@@ -305,7 +378,7 @@ ip_source = "rightmost_x_forwarded_for"
 		"{err}"
 	);
 
-	let err = check::reload(&some, &other_some).unwrap_err();
+	let err = reload(&some, &other_some).unwrap_err();
 	assert!(
 		err.to_string().contains("'ip_source'")
 			&& err
@@ -350,8 +423,8 @@ ip_source = "rightmost_x_forwarded_for"
 	)
 	.unwrap();
 
-	check::reload(&none, &none).expect("unchanged none config should reload");
-	check::reload(&some, &some).expect("unchanged some config should reload");
+	reload(&none, &none).expect("unchanged none config should reload");
+	reload(&some, &some).expect("unchanged some config should reload");
 }
 
 fn check_support_pgp_key(value: &str) -> Result {

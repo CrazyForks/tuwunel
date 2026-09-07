@@ -359,7 +359,7 @@ async fn test_contrived_states(pdus_paths: &[&str], state_sets_paths: &[&str]) -
 		})
 		.collect();
 
-	let exists = async |x| pdus_by_id.contains_key(&x);
+	let exists = async |x| Ok(pdus_by_id.contains_key(&x));
 	let fetch = async |x| {
 		pdus_by_id
 			.get(&x)
@@ -458,7 +458,7 @@ where
 			.ok_or_else(|| err!(Request(NotFound("event not found"))))
 	};
 
-	let exists = async |x| pdus_by_id.contains_key(&x);
+	let exists = async |x| Ok(pdus_by_id.contains_key(&x));
 
 	resolve(
 		rules,
@@ -525,7 +525,7 @@ where
 		.map(|pdu| (pdu.event_id().to_owned(), pdu.to_owned()))
 		.collect();
 
-	let exists = async |x| pdus_by_id.contains_key(&x);
+	let exists = async |x| Ok(pdus_by_id.contains_key(&x));
 	let fetch = async |x| {
 		pdus_by_id
 			.get(&x)

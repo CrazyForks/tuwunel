@@ -25,9 +25,9 @@ use tuwunel_core::{
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, IterStream, MutexMap, MutexMapGuard, ReadyExt, calculate_hash,
+		BoolExt, IterStream, MutexMap, MutexMapGuard, ReadyExt, TryReadyExt, calculate_hash,
 		mutex_map::Guard,
-		stream::{BroadbandExt, TryIgnore, WidebandExt},
+		stream::{TryBroadbandExt, TryIgnore, WidebandExt},
 	},
 	warn,
 };
@@ -449,50 +449,64 @@ where
 	StateEventType: Send + Sync,
 	StateKey: Send + Sync,
 {
-	let Ok(shortstatehash) = self.get_room_shortstatehash(room_id).await else {
-		return Ok(StateMap::new());
+	let shortstatehash = match self.get_room_shortstatehash(room_id).await {
+		| Ok(shortstatehash) => shortstatehash,
+		| Err(error) if error.is_not_found() => return Ok(StateMap::new()),
+		| Err(error) => return Err(error),
 	};
 
 	let sauthevents: HashMap<ShortStateKey, TypeStateKey> =
 		auth_types_for_event(kind, sender, state_key, content, auth_rules, include_create)?
 			.into_iter()
-			.stream()
-			.broad_filter_map(async |(event_type, state_key): TypeStateKey| {
-				self.services
+			.try_stream()
+			.broad_and_then(async |(event_type, state_key): TypeStateKey| {
+				match self
+					.services
 					.short
 					.get_shortstatekey(&event_type, &state_key)
 					.await
-					.map(move |sstatekey| (sstatekey, (event_type, state_key)))
-					.ok()
+				{
+					| Ok(sstatekey) => Ok(Some((sstatekey, (event_type, state_key)))),
+					| Err(error) if error.is_not_found() => Ok(None),
+					| Err(error) => Err(error),
+				}
 			})
-			.collect()
-			.await;
+			.ready_try_filter_map(Result::Ok)
+			.try_collect()
+			.await?;
 
-	let (state_keys, event_ids): (Vec<_>, Vec<_>) = self
+	let matching_state: Vec<_> = self
 		.services
 		.state_accessor
 		.state_full_shortids(shortstatehash)
-		.ready_filter_map(Result::ok)
-		.ready_filter_map(|(shortstatekey, shorteventid)| {
-			sauthevents
+		.ready_try_filter_map(|(shortstatekey, shorteventid)| {
+			Ok(sauthevents
 				.get(&shortstatekey)
-				.map(move |(ty, sk)| ((ty, sk), shorteventid))
+				.map(move |(ty, sk)| ((ty, sk), shorteventid)))
 		})
-		.unzip()
-		.await;
+		.try_collect()
+		.await?;
+	let (state_keys, event_ids): (Vec<_>, Vec<_>) = matching_state.into_iter().unzip();
 
 	self.services
 		.short
 		.multi_get_eventid_from_short(event_ids.into_iter().stream())
 		.zip(state_keys.into_iter().stream())
-		.ready_filter_map(|(event_id, (ty, sk))| Some(((ty, sk), event_id.ok()?)))
-		.broad_filter_map(async |((ty, sk), event_id): ((&_, &_), OwnedEventId)| {
-			let pdu = self.services.timeline.get_pdu(&event_id).await;
-
-			Some(((ty.clone(), sk.clone()), pdu.ok()?))
+		.map(|(event_id, (ty, sk))| match event_id {
+			| Ok(event_id) => Ok(Some(((ty, sk), event_id))),
+			| Err(error) if error.is_not_found() => Ok(None),
+			| Err(error) => Err(error),
 		})
-		.collect()
-		.map(Ok)
+		.ready_try_filter_map(Result::Ok)
+		.broad_and_then(async |((ty, sk), event_id): ((&_, &_), OwnedEventId)| {
+			match self.services.timeline.get_pdu(&event_id).await {
+				| Ok(pdu) => Ok(Some(((ty.clone(), sk.clone()), pdu))),
+				| Err(error) if error.is_not_found() => Ok(None),
+				| Err(error) => Err(error),
+			}
+		})
+		.ready_try_filter_map(Result::Ok)
+		.try_collect()
 		.await
 }
 

@@ -187,7 +187,7 @@ async fn merge_prev_states(
 		state_sets.into_iter().stream(),
 		auth_chain_sets.into_iter().stream(),
 		&async |id| event_map.get(&id).cloned().ok_or_else(not_found),
-		&async |id| event_map.contains_key(&id),
+		&async |id| Ok(event_map.contains_key(&id)),
 		false,
 	)
 	.await

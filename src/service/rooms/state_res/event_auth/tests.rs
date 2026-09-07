@@ -26,7 +26,7 @@ use tuwunel_core::{
 
 use self::room_power_levels::default_room_power_levels;
 use super::{
-	AuthCheckOutcome, auth_check, check_room_create, check_room_redaction,
+	AuthCheckOutcome, auth_check, auth_input_error, check_room_create, check_room_redaction,
 	check_state_dependent_auth_rules, check_state_independent_auth_rules, classify_auth_error,
 	events::{RoomCreateEvent, RoomPowerLevelsEvent},
 	test_utils::{
@@ -184,6 +184,74 @@ async fn auth_outcome_propagates_fetch_failures() {
 		auth_check(&RoomVersionRules::V6, &incoming_event, &missing_event, &fetch_state).await;
 
 	assert!(matches!(outcome, Err(error) if error.is_not_found()));
+}
+
+#[tokio::test]
+async fn auth_outcome_rejects_malformed_dependencies_as_database_errors() {
+	let _guard = init_subscriber();
+
+	assert!(matches!(auth_input_error(err!("malformed input")), Error::Database(..)));
+	assert!(matches!(
+		auth_input_error(err!(Request(InvalidParam("malformed input")))),
+		Error::Database(..)
+	));
+
+	let incoming_event = allowed_message();
+	let init_events = INITIAL_EVENTS();
+	let fetch_event = async |event_id| {
+		init_events
+			.get(&event_id)
+			.cloned()
+			.ok_or_else(not_found)
+	};
+
+	let malformed_membership = init_events
+		.clone()
+		.into_iter()
+		.chain([(
+			event_id("IMA"),
+			to_pdu_event(
+				"IMA",
+				alice(),
+				TimelineEventType::RoomMember,
+				Some(alice().as_str()),
+				to_raw_json_value(&json!({ "membership": 7 })).unwrap(),
+				&["CREATE"],
+				&["CREATE"],
+			),
+		)])
+		.collect();
+
+	let state = TestStateMap::new(&malformed_membership);
+	let outcome =
+		auth_check(&RoomVersionRules::V6, &incoming_event, &fetch_event, &state.fetch_state_fn())
+			.await;
+
+	assert!(matches!(outcome, Err(Error::Database(..))));
+
+	let malformed_power_levels = init_events
+		.clone()
+		.into_iter()
+		.chain([(
+			event_id("IPOWER"),
+			to_pdu_event(
+				"IPOWER",
+				alice(),
+				TimelineEventType::RoomPowerLevels,
+				Some(""),
+				to_raw_json_value(&json!({ "users": [] })).unwrap(),
+				&["CREATE", "IMA"],
+				&["IMA"],
+			),
+		)])
+		.collect();
+
+	let state = TestStateMap::new(&malformed_power_levels);
+	let outcome =
+		auth_check(&RoomVersionRules::V6, &incoming_event, &fetch_event, &state.fetch_state_fn())
+			.await;
+
+	assert!(matches!(outcome, Err(Error::Database(..))));
 }
 
 fn allowed_message() -> PduEvent {

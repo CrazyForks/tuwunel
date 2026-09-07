@@ -88,7 +88,7 @@ fn resolution_shallow_auth_chain(c: &mut Criterion) {
 						.cloned()
 						.ok_or(err!(Request(NotFound("Not Found"))))
 				},
-				&async |id| ev_map.contains_key(&id),
+				&async |id| Ok(ev_map.contains_key(&id)),
 				false,
 			)
 			.await
@@ -180,7 +180,7 @@ fn resolve_deeper_event_set(c: &mut Criterion) {
 						.cloned()
 						.ok_or(err!(Request(NotFound("Not Found"))))
 				},
-				&async |id| inner.contains_key(&id),
+				&async |id| Ok(inner.contains_key(&id)),
 				false,
 			)
 			.await

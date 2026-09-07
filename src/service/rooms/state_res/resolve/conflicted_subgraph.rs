@@ -5,8 +5,8 @@ use std::{
 };
 
 use futures::{
-	Stream, StreamExt,
-	stream::{FuturesUnordered, unfold},
+	Stream, StreamExt, TryStreamExt,
+	stream::{FuturesUnordered, try_unfold},
 };
 use ruma::{EventId, OwnedEventId};
 use tuwunel_core::{
@@ -103,7 +103,7 @@ const CAPACITY_MULTIPLIER: usize = 4;
 pub(super) fn conflicted_subgraph_dfs<Fetch, Fut, Pdu>(
 	conflicted_set: &Vec<&OwnedEventId>,
 	fetch: &Fetch,
-) -> impl Stream<Item = OwnedEventId> + Send
+) -> impl Stream<Item = Result<OwnedEventId>> + Send
 where
 	Fetch: Fn(OwnedEventId) -> Fut + Sync,
 	Fut: Future<Output = Result<Pdu>> + Send,
@@ -131,7 +131,10 @@ where
 		parked: 0,
 	};
 
-	unfold((seeds(), state), async |(mut inputs, mut state)| {
+	// try_unfold requires FnMut returning a nameable future; an async closure
+	// capturing fetch does not satisfy it.
+	#[expect(closure_returning_async_block)]
+	try_unfold((seeds(), state), move |(mut inputs, mut state)| async move {
 		let width = automatic_width();
 
 		debug_assert!(
@@ -160,7 +163,10 @@ where
 			debug_assert!(state.ready.is_empty(), "Undrained conflicted-subgraph wakes");
 			debug_assert!(state.deferred.is_empty(), "Deferred conflicted-subgraph fetches");
 			debug_assert_eq!(state.parked, 0, "Parked conflicted-subgraph walkers");
-			return None;
+
+			let output: Result<_> = Ok(None);
+
+			return output;
 		};
 
 		while state.todo.len() < width
@@ -173,7 +179,7 @@ where
 
 		let mut outputs = Path::new();
 
-		if let Some(next_id) = process_fetch(&mut state, id, event_id, event, &mut outputs) {
+		if let Some(next_id) = process_fetch(&mut state, id, event_id, event, &mut outputs)? {
 			if state.todo.len() < width {
 				state.todo.push(fetch_auth(id, next_id, fetch));
 			} else {
@@ -193,9 +199,12 @@ where
 			}
 		}
 
-		Some((outputs.into_iter().stream(), (inputs, state)))
+		let output: Result<_> = Ok(Some((outputs, (inputs, state))));
+
+		output
 	})
-	.flatten()
+	.map_ok(|outputs| outputs.into_iter().map(Ok).stream())
+	.try_flatten()
 }
 
 fn fetch_auth<Fetch, Fut, Pdu>(
@@ -218,7 +227,7 @@ fn process_fetch<Fut, Pdu>(
 	event_id: OwnedEventId,
 	event: Result<Pdu>,
 	outputs: &mut Path,
-) -> Option<OwnedEventId>
+) -> Result<Option<OwnedEventId>>
 where
 	Fut: Future + Send,
 	Pdu: Event,
@@ -232,7 +241,7 @@ where
 				.stack
 				.push(event.auth_events_into().into_iter().collect());
 		},
-		| Err(_) => {
+		| Err(error) if error.is_not_found() => {
 			let Global { subgraph, waiters, ready, parked, .. } = state;
 			let mut context = Context {
 				subgraph,
@@ -244,9 +253,10 @@ where
 
 			complete_pending(&mut context, event_id, Resolution::Dead);
 		},
+		| Err(error) => return Err(error),
 	}
 
-	advance(state, id, outputs)
+	Ok(advance(state, id, outputs))
 }
 
 fn resume<Fut: Future + Send>(

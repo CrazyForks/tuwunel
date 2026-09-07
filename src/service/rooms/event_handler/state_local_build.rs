@@ -16,18 +16,14 @@ use ruma::{
 };
 use tracing::{Instrument, Span};
 use tuwunel_core::{
-	Result,
-	arrayvec::ArrayVec,
-	debug, debug_warn, defer, err, implement,
+	Result, debug, debug_warn, defer, err, implement,
 	matrix::{
 		Event, PduEvent, StateKey,
 		pdu::PrevEvents,
 		room_version::{self, from_create_event},
 	},
-	smallvec::SmallVec,
 	trace,
 	utils::stream::{BroadbandExt, IterStream, ReadyExt, WidebandExt},
-	warn,
 };
 
 use crate::rooms::{
@@ -41,12 +37,6 @@ mod tests;
 
 /// State before or after one event, in the shape the sibling builders return.
 type StateIds = HashMap<ShortStateKey, OwnedEventId>;
-
-const DIVERGENCE_SAMPLE: usize = 8;
-const DIVERGENCE_INLINE: usize = 1;
-
-type DivergenceKeys = ArrayVec<ShortStateKey, DIVERGENCE_SAMPLE>;
-type DivergenceSample = SmallVec<[DivergenceKey; DIVERGENCE_INLINE]>;
 
 /// Summary of one local build attempt, for the admin debug command.
 #[derive(Debug)]
@@ -91,12 +81,6 @@ pub struct StateLocalMetrics {
 	pub walk_failures: u64,
 	/// State-event folds denied by the positional auth gate.
 	pub gate_denials: u64,
-	/// Shadow results compared with fetched state.
-	pub shadow_compares: u64,
-	/// Shadow comparisons with equal state.
-	pub shadow_agreements: u64,
-	/// Shadow comparisons with differing state.
-	pub shadow_divergences: u64,
 }
 
 #[derive(Default)]
@@ -114,9 +98,6 @@ pub(super) struct StateLocalCounters {
 	fallback_error: AtomicU64,
 	walk_failures: AtomicU64,
 	gate_denials: AtomicU64,
-	shadow_compares: AtomicU64,
-	shadow_agreements: AtomicU64,
-	shadow_divergences: AtomicU64,
 }
 
 struct WalkAttempt {
@@ -170,19 +151,6 @@ fn add_gate_denials(&self, gate_denials: usize) {
 }
 
 #[implement(StateLocalCounters)]
-fn settle_shadow(&self, outcome: ShadowOutcome) {
-	self.shadow_compares
-		.fetch_add(1, Ordering::Relaxed);
-
-	let counter = match outcome {
-		| ShadowOutcome::Agreement => &self.shadow_agreements,
-		| ShadowOutcome::Divergence => &self.shadow_divergences,
-	};
-
-	counter.fetch_add(1, Ordering::Relaxed);
-}
-
-#[implement(StateLocalCounters)]
 fn snapshot(&self) -> StateLocalMetrics {
 	StateLocalMetrics {
 		walk_attempts: self.walk_attempts.load(Ordering::Relaxed),
@@ -202,9 +170,6 @@ fn snapshot(&self) -> StateLocalMetrics {
 		fallback_error: self.fallback_error.load(Ordering::Relaxed),
 		walk_failures: self.walk_failures.load(Ordering::Relaxed),
 		gate_denials: self.gate_denials.load(Ordering::Relaxed),
-		shadow_compares: self.shadow_compares.load(Ordering::Relaxed),
-		shadow_agreements: self.shadow_agreements.load(Ordering::Relaxed),
-		shadow_divergences: self.shadow_divergences.load(Ordering::Relaxed),
 	}
 }
 
@@ -299,24 +264,6 @@ enum WalkOutcome {
 	Resolved,
 	Fallback(Fallback),
 	Failure,
-}
-
-#[derive(Clone, Copy)]
-enum ShadowOutcome {
-	Agreement,
-	Divergence,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum DivergenceKey {
-	Resolved(StateEventType, StateKey),
-	UnresolvedShortStateKey(ShortStateKey),
-}
-
-#[derive(Default)]
-struct DivergenceSide {
-	count: usize,
-	sample: DivergenceKeys,
 }
 
 /// Ceiling on simultaneously live state-map entries across one walk: the sum
@@ -454,8 +401,10 @@ async fn walk_task(
 #[must_use]
 pub fn state_local_metrics(&self) -> StateLocalMetrics { self.state_local.snapshot() }
 
-/// Run a read-only (shadow-mode) walk for one stored event and describe the
-/// outcome, for the admin debug command.
+/// Run a diagnostic walk for one stored event and describe the outcome.
+///
+/// The walk does not write authoritative state, resolved-state memos, or
+/// production counters. It may allocate short IDs and warm auth-chain caches.
 #[implement(super::Service)]
 pub async fn local_state_report(&self, event_id: &EventId) -> Result<LocalBuildReport> {
 	let pdu = self.services.timeline.get_pdu(event_id).await?;
@@ -497,93 +446,6 @@ pub async fn local_state_report(&self, event_id: &EventId) -> Result<LocalBuildR
 			.fallback
 			.map(|fallback| fallback.name().to_owned()),
 	})
-}
-
-/// Diff a shadow-mode local build against the authoritative fetched state.
-///
-/// Divergence is neutral on which side is wrong; the soak analysis decides.
-#[implement(super::Service)]
-#[tracing::instrument(name = "shadow_compare", level = "debug", skip_all)]
-pub(super) async fn compare_shadow(
-	&self,
-	room_id: &RoomId,
-	event_id: &EventId,
-	local: &StateIds,
-	fetched: &StateIds,
-) {
-	let only_local = divergent(local, fetched);
-	let only_fetch = divergent(fetched, local);
-	let agreement = only_local.count == 0 && only_fetch.count == 0;
-
-	let outcome = if agreement {
-		ShadowOutcome::Agreement
-	} else {
-		ShadowOutcome::Divergence
-	};
-
-	self.state_local.settle_shadow(outcome);
-
-	if agreement {
-		debug!(%room_id, %event_id, "Shadow local state build matches fetched state.");
-		return;
-	}
-
-	let resolve = |shortstatekey| {
-		self.services
-			.short
-			.get_statekey_from_short(shortstatekey)
-	};
-
-	let (only_local_sample, only_fetch_sample) = join(
-		resolve_divergence_sample(only_local.sample, &resolve),
-		resolve_divergence_sample(only_fetch.sample, &resolve),
-	)
-	.await;
-
-	warn!(
-		%room_id,
-		%event_id,
-		only_local = only_local.count,
-		only_fetch = only_fetch.count,
-		?only_local_sample,
-		?only_fetch_sample,
-		"Shadow local state build diverges from fetched state.",
-	);
-}
-
-// Count all entries in `a` absent from or differing in `b`, sampling a bounded
-// prefix for diagnostics.
-fn divergent(a: &StateIds, b: &StateIds) -> DivergenceSide {
-	a.iter()
-		.filter(|(shortstatekey, event_id)| b.get(shortstatekey) != Some(event_id))
-		.fold(DivergenceSide::default(), |mut divergence, (&shortstatekey, _)| {
-			divergence.count = divergence.count.saturating_add(1);
-
-			if !divergence.sample.is_full() {
-				divergence.sample.push(shortstatekey);
-			}
-
-			divergence
-		})
-}
-
-async fn resolve_divergence_sample<Resolve, Fut>(
-	sample: DivergenceKeys,
-	resolve: &Resolve,
-) -> DivergenceSample
-where
-	Resolve: Fn(ShortStateKey) -> Fut + Sync,
-	Fut: Future<Output = Result<(StateEventType, StateKey)>> + Send,
-{
-	sample
-		.into_iter()
-		.stream()
-		.wide_then(async |shortstatekey| match resolve(shortstatekey).await {
-			| Ok((event_type, state_key)) => DivergenceKey::Resolved(event_type, state_key),
-			| Err(_) => DivergenceKey::UnresolvedShortStateKey(shortstatekey),
-		})
-		.collect()
-		.await
 }
 
 /// Drive discovery then the post-order build; any abnormality sets
@@ -1081,7 +943,13 @@ async fn fork_resolve(
 		.ready_filter_map(Result::ok);
 
 	let resolved = self
-		.state_resolution(room_id, room_version, fork_states.into_iter().stream(), auth_chains)
+		.state_resolution(
+			room_id,
+			room_version,
+			fork_states.into_iter().stream(),
+			auth_chains,
+			Some(&chain_complete),
+		)
 		.await;
 
 	// Only polled chains can affect resolution. Check completeness before using
