@@ -29,13 +29,13 @@
 
 | ✅ `yes` | 🟨 `part` | ❌ `no` | ⬛ `n/a` | total |
 |---:|---:|---:|---:|---:|
-| 254 | 55 | 436 | 330 | 1075 |
+| 255 | 55 | 435 | 330 | 1075 |
 
 ### Status by inventory bucket
 
 | Inv | yes | part | no | n/a | total |
 |---|---|---|---|---|---|
-| merged | 181 | 15 | 12 | 60 | 268 |
+| merged | 182 | 15 | 11 | 60 | 268 |
 | open | 42 | 28 | 337 | 198 | 605 |
 | closed | 31 | 12 | 87 | 72 | 202 |
 
@@ -175,7 +175,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC2788 | ✅ ● | 100/100 | Room version 6 as a default | default_default_room_version is V11 in src/core/config/mod.rs:3842 |
 | MSC2778 | ✅ ● | 100/100 | Providing authentication method for appservice users | src/api/client/session/appservice.rs implements m.login.application_service |
 | MSC2732 | ✅ ● | 100/100 | Olm fallback keys | src/api/client/keys/claim_keys.rs:86; upload, claim-fallback, sync-unused-lis... |
-| MSC2705 | ❌ ◐ | 0/10 | Animated thumbnails | animated param accepted; thumbnails always PNG static |
+| MSC2705 | ✅ ● | 90/90 | Animated thumbnails | animated honored and animated GIF generated; webp output preference unmet |
 | MSC2702 | ✅ ● | 100/100 | `Content-Disposition` usage in the media repo | Content-Disposition and inline allowlist enforced for media downloads, thumbn... |
 | MSC2701 | ✅ ◐ | 80/90 | Media and the `Content-Type` relationship | Optional Content-Type accepted; stored and returned |
 | MSC2689 | ✅ ◐ | 100/100 | Allow guests to operate in encrypted rooms | Auth treats guests like users; /members open |
@@ -284,7 +284,6 @@ for spec compliance.
 | MSC2134 | ❌ ● | 0/0 |  | Identity Hash Lookups | no IS lookup client; no hash_details, pepper or v1 fallback code |
 | MSC2244 | ❌ ● | 0/0 |  | Mass redactions | Single-target redactions only; no array redacts handling |
 | MSC2604 | ❌ ● | 0/0 | 1.1 | Parameters for Login Fallback | login fallback page is homeserver served, so not n/a; Tuwunel ships no page |
-| MSC2705 | ❌ ◐ | 0/10 | 1.11 | Animated thumbnails | animated param accepted; thumbnails always PNG static |
 | MSC3288 | ❌ ● | 0/0 | 1.2 | Add room type to `/_matrix/identity/v2/store-invite` API | sole clause is addressed to homeservers, so not n/a; no 3PID invite at all |
 | MSC3550 | ❌ ◐ | 0/0 | 1.2 | Add HTTP 403 to possible profile lookup responses | CS /profile returns 403 M_FORBIDDEN when outbound profile lookup disabled |
 | MSC4127 | ❌ ● | 0/0 |  | Removal of query string auth | src/api/router/auth.rs:78 still falls back to request.query.access_token |
