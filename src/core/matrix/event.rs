@@ -18,11 +18,14 @@ use std::fmt::Debug;
 
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
-	events::TimelineEventType, room_version_rules::RoomVersionRules,
+	events::{AnySyncMessageLikeEvent, TimelineEventType},
+	room_version_rules::RoomVersionRules,
+	serde::Raw,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, value::RawValue as RawJsonValue};
 
+use self::format::to_sync_message_like_without_unsigned;
 pub use self::{
 	filter::{Matches, trim_event_fields},
 	format::{Owned, Ref},
@@ -63,6 +66,18 @@ pub trait Event: Clone + Debug + Send + Sync {
 		Self: Sized + 'a,
 	{
 		Ref(self).into()
+	}
+
+	/// Serializes a borrowed sync message-like event without unsigned data.
+	///
+	/// This is suitable for persisted event embeddings whose shared copy must
+	/// never retain sender-specific unsigned metadata.
+	#[inline]
+	fn to_sync_message_like_without_unsigned(&self) -> Raw<AnySyncMessageLikeEvent>
+	where
+		Self: Sized,
+	{
+		to_sync_message_like_without_unsigned(self)
 	}
 
 	/// Checks an unsigned-data property with a caller-supplied predicate.

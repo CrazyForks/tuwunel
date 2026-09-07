@@ -1,7 +1,8 @@
-use ruma::{RoomVersionId, events::AnySyncMessageLikeEvent, serde::Raw};
+use ruma::{RoomVersionId, event_id, events::AnySyncMessageLikeEvent, serde::Raw, user_id};
 use serde_json::{json, value::to_raw_value};
 
-use super::{Count, Pdu};
+use super::{Count, Pdu, Unsigned};
+use crate::matrix::Event;
 
 fn message_pdu() -> Pdu {
 	serde_json::from_value(json!({
@@ -18,6 +19,27 @@ fn message_pdu() -> Pdu {
 		"unsigned": { "age": 4, "m.relations": { "m.thread": {} } },
 	}))
 	.expect("valid pdu")
+}
+
+#[test]
+fn sync_message_like_without_unsigned_borrows_pdu() {
+	let pdu = message_pdu();
+	let formatted = pdu.to_sync_message_like_without_unsigned();
+	let formatted: serde_json::Value = serde_json::from_str(formatted.json().get())
+		.expect("formatted event should be valid JSON");
+
+	assert!(formatted.get("unsigned").is_none(), "formatted event retained unsigned data");
+	assert_eq!(formatted["type"], "m.room.message", "formatted event changed type");
+	assert!(pdu.unsigned.is_some(), "formatting mutated the source event");
+
+	let mut custom = serde_json::to_value(&pdu).expect("serialize pdu");
+	custom["type"] = json!("com.example.custom");
+	let custom: Pdu = serde_json::from_value(custom).expect("valid custom pdu");
+	let formatted = custom.to_sync_message_like_without_unsigned();
+	let formatted: serde_json::Value = serde_json::from_str(formatted.json().get())
+		.expect("formatted event should be valid JSON");
+
+	assert_eq!(formatted["type"], "com.example.custom", "custom event type was lost");
 }
 
 #[test]
@@ -96,6 +118,14 @@ fn member_pdu(unsigned: &serde_json::Value) -> Pdu {
 		"unsigned": unsigned,
 	}))
 	.expect("valid pdu")
+}
+
+fn member_pdu_with_raw_unsigned(unsigned: &str) -> Pdu {
+	let mut pdu = member_pdu(&json!({}));
+	pdu.unsigned =
+		Some(Unsigned::from_json_string(unsigned.to_owned()).expect("valid raw unsigned object"));
+
+	pdu
 }
 
 #[test]
@@ -278,6 +308,72 @@ fn remove_replacement_bundle_ignores_nested_replace() {
 }
 
 #[test]
+fn set_reference_bundle_preserves_siblings_and_nested_reference() {
+	let mut pdu = member_pdu(&json!({
+		"age": 17,
+		"m.relations": {
+			"m.replace": { "event_id": "$edit:example.com" },
+			"m.thread": {
+				"latest_event": {
+					"unsigned": {
+						"m.relations": {
+							"m.reference": {
+								"chunk": [{ "event_id": "$nested:example.com" }],
+							},
+						},
+					},
+				},
+			},
+		},
+	}));
+
+	let event_ids = [
+		event_id!("$one:example.com").to_owned(),
+		event_id!("$two:example.com").to_owned(),
+	];
+
+	pdu.set_reference_bundle(&event_ids)
+		.expect("set reference bundle");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	assert_eq!(
+		unsigned,
+		json!({
+			"age": 17,
+			"m.relations": {
+				"m.reference": {
+					"chunk": [
+						{ "event_id": "$one:example.com" },
+						{ "event_id": "$two:example.com" },
+					],
+				},
+				"m.replace": { "event_id": "$edit:example.com" },
+				"m.thread": {
+					"latest_event": {
+						"unsigned": {
+							"m.relations": {
+								"m.reference": {
+									"chunk": [{ "event_id": "$nested:example.com" }],
+								},
+							},
+						},
+					},
+				},
+			},
+		}),
+		"reference insertion changed sibling data",
+	);
+}
+
+#[test]
 fn remove_replacement_bundle_absent_unsigned_noop() {
 	let mut pdu = member_pdu(&json!(null));
 
@@ -285,4 +381,458 @@ fn remove_replacement_bundle_absent_unsigned_noop() {
 		.expect("remove failed");
 
 	assert!(pdu.unsigned.is_none());
+}
+
+#[test]
+fn remove_thread_bundle_preserves_siblings() {
+	let mut pdu = member_pdu(&json!({
+		"age": 4612,
+		"m.relations": {
+			"m.replace": { "event_id": "$edit:example.com" },
+			"m.thread": { "count": 3 },
+		},
+	}));
+
+	pdu.remove_thread_bundle()
+		.expect("thread bundle removal should succeed");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("sibling unsigned data should remain")
+			.json()
+			.get(),
+	)
+	.expect("remaining unsigned data should be valid JSON");
+
+	assert!(unsigned["m.relations"].get("m.thread").is_none());
+	assert_eq!(unsigned["m.relations"]["m.replace"], json!({ "event_id": "$edit:example.com" }));
+	assert_eq!(unsigned["age"], 4612);
+}
+
+#[test]
+fn remove_thread_bundle_drops_emptied_relations() {
+	let mut pdu = member_pdu(&json!({
+		"age": 4612,
+		"m.relations": { "m.thread": { "count": 3 } },
+	}));
+
+	pdu.remove_thread_bundle()
+		.expect("thread bundle removal should succeed");
+
+	let unsigned = pdu
+		.unsigned
+		.as_ref()
+		.expect("sibling unsigned data should remain");
+
+	assert_eq!(unsigned.json().get(), r#"{"age":4612}"#);
+}
+
+#[test]
+fn remove_thread_bundle_omits_emptied_unsigned() {
+	let mut pdu = member_pdu(&json!({
+		"m.relations": { "m.thread": { "count": 3 } },
+	}));
+
+	pdu.remove_thread_bundle()
+		.expect("thread bundle removal should succeed");
+
+	assert!(pdu.unsigned.is_none());
+}
+
+#[test]
+fn remove_thread_bundle_ignores_nested_thread() {
+	let mut pdu = member_pdu(&json!({
+		"m.relations": {
+			"m.replace": {
+				"latest_event": {
+					"unsigned": { "m.relations": { "m.thread": {} } },
+				},
+			},
+		},
+	}));
+
+	let before = pdu
+		.unsigned
+		.as_ref()
+		.expect("thread unsigned data should be present")
+		.json()
+		.get()
+		.to_owned();
+
+	pdu.remove_thread_bundle()
+		.expect("thread bundle removal should succeed");
+
+	assert_eq!(
+		pdu.unsigned
+			.as_ref()
+			.expect("sibling unsigned data should remain")
+			.json()
+			.get(),
+		before,
+		"a nested bundle is not the top-level one",
+	);
+}
+
+#[test]
+fn remove_thread_bundle_decodes_escaped_relation_key() {
+	let unsigned = r#"{
+		"age": 4,
+		"m.relations": {
+			"m\u002ethread": { "count": 1 },
+			"m.replace": { "event_id": "$edit:example.com" }
+		}
+	}"#;
+
+	let mut pdu = member_pdu_with_raw_unsigned(unsigned);
+	assert!(
+		pdu.has_thread_bundle()
+			.expect("presence check failed")
+	);
+
+	pdu.remove_thread_bundle().expect("remove failed");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	assert_eq!(
+		unsigned,
+		json!({
+			"age": 4,
+			"m.relations": { "m.replace": { "event_id": "$edit:example.com" } },
+		}),
+	);
+}
+
+#[test]
+fn remove_thread_bundle_absent_unsigned_noop() {
+	let mut pdu = member_pdu(&json!(null));
+
+	pdu.remove_thread_bundle()
+		.expect("thread bundle removal should succeed");
+
+	assert!(pdu.unsigned.is_none());
+}
+
+#[test]
+fn thread_latest_event_rejects_malformed_identity() {
+	let pdu = member_pdu(&json!({
+		"m.relations": {
+			"m.thread": {
+				"latest_event": { "event_id": "$reply:example.com" },
+			},
+		},
+	}));
+
+	assert!(pdu.thread_latest_event().is_err(), "malformed identity was treated as absent");
+}
+
+#[test]
+fn thread_latest_event_rejects_null_bundle_fields() {
+	for unsigned in [
+		json!({ "m.relations": { "m.thread": null } }),
+		json!({ "m.relations": { "m.thread": { "latest_event": null } } }),
+	] {
+		let pdu = member_pdu(&unsigned);
+
+		assert!(pdu.thread_latest_event().is_err(), "null bundle field was treated as absent");
+	}
+}
+
+#[test]
+fn remove_thread_latest_transaction_id_for_other_user() {
+	let mut pdu = member_pdu(&json!({
+		"age": 4612,
+		"m.relations": {
+			"m.replace": { "event_id": "$edit:example.com" },
+			"m.thread": {
+				"count": 1,
+				"latest_event": {
+					"content": { "body": "hello", "msgtype": "m.text" },
+					"event_id": "$latest:example.com",
+					"sender": "@bob:example.com",
+					"unsigned": {
+						"age": 23,
+						"transaction_id": "secret",
+					},
+				},
+			},
+		},
+	}));
+
+	let mut expected: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned present")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	expected["m.relations"]["m.thread"]["latest_event"]["unsigned"]
+		.as_object_mut()
+		.expect("unsigned object")
+		.remove("transaction_id");
+
+	pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"))
+		.expect("remove failed");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	assert_eq!(unsigned, expected, "rewrite changed fields beside the transaction ID");
+}
+
+#[test]
+fn retain_thread_latest_transaction_id_for_sender() {
+	let mut pdu = member_pdu(&json!({
+		"m.relations": {
+			"m.thread": {
+				"latest_event": {
+					"sender": "@bob:example.com",
+					"unsigned": { "transaction_id": "secret" },
+				},
+			},
+		},
+	}));
+
+	let before = pdu
+		.unsigned
+		.as_ref()
+		.expect("unsigned present")
+		.json()
+		.get()
+		.to_owned();
+
+	pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@bob:example.com"))
+		.expect("remove failed");
+
+	let unsigned = pdu.unsigned.as_ref().expect("unsigned kept");
+
+	assert_eq!(unsigned.json().get(), before, "own bundle was re-encoded");
+}
+
+#[test]
+fn thread_latest_transaction_id_decodes_escaped_sender() {
+	for (encoded, sender) in [
+		(r"@\u0062ob:example.com", user_id!("@bob:example.com")),
+		(r"@bo\\b:example.com", user_id!(r"@bo\b:example.com")),
+	] {
+		let unsigned = format!(
+			r#"{{
+				"age": 4612,
+				"m.relations": {{
+					"m.replace": {{ "event_id": "$edit:example.com" }},
+					"m.thread": {{
+						"count": 1,
+						"latest_event": {{
+							"sender": "{encoded}",
+							"content": {{ "body": "hello" }},
+							"unsigned": {{ "age": 23, "transaction_id": "secret" }}
+						}}
+					}}
+				}}
+			}}"#,
+		);
+
+		let mut pdu = member_pdu_with_raw_unsigned(&unsigned);
+
+		pdu.remove_thread_latest_transaction_id_unless_sender(sender)
+			.expect("retain for escaped sender failed");
+
+		assert_eq!(
+			pdu.unsigned
+				.as_ref()
+				.expect("unsigned kept")
+				.json()
+				.get(),
+			unsigned,
+			"own bundle was re-encoded",
+		);
+
+		let mut expected: serde_json::Value =
+			serde_json::from_str(&unsigned).expect("valid unsigned");
+
+		expected["m.relations"]["m.thread"]["latest_event"]["unsigned"]
+			.as_object_mut()
+			.expect("unsigned object")
+			.remove("transaction_id");
+
+		pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"))
+			.expect("remove for other user failed");
+
+		let actual: serde_json::Value = serde_json::from_str(
+			pdu.unsigned
+				.as_ref()
+				.expect("unsigned kept")
+				.json()
+				.get(),
+		)
+		.expect("valid unsigned");
+
+		assert_eq!(actual, expected, "rewrite changed fields beside the transaction ID");
+	}
+}
+
+#[test]
+fn reject_thread_latest_transaction_id_without_sender() {
+	let mut pdu = member_pdu(&json!({
+		"m.relations": {
+			"m.thread": {
+				"latest_event": {
+					"unsigned": { "transaction_id": "secret" },
+				},
+			},
+		},
+	}));
+
+	let before = pdu
+		.unsigned
+		.as_ref()
+		.expect("unsigned present")
+		.json()
+		.get()
+		.to_owned();
+
+	let result =
+		pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"));
+
+	let unsigned = pdu.unsigned.as_ref().expect("unsigned kept");
+
+	assert!(result.is_err(), "missing sender did not fail closed");
+	assert_eq!(unsigned.json().get(), before, "failed rewrite mutated the bundle");
+}
+
+#[test]
+fn reject_duplicate_thread_bundle_path() {
+	let unsigned = r#"{
+		"m.relations": {
+			"m.thread": {
+				"latest_event": {
+					"sender": "@bob:example.com",
+					"unsigned": { "transaction_id": "secret" }
+				}
+			}
+		},
+		"m.relations": {}
+	}"#;
+
+	let mut pdu = member_pdu_with_raw_unsigned(unsigned);
+
+	let result =
+		pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"));
+
+	assert!(result.is_err(), "duplicate path field did not fail closed");
+	assert_eq!(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+		unsigned,
+		"failed rewrite mutated the bundle",
+	);
+}
+
+#[test]
+fn thread_bundle_fallback_preserves_unrelated_unsigned_data() {
+	let unsigned = r#"{
+		"age": 4,
+		"m.relations": { "m.thread": { "count": 1 } },
+		"m.relations": { "m.replace": { "event_id": "$edit:example.com" } }
+	}"#;
+
+	let mut pdu = member_pdu_with_raw_unsigned(unsigned);
+
+	pdu.remove_thread_bundle()
+		.expect("fallback removal failed");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	assert_eq!(unsigned["age"], 4);
+	assert_eq!(unsigned["m.relations"]["m.replace"]["event_id"], "$edit:example.com");
+	assert!(unsigned["m.relations"].get("m.thread").is_none());
+}
+
+#[test]
+fn remove_thread_latest_transaction_id_decodes_escaped_key() {
+	let unsigned = r#"{
+		"m.relations": {
+			"m.thread": {
+				"latest_event": {
+					"sender": "@bob:example.com",
+					"unsigned": { "transaction\u005fid": "secret" }
+				}
+			}
+		}
+	}"#;
+
+	let mut pdu = member_pdu_with_raw_unsigned(unsigned);
+
+	pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"))
+		.expect("remove failed");
+
+	let unsigned: serde_json::Value = serde_json::from_str(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+	)
+	.expect("valid unsigned");
+
+	let nested = &unsigned["m.relations"]["m.thread"]["latest_event"]["unsigned"];
+
+	assert!(nested.get("transaction_id").is_none(), "escaped transaction ID survived");
+}
+
+#[test]
+fn reject_duplicate_thread_bundle_sibling() {
+	let unsigned = r#"{
+		"m.relations": {
+			"m.thread": {
+				"latest_event": {
+					"content": { "body": "one" },
+					"content": { "body": "two" },
+					"sender": "@bob:example.com",
+					"unsigned": { "transaction_id": "secret" }
+				}
+			}
+		}
+	}"#;
+
+	let mut pdu = member_pdu_with_raw_unsigned(unsigned);
+
+	let result =
+		pdu.remove_thread_latest_transaction_id_unless_sender(user_id!("@alice:example.com"));
+
+	assert!(result.is_err(), "duplicate sibling field did not fail closed");
+	assert_eq!(
+		pdu.unsigned
+			.as_ref()
+			.expect("unsigned kept")
+			.json()
+			.get(),
+		unsigned,
+		"failed rewrite mutated the bundle",
+	);
 }

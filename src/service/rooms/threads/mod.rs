@@ -2,12 +2,11 @@ use std::{collections::BTreeMap, pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt, TryFutureExt, future::join3};
 use ruma::{
-	CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UInt,
+	UserId,
 	api::{Direction, client::threads::get_threads::v1::IncludeThreads},
-	events::{
-		TimelineEventType,
-		relation::{BundledThread, RelationType},
-	},
+	events::{AnySyncMessageLikeEvent, TimelineEventType, relation::RelationType},
+	serde::Raw,
 	uint,
 };
 use serde::Deserialize;
@@ -39,6 +38,59 @@ struct ExtractThreadRelation {
 struct ThreadRelation {
 	rel_type: RelationType,
 	event_id: OwnedEventId,
+}
+
+fn canonical_object_field<'a>(
+	object: &'a mut CanonicalJsonObject,
+	field: &str,
+) -> &'a mut CanonicalJsonObject {
+	if !matches!(object.get(field), Some(CanonicalJsonValue::Object(_))) {
+		object.insert(field.into(), CanonicalJsonValue::Object(BTreeMap::new()));
+	}
+
+	let Some(CanonicalJsonValue::Object(value)) = object.get_mut(field) else {
+		unreachable!("canonical object field was initialized as an object");
+	};
+
+	value
+}
+
+/// Persist a latest event whose embedded sender and event ID come from the
+/// same validated event used to index the thread activity.
+fn update_thread_bundle<E>(unsigned: &mut CanonicalJsonObject, event: &E)
+where
+	E: Event,
+{
+	let latest_event = event.to_sync_message_like_without_unsigned();
+	update_thread_bundle_raw(unsigned, &latest_event);
+}
+
+fn update_thread_bundle_raw(
+	unsigned: &mut CanonicalJsonObject,
+	latest_event: &Raw<AnySyncMessageLikeEvent>,
+) {
+	let relations = canonical_object_field(unsigned, "m.relations");
+	let thread = canonical_object_field(relations, "m.thread");
+	let count = thread
+		.get("count")
+		.cloned()
+		.and_then(|count| serde_json::from_value::<UInt>(count.into()).ok());
+
+	let count = count.map_or_else(|| uint!(1), |count| count.saturating_add(uint!(1)));
+	let latest_event = serde_json::from_str(latest_event.json().get())
+		.expect("thread latest event should be canonical JSON");
+
+	thread.insert("latest_event".into(), latest_event);
+	thread.insert(
+		"count".into(),
+		json!(count)
+			.try_into()
+			.expect("thread count is canonical JSON"),
+	);
+
+	if !matches!(thread.get("current_user_participated"), Some(CanonicalJsonValue::Bool(_))) {
+		thread.insert("current_user_participated".into(), CanonicalJsonValue::Bool(true));
+	}
 }
 
 pub struct Service {
@@ -204,42 +256,7 @@ impl Service {
 			.entry("unsigned".into())
 			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
 		{
-			if let Some(mut relations) = unsigned
-				.get("m.relations")
-				.and_then(|r| r.as_object())
-				.and_then(|r| r.get("m.thread"))
-				.and_then(|relations| {
-					serde_json::from_value::<BundledThread>(relations.clone().into()).ok()
-				}) {
-				// Thread already existed
-				relations.count = relations.count.saturating_add(uint!(1));
-				relations.latest_event = event.to_format();
-
-				let content = serde_json::to_value(relations).expect("to_value always works");
-
-				unsigned.insert(
-					"m.relations".into(),
-					json!({ "m.thread": content })
-						.try_into()
-						.expect("thread is valid json"),
-				);
-			} else {
-				// New thread
-				let relations = BundledThread {
-					latest_event: event.to_format(),
-					count: uint!(1),
-					current_user_participated: true,
-				};
-
-				let content = serde_json::to_value(relations).expect("to_value always works");
-
-				unsigned.insert(
-					"m.relations".into(),
-					json!({ "m.thread": content })
-						.try_into()
-						.expect("thread is valid json"),
-				);
-			}
+			update_thread_bundle(unsigned, event);
 
 			self.services
 				.timeline
@@ -331,7 +348,8 @@ impl Service {
 			.await
 			.ok()?;
 
-		pdu.remove_transaction_id_unless_sender(Some(user_id));
+		pdu.remove_transaction_id_unless_sender(Some(user_id))
+			.ok()?;
 
 		Some((count, pdu))
 	}

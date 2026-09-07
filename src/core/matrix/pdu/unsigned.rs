@@ -1,15 +1,77 @@
-use std::collections::BTreeMap;
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, btree_map::Entry},
+	fmt::{Formatter, Result as FmtResult},
+	iter::from_fn,
+};
 
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, UserId,
 	events::{AnySyncMessageLikeEvent, room::member::MembershipState},
 	serde::Raw,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+	Deserialize, Deserializer, Serialize, Serializer,
+	de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, Visitor},
+	ser::SerializeMap,
+};
 use serde_json::value::{RawValue as RawJsonValue, Value as JsonValue, to_raw_value};
 
 use super::{Pdu, Unsigned};
-use crate::{Result, err, implement, result::LogErr, utils::BoolExt};
+use crate::{Result, err, implement, utils::BoolExt};
+
+type BorrowedObject<'a> = BTreeMap<Cow<'a, str>, &'a RawJsonValue>;
+type JsonEntry<'a> = (JsonString<'a>, &'a RawJsonValue);
+
+struct RelationBundle<'a> {
+	unsigned: BorrowedObject<'a>,
+	relations: BorrowedObject<'a>,
+}
+
+struct ThreadBundleFields<'a> {
+	unsigned: BorrowedObject<'a>,
+	relations: BorrowedObject<'a>,
+	thread: BorrowedObject<'a>,
+	latest_event: BorrowedObject<'a>,
+	latest_event_unsigned: BorrowedObject<'a>,
+}
+
+struct RawObjectPatch<'a, 'raw, T> {
+	object: &'a BorrowedObject<'raw>,
+	field: &'static str,
+	value: T,
+}
+
+struct RawObjectRemove<'a, 'raw> {
+	object: &'a BorrowedObject<'raw>,
+	field: &'a str,
+}
+
+struct BorrowedField<'a>(&'a str);
+
+struct UniqueObject;
+
+struct JsonString<'a>(Cow<'a, str>);
+
+struct JsonStringVisitor;
+
+#[derive(Serialize)]
+struct ReferenceBundle<'a> {
+	chunk: ReferenceChunk<'a>,
+}
+
+struct ReferenceChunk<'a>(&'a [OwnedEventId]);
+
+#[derive(Serialize)]
+struct ReferenceEvent<'a> {
+	event_id: &'a OwnedEventId,
+}
+
+#[derive(Deserialize)]
+struct Identity {
+	event_id: OwnedEventId,
+	sender: OwnedUserId,
+}
 
 /// Removes the transaction ID unless the event is served to its own sender.
 ///
@@ -17,10 +79,11 @@ use crate::{Result, err, implement, result::LogErr, utils::BoolExt};
 /// its echo against, so the sender keeps it and nobody else sees it. A `None`
 /// requester is nobody in particular and is treated as somebody else.
 #[implement(Pdu)]
-pub fn remove_transaction_id_unless_sender(&mut self, user_id: Option<&UserId>) {
-	if user_id.is_none_or(|user_id| self.sender != *user_id) {
-		self.remove_transaction_id().log_err().ok();
-	}
+pub fn remove_transaction_id_unless_sender(&mut self, user_id: Option<&UserId>) -> Result {
+	user_id
+		.is_none_or(|user_id| self.sender != *user_id)
+		.then(|| self.remove_transaction_id())
+		.unwrap_or(Ok(()))
 }
 
 /// Removes the local transaction ID from unsigned event metadata.
@@ -195,39 +258,35 @@ pub fn set_thread_participated(&mut self, participated: bool) -> Result {
 	Ok(())
 }
 
-/// MSC4025: identify the bundled `m.thread` `latest_event` without parsing
-/// the whole bundle: the `sender` keys the erasure gate, the `event_id` loads
-/// the event on a hit.
+/// Identifies the sender and event ID of a bundled thread preview.
+///
+/// MSC4025 uses the sender for the erasure check and the event ID to load the
+/// event. The thread writer derives both fields from one validated event.
 #[implement(Pdu)]
-#[must_use]
-pub fn thread_latest_event(&self) -> Option<(OwnedEventId, OwnedUserId)> {
-	#[derive(Deserialize)]
-	struct Relations {
-		#[serde(rename = "m.thread")]
-		thread: Option<Thread>,
-	}
+#[inline]
+pub fn thread_latest_event(&self) -> Result<Option<(OwnedEventId, OwnedUserId)>> {
+	self.unsigned
+		.as_ref()
+		.map(Unsigned::json)
+		.map(thread_latest)
+		.transpose()?
+		.flatten()
+		.map(thread_identity)
+		.transpose()
+}
 
-	#[derive(Deserialize)]
-	struct Thread {
-		latest_event: Option<Identity>,
-	}
-
-	#[derive(Deserialize)]
-	struct Identity {
-		event_id: OwnedEventId,
-		sender: OwnedUserId,
-	}
-
-	let relations: Relations = self
-		.unsigned
-		.as_ref()?
-		.get_field("m.relations")
-		.ok()
-		.flatten()?;
-
-	let identity = relations.thread?.latest_event?;
-
-	Some((identity.event_id, identity.sender))
+/// Whether `unsigned.m.relations` contains an `m.thread` bundle.
+///
+/// This decodes object keys, so escaped spellings cannot bypass read-time
+/// privacy handling.
+#[implement(Pdu)]
+pub fn has_thread_bundle(&self) -> Result<bool> {
+	self.unsigned
+		.as_ref()
+		.map(Unsigned::json)
+		.map(thread_bundle)
+		.transpose()
+		.map(|thread| thread.flatten().is_some())
 }
 
 /// MSC4025: overwrite `unsigned.m.relations.m.thread.latest_event`, serving
@@ -261,6 +320,181 @@ pub fn set_thread_latest_event(&mut self, latest: &Raw<AnySyncMessageLikeEvent>)
 	}
 
 	Ok(())
+}
+
+/// Removes a thread preview transaction ID unless served to its own sender.
+///
+/// Stored thread bundles predate write-side sanitization, so this rewrites the
+/// nested event at serve time while retaining its other unsigned properties.
+/// A missing or invalid sender returns an error so callers can fail closed.
+#[implement(Pdu)]
+pub fn remove_thread_latest_transaction_id_unless_sender(&mut self, user_id: &UserId) -> Result {
+	if let Some(unsigned) = self
+		.unsigned
+		.as_ref()
+		.map(Unsigned::json)
+		.map(|raw| thread_without_transaction_id(raw, user_id))
+		.transpose()?
+		.flatten()
+	{
+		self.unsigned = Some(unsigned);
+	}
+
+	Ok(())
+}
+
+fn thread_without_transaction_id(
+	raw: &RawJsonValue,
+	user_id: &UserId,
+) -> Result<Option<Unsigned>> {
+	thread_transaction_sender(raw)?
+		.map(|sender| serde_json::from_str(sender.get()))
+		.transpose()
+		.map_err(|error| err!(Database("Invalid sender in thread latest event: {error}")))?
+		.filter(|JsonString(sender)| sender != user_id.as_str())
+		.map(|JsonString(sender)| {
+			UserId::parse(sender.as_ref())
+				.map_err(|error| err!(Database("Invalid sender in thread latest event: {error}")))
+				.and_then(|_| ThreadBundleFields::parse(raw)?.without_transaction_id())
+		})
+		.transpose()
+}
+
+fn thread_transaction_sender(raw: &RawJsonValue) -> Result<Option<&RawJsonValue>> {
+	thread_latest(raw)?
+		.map(transaction_sender)
+		.transpose()
+		.map(Option::flatten)
+}
+
+fn transaction_sender(latest_event: &RawJsonValue) -> Result<Option<&RawJsonValue>> {
+	let sender = || {
+		raw_field(latest_event, "sender", "thread latest event")?.ok_or_else(|| {
+			err!(Database("Thread latest event with transaction ID has no sender"))
+		})
+	};
+
+	raw_field(latest_event, "unsigned", "thread latest event")?
+		.map(|unsigned| raw_field(unsigned, "transaction_id", "thread latest event unsigned"))
+		.transpose()?
+		.flatten()
+		.map(|_| sender())
+		.transpose()
+}
+
+fn thread_latest(raw: &RawJsonValue) -> Result<Option<&RawJsonValue>> {
+	thread_bundle(raw)?
+		.map(|thread| raw_field(thread, "latest_event", "thread bundle"))
+		.transpose()
+		.map(Option::flatten)
+}
+
+fn thread_bundle(raw: &RawJsonValue) -> Result<Option<&RawJsonValue>> {
+	raw_field(raw, "m.relations", "unsigned")?
+		.map(|relations| raw_field(relations, "m.thread", "bundled relations"))
+		.transpose()
+		.map(Option::flatten)
+}
+
+fn thread_identity(raw: &RawJsonValue) -> Result<(OwnedEventId, OwnedUserId)> {
+	serde_json::from_str(raw.get())
+		.map(|Identity { event_id, sender }| (event_id, sender))
+		.map_err(|error| err!(Database("Invalid thread latest event in PDU event: {error}")))
+}
+
+/// Excise `m.thread` from `unsigned.m.relations`, retaining unrelated data.
+///
+/// Empty relation and unsigned objects are removed with the bundle.
+#[implement(Pdu)]
+pub fn remove_thread_bundle(&mut self) -> Result {
+	remove_relation_bundle(self, "m.thread")
+		.or_else(|_| remove_relation_bundle_canonical(self, "m.thread"))
+}
+
+/// Canonicalize malformed or ambiguous relation objects while removing only
+/// the requested relation. This allocation is reserved for the error path of
+/// the borrowed surgical rewrite.
+fn remove_relation_bundle_canonical(pdu: &mut Pdu, relation_type: &str) -> Result {
+	let Some(raw) = pdu.unsigned.as_ref() else {
+		return Ok(());
+	};
+
+	let mut unsigned: JsonValue = serde_json::from_str(raw.json().get())?;
+	let unsigned = unsigned
+		.as_object_mut()
+		.ok_or_else(|| err!(Database("Invalid unsigned object in PDU event")))?;
+
+	let remove_relations = match unsigned.get_mut("m.relations") {
+		| None => return Ok(()),
+		| Some(JsonValue::Object(relations)) => {
+			relations.remove(relation_type);
+			relations.is_empty()
+		},
+		| Some(_) => true,
+	};
+
+	if remove_relations {
+		unsigned.remove("m.relations");
+	}
+
+	pdu.unsigned = if unsigned.is_empty() {
+		None
+	} else {
+		Some(raw_as(unsigned)?)
+	};
+
+	Ok(())
+}
+
+fn remove_relation_bundle(pdu: &mut Pdu, relation_type: &str) -> Result {
+	if let Some(unsigned) = pdu
+		.unsigned
+		.as_ref()
+		.map(Unsigned::json)
+		.map(|raw| RelationBundle::parse(raw, relation_type))
+		.transpose()?
+		.flatten()
+		.map(|bundle| bundle.without(relation_type))
+		.transpose()?
+	{
+		pdu.unsigned = unsigned;
+	}
+
+	Ok(())
+}
+
+#[implement(RelationBundle, generics = "<'a>", params = "<'a>")]
+fn parse(raw: &'a RawJsonValue, relation_type: &str) -> Result<Option<Self>> {
+	let unsigned = raw_object(raw, "unsigned")?;
+
+	unsigned
+		.get("m.relations")
+		.copied()
+		.map(|relations| raw_object(relations, "bundled relations"))
+		.transpose()
+		.map(|relations| {
+			relations
+				.filter(|relations| relations.contains_key(relation_type))
+				.map(|relations| Self { unsigned, relations })
+		})
+}
+
+#[implement(RelationBundle, generics = "<'a>", params = "<'a>")]
+fn without(&self, relation_type: &str) -> Result<Option<Unsigned>> {
+	match self.relations.len() {
+		| 1 => self
+			.unsigned
+			.len()
+			.ne(&1)
+			.then(|| raw_as(&RawObjectRemove::new(&self.unsigned, "m.relations")))
+			.transpose(),
+		| _ => {
+			let relations = RawObjectRemove::new(&self.relations, relation_type);
+			let unsigned = RawObjectPatch::new(&self.unsigned, "m.relations", relations);
+
+			raw_as(&unsigned).map(Some)
+		},
+	}
 }
 
 /// MSC3856: overwrite `unsigned.m.relations.m.thread.count` with a
@@ -333,48 +567,7 @@ pub fn set_replacement_bundle(&mut self, replacement: &Raw<AnySyncMessageLikeEve
 /// it and `unsigned` when that leaves nothing.
 #[implement(Pdu)]
 pub fn remove_replacement_bundle(&mut self) -> Result {
-	use BTreeMap as Map;
-
-	type Object = Map<String, Raw<JsonValue>>;
-
-	let Some(unsigned) = &self.unsigned else {
-		return Ok(());
-	};
-
-	if !unsigned.json().get().contains("\"m.replace\"") {
-		return Ok(());
-	}
-
-	let parse = |raw: &RawJsonValue| -> Result<Object> {
-		serde_json::from_str(raw.get())
-			.map_err(|e| err!(SerdeDe("Invalid object in pdu unsigned: {e}")))
-	};
-
-	let mut unsigned: Object = parse(unsigned.json())?;
-
-	let Some(relations) = unsigned.get("m.relations") else {
-		return Ok(());
-	};
-
-	let mut relations: Object = parse(relations.json())?;
-
-	if relations.remove("m.replace").is_none() {
-		return Ok(());
-	}
-
-	match relations.is_empty() {
-		| true => unsigned.remove("m.relations"),
-		| false => unsigned.insert("m.relations".to_owned(), to_raw_value(&relations)?.into()),
-	};
-
-	self.unsigned = unsigned
-		.is_empty()
-		.is_false()
-		.then(|| to_raw_value(&unsigned))
-		.transpose()?
-		.map(Into::into);
-
-	Ok(())
+	remove_relation_bundle(self, "m.replace")
 }
 
 /// MSC2675/MSC3267: fold reference relations into
@@ -383,43 +576,292 @@ pub fn remove_replacement_bundle(&mut self) -> Result {
 /// `unsigned` when absent.
 #[implement(Pdu)]
 pub fn set_reference_bundle(&mut self, event_ids: &[OwnedEventId]) -> Result {
-	use BTreeMap as Map;
-
-	type Object = Map<String, Raw<JsonValue>>;
-
-	let parse = |raw: &RawJsonValue| -> Result<Object> {
-		serde_json::from_str(raw.get())
-			.map_err(|e| err!(Database("Invalid object in pdu unsigned: {e}")))
-	};
-
-	let mut unsigned: Object = self
+	let unsigned = self
 		.unsigned
 		.as_ref()
-		.map(|unsigned| parse(unsigned.json()))
+		.map(|unsigned| raw_object(unsigned.json(), "unsigned"))
 		.transpose()?
 		.unwrap_or_default();
 
-	let mut relations: Object = unsigned
+	let relations = unsigned
 		.get("m.relations")
-		.map(|relations| parse(relations.json()))
+		.copied()
+		.map(|relations| raw_object(relations, "bundled relations"))
 		.transpose()?
 		.unwrap_or_default();
 
-	let chunk: Vec<JsonValue> = event_ids
-		.iter()
-		.map(|event_id| serde_json::json!({ "event_id": event_id }))
-		.collect();
-
-	let reference = serde_json::json!({ "chunk": chunk });
-
-	relations.insert("m.reference".to_owned(), to_raw_value(&reference)?.into());
-	unsigned.insert("m.relations".to_owned(), to_raw_value(&relations)?.into());
-	self.unsigned = Some(to_raw_value(&unsigned)?.into());
+	let reference = ReferenceBundle { chunk: ReferenceChunk(event_ids) };
+	let relations = RawObjectPatch::new(&relations, "m.reference", reference);
+	let unsigned = RawObjectPatch::new(&unsigned, "m.relations", relations);
+	self.unsigned = Some(raw_as(&unsigned)?);
 
 	Ok(())
 }
 
-#[inline]
-fn raw_of<T: Serialize>(value: &T) -> Result<Raw<JsonValue>> {
-	Ok(Raw::from_raw_value(&to_raw_value(value)?))
+impl<'de> Deserialize<'de> for JsonString<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		deserializer.deserialize_str(JsonStringVisitor)
+	}
 }
+
+impl<'de> Visitor<'de> for JsonStringVisitor {
+	type Value = JsonString<'de>;
+
+	fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+		formatter.write_str("a JSON string")
+	}
+
+	fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+		Ok(JsonString(Cow::Borrowed(value)))
+	}
+
+	fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+	where
+		E: DeError,
+	{
+		Ok(JsonString(Cow::Owned(value.to_owned())))
+	}
+
+	fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+		Ok(JsonString(Cow::Owned(value)))
+	}
+}
+
+impl<'de> DeserializeSeed<'de> for BorrowedField<'_> {
+	type Value = Option<&'de RawJsonValue>;
+
+	fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		deserializer.deserialize_map(self)
+	}
+}
+
+impl<'de> Visitor<'de> for BorrowedField<'_> {
+	type Value = Option<&'de RawJsonValue>;
+
+	fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+		write!(formatter, "an object containing {}", self.0)
+	}
+
+	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+	where
+		A: MapAccess<'de>,
+	{
+		let mut value = None; // MapAccess key/value reads share the cursor.
+
+		while let Some(JsonString(field)) = map.next_key()? {
+			value = match field.as_ref() {
+				| field if field != self.0 => map.next_value().map(|_: IgnoredAny| value),
+				| _ if value.is_some() =>
+					Err(A::Error::custom(format_args!("duplicate field `{field}`"))),
+				| _ => map.next_value().map(Some),
+			}?;
+		}
+
+		Ok(value)
+	}
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueObject {
+	type Value = BorrowedObject<'de>;
+
+	fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		deserializer.deserialize_map(self)
+	}
+}
+
+impl<'de> Visitor<'de> for UniqueObject {
+	type Value = BorrowedObject<'de>;
+
+	fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+		formatter.write_str("an object without duplicate fields")
+	}
+
+	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+	where
+		A: MapAccess<'de>,
+	{
+		from_fn(|| map.next_entry().transpose()).try_fold(
+			BorrowedObject::new(),
+			|mut object, entry: Result<JsonEntry<'de>, A::Error>| {
+				let (JsonString(field), value) = entry?;
+
+				match object.entry(field) {
+					| Entry::Occupied(entry) =>
+						Err(A::Error::custom(format_args!("duplicate field `{}`", entry.key()))),
+					| Entry::Vacant(entry) => {
+						entry.insert(value);
+
+						Ok(object)
+					},
+				}
+			},
+		)
+	}
+}
+
+#[implement(ThreadBundleFields, generics = "<'a>", params = "<'a>")]
+fn parse(raw: &'a RawJsonValue) -> Result<Self> {
+	let child = |object: &BorrowedObject<'a>, field, name| {
+		object
+			.get(field)
+			.ok_or_else(|| {
+				err!(Database("Thread transaction probe disagreed with bundle parser"))
+			})
+			.and_then(|raw| raw_object(raw, name))
+	};
+
+	let unsigned = raw_object(raw, "unsigned")?;
+	let relations = child(&unsigned, "m.relations", "bundled relations")?;
+	let thread = child(&relations, "m.thread", "thread bundle")?;
+	let latest_event = child(&thread, "latest_event", "thread latest event")?;
+	let latest_event_unsigned = child(&latest_event, "unsigned", "thread latest event unsigned")?;
+
+	Ok(Self {
+		unsigned,
+		relations,
+		thread,
+		latest_event,
+		latest_event_unsigned,
+	})
+}
+
+#[implement(ThreadBundleFields, generics = "<'a>", params = "<'a>")]
+fn without_transaction_id<U, const N: usize>(&self) -> Result<Raw<U, N>> {
+	let latest_event_unsigned =
+		RawObjectRemove::new(&self.latest_event_unsigned, "transaction_id");
+
+	let latest_event = RawObjectPatch::new(&self.latest_event, "unsigned", latest_event_unsigned);
+	let thread = RawObjectPatch::new(&self.thread, "latest_event", latest_event);
+	let relations = RawObjectPatch::new(&self.relations, "m.thread", thread);
+	let unsigned = RawObjectPatch::new(&self.unsigned, "m.relations", relations);
+
+	raw_as(&unsigned)
+}
+
+impl<'a, 'raw, T> RawObjectPatch<'a, 'raw, T> {
+	fn new(object: &'a BorrowedObject<'raw>, field: &'static str, value: T) -> Self {
+		Self { object, field, value }
+	}
+}
+
+impl<T: Serialize> Serialize for RawObjectPatch<'_, '_, T> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let present = self.object.contains_key(self.field);
+		let len = self
+			.object
+			.len()
+			.saturating_add(usize::from(!present));
+
+		let map = self.object.iter().try_fold(
+			serializer.serialize_map(Some(len))?,
+			|mut map, (field, value)| {
+				match field.as_ref() == self.field {
+					| true => map.serialize_entry(field, &self.value),
+					| false => map.serialize_entry(field, value),
+				}?;
+
+				Ok(map)
+			},
+		)?;
+
+		present
+			.is_false()
+			.then_some(self.field)
+			.into_iter()
+			.try_fold(map, |mut map, field| {
+				map.serialize_entry(field, &self.value)?;
+
+				Ok(map)
+			})
+			.and_then(SerializeMap::end)
+	}
+}
+
+impl<'a, 'raw> RawObjectRemove<'a, 'raw> {
+	fn new(object: &'a BorrowedObject<'raw>, field: &'a str) -> Self { Self { object, field } }
+}
+
+impl Serialize for RawObjectRemove<'_, '_> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		self.object
+			.iter()
+			.filter(|(field, _)| field.as_ref() != self.field)
+			.try_fold(
+				serializer.serialize_map(Some(self.object.len().saturating_sub(1)))?,
+				|mut map, (field, value)| {
+					map.serialize_entry(field, value)?;
+
+					Ok(map)
+				},
+			)
+			.and_then(SerializeMap::end)
+	}
+}
+
+impl Serialize for ReferenceChunk<'_> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.collect_seq(
+			self.0
+				.iter()
+				.map(|event_id| ReferenceEvent { event_id }),
+		)
+	}
+}
+
+fn raw_object<'a>(raw: &'a RawJsonValue, name: &str) -> Result<BorrowedObject<'a>> {
+	deserialize_raw(raw, UniqueObject, name)
+}
+
+fn raw_field<'a>(
+	raw: &'a RawJsonValue,
+	field: &str,
+	name: &str,
+) -> Result<Option<&'a RawJsonValue>> {
+	deserialize_raw(raw, BorrowedField(field), name)
+}
+
+fn deserialize_raw<'a, D>(raw: &'a RawJsonValue, seed: D, name: &str) -> Result<D::Value>
+where
+	D: DeserializeSeed<'a>,
+{
+	let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+
+	seed.deserialize(&mut deserializer)
+		.and_then(|value| deserializer.end().map(|()| value))
+		.map_err(|error| err!(Database("Invalid {name} object in PDU event: {error}")))
+}
+
+/// Serializes `value` into raw JSON labeled as `U`.
+///
+/// `Raw<T, N>` has identical layout for every phantom `T` at fixed `N`.
+/// Callers must ensure that the serialized JSON is valid for `U`.
+#[inline]
+fn raw_as<T, U, const N: usize>(value: &T) -> Result<Raw<U, N>>
+where
+	T: Serialize,
+{
+	Raw::<T, N>::new(value)
+		.map(|raw| raw.cast_ref_unchecked::<U>().clone())
+		.map_err(Into::into)
+}
+
+#[inline]
+fn raw_of<T: Serialize>(value: &T) -> Result<Raw<JsonValue>> { raw_as(value) }

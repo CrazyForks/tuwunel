@@ -1,4 +1,4 @@
-use futures::{Stream, StreamExt, TryFutureExt, future::Either};
+use futures::{Stream, StreamExt, future::Either};
 use ruma::{
 	EventId, OwnedUserId, UserId,
 	api::Direction,
@@ -151,16 +151,16 @@ pub fn get_relations<'a>(
 	.map(move |count| (user_id, shortroomid, count))
 	.wide_filter_map(async |(user_id, shortroomid, count)| {
 		let pdu_id: RawPduId = PduId { shortroomid, count }.into();
-
-		self.services
+		let mut pdu = self
+			.services
 			.timeline
 			.get_pdu_from_id(&pdu_id)
-			.map_ok(move |mut pdu| {
-				pdu.remove_transaction_id_unless_sender(user_id);
-
-				(count, pdu)
-			})
 			.await
-			.ok()
+			.ok()?;
+
+		pdu.remove_transaction_id_unless_sender(user_id)
+			.ok()?;
+
+		Some((count, pdu))
 	})
 }

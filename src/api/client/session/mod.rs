@@ -106,7 +106,7 @@ pub(crate) async fn get_login_types_route(
 /// requests.
 ///
 /// - The user needs to authenticate using their password (or if enabled using a
-///   json web token)
+///   JSON Web Token)
 /// - If `device_id` is known: issues an additional access token for that device
 /// - If `device_id` is unknown: creates a new device
 /// - Returns access token that is associated with the user and device
@@ -114,13 +114,17 @@ pub(crate) async fn get_login_types_route(
 /// Note: You can use [`GET
 /// /_matrix/client/r0/login`](fn.get_supported_versions_route.html) to see
 /// supported login types.
-#[tracing::instrument(name = "login", skip_all, fields(%client, ?body.login_info))]
+#[tracing::instrument(
+	name = "login",
+	level = "debug",
+	skip_all,
+	fields(client = %client_ip),
+)]
 pub(crate) async fn login_route(
 	State(services): State<crate::State>,
-	ClientIp(client): ClientIp,
+	ClientIp(client_ip): ClientIp,
 	body: Ruma<login::v3::Request>,
 ) -> Result<login::v3::Response> {
-	// Validate login method
 	let user_id = match &body.login_info {
 		| LoginInfo::Password(info) if services.config.login_with_password =>
 			password::handle_login(&services, &body, info).await?,
@@ -130,30 +134,23 @@ pub(crate) async fn login_route(
 		| LoginInfo::ApplicationService(info) =>
 			appservice::handle_login(&services, &body, info)?,
 		| _ => {
-			return Err!(Request(Unknown(debug_warn!(
-				?body.login_info,
-				?body.json_body,
-				"Invalid or unsupported login type",
-			))));
+			return Err!(Request(Unknown(debug_warn!("Invalid or unsupported login type"))));
 		},
 	};
 
 	services.users.locked_check(&user_id).await?;
 
-	// Generate a new token for the device
 	let (access_token, expires_in) = services
 		.users
 		.generate_access_token(body.body.refresh_token);
 
-	// Generate a new refresh_token if requested by client
 	let refresh_token = expires_in.is_some().then(generate_refresh_token);
 
-	// Determine if device_id was provided and exists in the db for this user
 	let device_id = if let Some(device_id) = &body.device_id
 		&& services
 			.users
 			.all_device_ids(&user_id)
-			.ready_any(|v| v == device_id)
+			.ready_any(|existing_device_id| existing_device_id == device_id)
 			.await
 	{
 		services
@@ -177,7 +174,7 @@ pub(crate) async fn login_route(
 				(Some(&access_token), expires_in),
 				refresh_token.as_deref(),
 				body.initial_device_display_name.as_deref(),
-				Some(client),
+				Some(client_ip),
 			)
 			.await?
 	};
@@ -186,7 +183,7 @@ pub(crate) async fn login_route(
 
 	let home_server = services.server.name.clone().into();
 
-	// send client well-known if specified so the client knows to reconfigure itself
+	// Send client well-known information when configured, so the client can reconfigure itself.
 	let well_known: Option<DiscoveryInfo> = services
 		.config
 		.well_known

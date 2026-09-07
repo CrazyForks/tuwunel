@@ -48,27 +48,35 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 		return pruned;
 	}
 
-	let has_thread = pdu
-		.unsigned()
-		.is_some_and(|unsigned| unsigned.get().contains("m.thread"));
+	let has_thread = pdu.has_thread_bundle().log_err().unwrap_or(true);
 
 	if has_thread {
-		let participated = self
-			.services
-			.threads
-			.user_participated(pdu.event_id(), sender_user)
-			.await;
-
-		pdu.set_thread_participated(participated)
+		if pdu
+			.remove_thread_latest_transaction_id_unless_sender(sender_user)
 			.log_err()
-			.ok();
-
-		self.erase_thread_latest(sender_user, &mut pdu)
-			.await;
-
-		if self.services.server.config.bundle_edit_relations {
-			self.bundle_thread_latest_edit(sender_user, &mut pdu)
+			.is_err()
+		{
+			drop_thread_bundle(&mut pdu);
+		} else {
+			let participated = self
+				.services
+				.threads
+				.user_participated(pdu.event_id(), sender_user)
 				.await;
+
+			let participation = pdu
+				.set_thread_participated(participated)
+				.log_err();
+
+			if thread_result_or_drop(&mut pdu, participation).is_some() {
+				self.erase_thread_latest(sender_user, &mut pdu)
+					.await;
+
+				if self.services.server.config.bundle_edit_relations {
+					self.bundle_thread_latest_edit(sender_user, &mut pdu)
+						.await;
+				}
+			}
 		}
 	}
 
@@ -87,9 +95,11 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 			.state_accessor
 			.erased_for(sender_user, &replacement)
 			.await
+		&& replacement
+			.remove_transaction_id_unless_sender(Some(sender_user))
+			.log_err()
+			.is_ok()
 	{
-		replacement.remove_transaction_id_unless_sender(Some(sender_user));
-
 		pdu.set_replacement_bundle(&replacement.into_format())
 			.log_err()
 			.ok();
@@ -119,7 +129,9 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 async fn erase_thread_latest(&self, sender_user: &UserId, pdu: &mut Pdu) {
-	let Some((event_id, sender)) = pdu.thread_latest_event() else {
+	let identity = pdu.thread_latest_event().log_err();
+
+	let Some((event_id, sender)) = thread_result_or_drop(pdu, identity).flatten() else {
 		return;
 	};
 
@@ -127,21 +139,36 @@ async fn erase_thread_latest(&self, sender_user: &UserId, pdu: &mut Pdu) {
 		return;
 	}
 
-	let Ok(latest) = self.services.timeline.get_pdu(&event_id).await else {
+	let latest = self.services.timeline.get_pdu(&event_id).await;
+	let Some(latest) = thread_result_or_drop(pdu, latest) else {
 		return;
 	};
 
-	if let Some(pruned) = self
+	let Some(pruned) = self
 		.services
 		.state_accessor
 		.erased_view(sender_user, &latest)
 		.await
+	else {
+		return;
+	};
+
+	if pdu
+		.set_thread_latest_event(&pruned.into_format())
+		.log_err()
+		.is_err()
 	{
-		pdu.set_thread_latest_event(&pruned.into_format())
-			.log_err()
-			.ok();
+		drop_thread_bundle(pdu);
 	}
 }
+
+fn thread_result_or_drop<T, E>(pdu: &mut Pdu, result: Result<T, E>) -> Option<T> {
+	result
+		.inspect_err(|_| drop_thread_bundle(pdu))
+		.ok()
+}
+
+fn drop_thread_bundle(pdu: &mut Pdu) { pdu.remove_thread_bundle().log_err().ok(); }
 
 /// The thread module's aggregated `latest_event` (MSC3856): when the edit
 /// fold is enabled, the bundled latest reply carries its own newest
@@ -150,50 +177,67 @@ async fn erase_thread_latest(&self, sender_user: &UserId, pdu: &mut Pdu) {
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 async fn bundle_thread_latest_edit(&self, sender_user: &UserId, pdu: &mut Pdu) {
-	let Some((event_id, _)) = pdu.thread_latest_event() else {
+	let identity = pdu.thread_latest_event().log_err();
+
+	let Some((event_id, _)) = thread_result_or_drop(pdu, identity).flatten() else {
 		return;
 	};
 
-	let Ok(mut latest) = self.services.timeline.get_pdu(&event_id).await else {
+	let latest_event = self
+		.services
+		.timeline
+		.get_pdu(&event_id)
+		.await
+		.log_err();
+
+	let Some(mut latest_event) = thread_result_or_drop(pdu, latest_event) else {
 		return;
 	};
 
 	if self
 		.services
 		.state_accessor
-		.erased_for(sender_user, &latest)
+		.erased_for(sender_user, &latest_event)
 		.await
 	{
 		return;
 	}
 
-	let Some(mut replacement) = self.newest_replacement(&latest).await else {
+	let Some(mut replacement_event) = self.newest_replacement(&latest_event).await else {
 		return;
 	};
 
 	if self
 		.services
 		.state_accessor
-		.erased_for(sender_user, &replacement)
+		.erased_for(sender_user, &replacement_event)
 		.await
 	{
 		return;
 	}
 
-	replacement.remove_transaction_id_unless_sender(Some(sender_user));
-	latest.remove_transaction_id_unless_sender(Some(sender_user));
+	let sanitized = replacement_event
+		.remove_transaction_id_unless_sender(Some(sender_user))
+		.and_then(|()| latest_event.remove_transaction_id_unless_sender(Some(sender_user)))
+		.log_err();
 
-	if latest
-		.set_replacement_bundle(&replacement.into_format())
-		.log_err()
-		.is_err()
-	{
+	if thread_result_or_drop(pdu, sanitized).is_none() {
 		return;
 	}
 
-	pdu.set_thread_latest_event(&latest.into_format())
-		.log_err()
-		.ok();
+	let replacement = latest_event
+		.set_replacement_bundle(&replacement_event.into_format())
+		.log_err();
+
+	if thread_result_or_drop(pdu, replacement).is_none() {
+		return;
+	}
+
+	let latest = pdu
+		.set_thread_latest_event(&latest_event.into_format())
+		.log_err();
+
+	thread_result_or_drop(pdu, latest);
 }
 
 /// MSC3925: the newest `m.replace` edit of `parent` as a full event, or `None`
@@ -334,6 +378,8 @@ pub async fn ignored_thread_view(
 
 	let swap = root
 		.thread_latest_event()
+		.ok()
+		.flatten()
 		.is_some_and(|(_, sender)| ignored.contains(&sender));
 
 	let latest = match swap.then_some(latest).flatten() {
@@ -383,4 +429,61 @@ async fn redacted_root(&self, ignored: &BTreeSet<OwnedUserId>, root: &Pdu) -> Op
 		})
 		.await
 		.flatten()
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	#[test]
+	fn thread_latest_load_error_drops_bundle() {
+		let mut pdu: Pdu = serde_json::from_value(json!({
+			"type": "m.room.member",
+			"content": { "membership": "join" },
+			"event_id": "$member:example.com",
+			"room_id": "!room:example.com",
+			"sender": "@alice:example.com",
+			"state_key": "@alice:example.com",
+			"prev_events": ["$prev:example.com"],
+			"auth_events": ["$auth:example.com"],
+			"origin_server_ts": 1_838_188_000,
+			"depth": 12,
+			"hashes": { "sha256": "thishashcoversallfieldsincasethisisredacted" },
+			"unsigned": {
+				"age": 4612,
+				"m.relations": {
+					"m.replace": { "event_id": "$edit:example.com" },
+					"m.thread": { "count": 3 },
+				},
+			},
+		}))
+		.expect("test fixture should deserialize as a valid PDU");
+
+		let latest: Option<()> = thread_result_or_drop(&mut pdu, Err("missing latest event"));
+
+		assert!(latest.is_none(), "load failure returned a latest event");
+
+		let unsigned: serde_json::Value = serde_json::from_str(
+			pdu.unsigned
+				.as_ref()
+				.expect("sibling unsigned data should remain")
+				.json()
+				.get(),
+		)
+		.expect("remaining unsigned data should be valid JSON");
+
+		assert!(
+			unsigned["m.relations"].get("m.thread").is_none(),
+			"failed load retained the thread bundle",
+		);
+
+		assert_eq!(
+			unsigned["m.relations"]["m.replace"],
+			json!({ "event_id": "$edit:example.com" }),
+			"failed load removed a sibling relation",
+		);
+		assert_eq!(unsigned["age"], 4612, "failed load removed outer unsigned data");
+	}
 }
