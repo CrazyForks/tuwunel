@@ -6,7 +6,7 @@
 
 use std::{cmp::Ordering, time::Duration};
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use ruma::{OwnedUserId, ServerName, UserId};
 use tokio::time::sleep;
 use tuwunel_core::{
@@ -14,7 +14,7 @@ use tuwunel_core::{
 	itertools::Itertools,
 	result::NotFound,
 	smallstr::SmallString,
-	utils::{BoolExt, ReadyExt},
+	utils::{BoolExt, ReadyExt, TryReadyExt},
 	warn,
 };
 use tuwunel_database::Deserialized;
@@ -420,23 +420,36 @@ async fn warn_forbidden_names(services: &Services) -> Result {
 		services
 			.users
 			.stream()
-			.filter(|user_id| services.users.is_active_local(user_id))
-			.ready_filter_map(|user_id| {
+			.map(|user_id| {
+				services
+					.server
+					.check_running()
+					.map(|()| user_id.to_owned())
+			})
+			.try_filter_map(async |user_id| {
+				Ok(services
+					.users
+					.is_active_local(&user_id)
+					.await
+					.then_some(user_id))
+			})
+			.ready_try_filter_map(|user_id| {
 				let patterns = &services.config.forbidden_usernames;
 				let matches = patterns.matches(user_id.localpart());
-				let matched = matches
+				let matched_patterns = matches
 					.iter()
-					.map(|x| &patterns.patterns()[x])
+					.map(|pattern_index| &patterns.patterns()[pattern_index])
 					.join(", ");
 
-				matches
+				Ok(matches
 					.matched_any()
-					.then_some((user_id, matched))
+					.then_some((user_id, matched_patterns)))
 			})
-			.ready_for_each(|(user_id, matched)| {
-				warn!("User {user_id} matches forbidden username patterns: {matched:#?}");
+			.ready_try_for_each(|(user_id, matched_patterns)| {
+				warn!("User {user_id} matches forbidden username patterns: {matched_patterns}");
+				Ok(())
 			})
-			.await;
+			.await?;
 	}
 
 	services.server.check_running()?;
@@ -452,31 +465,40 @@ async fn warn_forbidden_names(services: &Services) -> Result {
 			.iter_ids()
 			.map(|room_id| {
 				services
+					.server
+					.check_running()
+					.map(|()| room_id.to_owned())
+			})
+			.try_for_each(async |room_id| {
+				services
 					.alias
-					.local_aliases_for_room(room_id)
-					.map(move |alias| (room_id, alias))
-			})
-			.flatten()
-			.ready_filter_map(|(room_id, room_alias)| {
-				let patterns = &services.config.forbidden_alias_names;
-				let matches = patterns.matches(room_alias.alias());
-				let matched = matches
-					.iter()
-					.map(|x| &patterns.patterns()[x])
-					.join(", ");
+					.local_aliases_for_room(&room_id)
+					.map(|room_alias| {
+						services
+							.server
+							.check_running()
+							.map(|()| room_alias)
+					})
+					.ready_try_for_each(|room_alias| {
+						let patterns = &services.config.forbidden_alias_names;
+						let matches = patterns.matches(room_alias.alias());
+						let matched_patterns = matches
+							.iter()
+							.map(|pattern_index| &patterns.patterns()[pattern_index])
+							.join(", ");
 
-				matches
-					.matched_any()
-					.then_some((room_id, room_alias, matched))
+						if matches.matched_any() {
+							warn!(
+								"Room {room_id} with alias {room_alias} matches the following \
+								 forbidden alias name patterns: {matched_patterns}"
+							);
+						}
+
+						Ok(())
+					})
+					.await
 			})
-			.ready_for_each(|(room_id, room_alias, matched)| {
-				warn!(
-					"Room {room_id} with alias {room_alias} matches the following forbidden \
-					 room name patterns: {matched}"
-				);
-			})
-			.boxed()
-			.await;
+			.await?;
 	}
 
 	Ok(())
