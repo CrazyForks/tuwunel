@@ -83,11 +83,15 @@ pub fn get_server(&self) -> Result<&Server> {
 /// Cap on the rate-limit table; fully refilled buckets are pruned past it.
 const RATELIMIT_MAP_CAP: usize = 1 << 16;
 
+#[cfg(test)]
+mod tests;
+
 /// Always-on throttle for the RFC 8628 device user-code endpoints. The
 /// `user_code` is low-entropy by design (§6.1), so §5.1 requires bounding
 /// guesses regardless of the optional `oidc_rc_*` knobs; the burst stays
 /// generous for the one code a real user enters.
 const DEVICE_RC_PER_SECOND: f64 = 1.0;
+/// Generous allowance for the one code a real user enters.
 const DEVICE_RC_BURST: f64 = 60.0;
 
 /// Shared per-client-IP token-bucket throttle for the OIDC endpoints. A no-op
@@ -113,19 +117,45 @@ pub fn check_device_rate_limit(&self, client: IpAddr) -> Result {
 }
 
 fn check_bucket(table: &Ratelimiter, client: IpAddr, rate: f64, burst: f64) -> Result {
-	let now = Instant::now();
-	let mut buckets = table.lock()?;
+	check_bucket_at(table, client, rate, burst, Instant::now(), RATELIMIT_MAP_CAP)
+}
 
-	// A fully refilled bucket equals an absent one; prune those past the cap so
-	// a source-address spray cannot grow the table without bound.
-	if buckets.len() >= RATELIMIT_MAP_CAP {
-		buckets.retain(|_, bucket| {
-			let (last, toks) = *bucket;
-			now.duration_since(last)
+fn check_bucket_at(
+	table: &Ratelimiter,
+	client: IpAddr,
+	rate: f64,
+	burst: f64,
+	now: Instant,
+	cap: usize,
+) -> Result {
+	let mut buckets = table.lock()?;
+	debug_assert!(cap > 0, "rate-limit table cap must be positive");
+	debug_assert!(buckets.len() <= cap, "rate-limit table exceeded its cap");
+
+	if buckets.len() >= cap && !buckets.contains_key(&client) {
+		let mut oldest = None;
+
+		buckets.retain(|client, bucket| {
+			let (last_time, tokens) = *bucket;
+			let refilled = now
+				.duration_since(last_time)
 				.as_secs_f64()
-				.mul_add(rate, toks)
-				< burst
+				.mul_add(rate, tokens);
+
+			let retain = refilled < burst;
+
+			if retain && oldest.is_none_or(|(_, oldest_at)| last_time < oldest_at) {
+				oldest = Some((*client, last_time));
+			}
+
+			retain
 		});
+
+		if buckets.len() >= cap
+			&& let Some((oldest, _)) = oldest
+		{
+			buckets.remove(&oldest);
+		}
 	}
 
 	let (last_time, tokens) = buckets
