@@ -29,14 +29,14 @@
 
 | ✅ `yes` | 🟨 `part` | ❌ `no` | ⬛ `n/a` | total |
 |---:|---:|---:|---:|---:|
-| 253 | 56 | 436 | 330 | 1075 |
+| 254 | 55 | 436 | 330 | 1075 |
 
 ### Status by inventory bucket
 
 | Inv | yes | part | no | n/a | total |
 |---|---|---|---|---|---|
 | merged | 181 | 15 | 12 | 60 | 268 |
-| open | 41 | 29 | 337 | 198 | 605 |
+| open | 42 | 28 | 337 | 198 | 605 |
 | closed | 31 | 12 | 87 | 72 | 202 |
 
 ## Merged
@@ -87,14 +87,14 @@ in the [Out of scope](#out-of-scope) section.
 | MSC4156 | ✅ ● | 100/100 | Migrate `server_name` to `via` | via parameter handled via Ruma |
 | MSC4151 | ✅ ● | 100/100 | Reporting rooms (Client-Server API) | POST /rooms/{roomId}/report implemented and routed |
 | MSC4138 | ✅ ● | 100/100 | Update allowed HTTP methods in CORS responses | CORS METHODS list includes HEAD and PATCH; excludes CONNECT/TRACE |
-| MSC4133 | ✅ ● | 85/95 | Extending User Profile API with Custom Key:Value Pairs | endpoints + caps/errcodes; unset legacy 200 omit by choice, 404 key-scoped |
+| MSC4133 | ✅ ● | 90/100 | Extending User Profile API with Custom Key:Value Pairs | endpoints + caps/errcodes; unset legacy 200 omit by choice, 404 key-scoped |
 | MSC4127 | ❌ ● | 0/0 | Removal of query string auth | src/api/router/auth.rs:78 still falls back to request.query.access_token |
 | MSC4126 | ✅ ● | 100/100 | Deprecation of query string auth | deprecation of query string auth; server still accepts both |
-| MSC4115 | ✅ ● | 95/85 | membership metadata on events | src/core/matrix/pdu/unsigned.rs add_membership; src/service/rooms/state_acces... |
+| MSC4115 | ✅ ● | 100/100 | membership metadata on events | src/core/matrix/pdu/unsigned.rs add_membership; src/service/rooms/state_acces... |
 | MSC4041 | ✅ ◐ | 90/90 | Use http header Retry-After to enable library-assisted retry handling | Ruma error type emits Retry-After header for LimitExceeded responses. |
 | MSC4040 | ✅ ● | 100/100 | Update SRV service name to IANA registration | Tuwunel queries _matrix-fed first then falls back to _matrix. |
 | MSC4026 | ✅ ◐ | 80/90 | Allow /versions to optionally accept authentication | versions endpoint accepts optional auth via Ruma |
-| MSC4025 | ✅ ● | 85/85 | Local user erasure requests | phase B landed: erased senders serve pruned to clients and federation |
+| MSC4025 | ✅ ● | 95/100 | Local user erasure requests | phase B landed: erased senders serve pruned to clients and federation |
 | MSC4010 | ✅ ● | 100/100 | Push rules and account data | m.push_rules and m.fully_read rejected on /account_data |
 | MSC4009 | ✅ ● | 100/100 | Expanding the Matrix ID grammar to enable E.164 IDs | E.164 + character allowed via Ruma localpart validation |
 | MSC3989 | ✅ ● | 100/100 | Redact `origin` property on events | V11 redaction drops origin via Ruma RedactionRules |
@@ -110,7 +110,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC3939 | ✅ ● | 90/90 | Account locking | Login gate landed; /refresh and OIDC token paths still mint for locked accounts |
 | MSC3938 | ✅ ● | 100/100 | Remove deprecated `keyId` parameters from `/keys` endpoints | only the keyless /key/v2/server is routed; no notary /query left to change |
 | MSC3930 | ✅ ● | 100/100 | Polls push rules/notifications | Default poll push rules via ruma server_default; seeded at registration |
-| MSC3925 | 🟨 ◐ | 75/85 | m.replace aggregation with full event | Full m.replace bundle; gated default-off; typed index, ts-ordered selection |
+| MSC3925 | 🟨 ◐ | 85/85 | m.replace aggregation with full event | Full m.replace bundle; gated default-off; typed index, ts-ordered selection |
 | MSC3916 | ✅ ● | 90/100 | Authentication for media access, and new endpoint names | New /client/v1/media and /federation/v1/media auth endpoints implemented. |
 | MSC3905 | ✅ ● | 100/100 | Application services should only be interested in local users | src/service/appservice/append.rs:66; local-user guard at the three event-inte... |
 | MSC3904 | ✅ ● | 100/100 | Room version 10 as the default room version | default_room_version is v11, at or above the v10 the MSC suggests |
@@ -263,8 +263,8 @@ for spec compliance.
 
 | MSC | Status | Impl | Spec | Title | Note |
 |---|---|---:|---:|---|---|
+| MSC3925 | 🟨 ◐ | 85/85 | 1.7 | m.replace aggregation with full event | Full m.replace bundle; gated default-off; typed index, ts-ordered selection |
 | MSC2265 | 🟨 ● | 75/100 | 1.1 | Proposal for mandating case folding when processing e-mail addresses | HS case-folds whole email (ss-fold) before storage; IS migration out of scope |
-| MSC3925 | 🟨 ◐ | 75/85 | 1.7 | m.replace aggregation with full event | Full m.replace bundle; gated default-off; typed index, ts-ordered selection |
 | MSC4178 | 🟨 ● | 75/90 | 1.13 | Error codes for requestToken | msisdn returns M_THREEPID_MEDIUM_NOT_SUPPORTED; bad email returns M_INVALID_P... |
 | MSC2409 | 🟨 ● | 70/70 | 1.13 | Proposal to send typing, presence and receipts to appservices | typing+receipt EDUs sent to AS; presence not forwarded |
 | MSC3970 | 🟨 ◐ | 70/80 | 1.7 | Scope transaction IDs to devices | txn key is user, device, txn with no path; redact untracked; echo user scoped |
@@ -470,7 +470,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC4152 | ❌ ● | 0/0 | Room labeling and filtering | room labels and /rooms/{roomId}/labels not implemented |
 | MSC4149 | 🟨 ◐ | 80/80 | Update CSP Directives for Media Repository | global CSP aligns with MSC; missing font-src and script-src 'none' |
 | MSC4145 | ❌ ● | 0/0 | Simple verified accounts | m.verified profile field and endpoint not implemented |
-| MSC4143 | 🟨 ◐ | 50/60 | MatrixRTC | GET rtc/transports served; slots and sticky membership are client and MSC4354 |
+| MSC4143 | 🟨 ◐ | 60/60 | MatrixRTC | GET rtc/transports served; slots and sticky membership are client and MSC4354 |
 | MSC4141 | ❌ ● | 0/0 | Time based notification filtering | time_and_day push rule condition not supported |
 | MSC4140 | ❌ ● | 0/0 | Cancellable delayed events | No delayed_event routes, no m.delayed_events capability, no delay_id anywhere |
 | MSC4136 | ❌ ● | 0/0 | Shared retry hints between servers | retry_hints in /send_join response not implemented |
@@ -480,7 +480,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC4120 | ❌ ● | 0/0 | Allow `HEAD` on `/download` | HEAD on /download not wired; routes mounted via Ruma metadata GET only |
 | MSC4117 | ❌ ● | 0/0 | Reinstating Events (Reversible Redactions) | m.room.reinstate (reversible redactions) not implemented |
 | MSC4109 | ❌ ● | 0/0 | Appservices &amp; soft-failed events | appservice v2/transactions endpoint with soft-failed events absent |
-| MSC4108 | ✅ ● | 90/90 | Mechanism to allow OAuth 2.0 API sign in and E2EE set up via QR code | Device-authorization login served; secure channel now delegated to MSC4388 |
+| MSC4108 | ✅ ● | 100/100 | Mechanism to allow OAuth 2.0 API sign in and E2EE set up via QR code | src/api/oidc/device.rs:169 serves native or IdP approval; transports complete |
 | MSC4106 | ❌ ● | 0/0 | Join as Muted | join-as-muted default_membership not implemented |
 | MSC4104 | ❌ ● | 0/0 | Auth Lock: Soft-failure-be-gone! | m.auth_lock event and auth-rule not implemented |
 | MSC4103 | ❌ ◐ | 0/0 | Make threaded read receipts opt-in in /sync | threaded_read_receipts sync filter not implemented |
@@ -538,8 +538,8 @@ in the [Out of scope](#out-of-scope) section.
 | MSC3994 | ❌ ● | 0/0 | Display why an event caused a notification | rule_kind/rule_id not added to /notifications |
 | MSC3993 | ❌ ● | 0/0 | Room takeover | room takeover variants not implemented |
 | MSC3991 | ❌ ● | 0/0 | Power level up! Taking the room to new heights | raise own power level above max not allowed |
-| MSC3984 | 🟨 ● | 75/80 | Sending key queries to appservices | src/api/client/keys/get_keys.rs:178 appservice device overlay; no cross-signi... |
-| MSC3983 | ✅ ● | 85/100 | Sending One-Time Key (OTK) claims to appservices | src/api/client/keys/claim_keys.rs:92 local OTK, appservice, fallback; interes... |
+| MSC3984 | ✅ ● | 80/90 | Sending key queries to appservices | src/api/client/keys/get_keys.rs:178 appservice device overlay; no cross-signi... |
+| MSC3983 | ✅ ● | 90/100 | Sending One-Time Key (OTK) claims to appservices | src/api/client/keys/claim_keys.rs:92 local OTK, appservice, fallback; interes... |
 | MSC3982 | ❌ ● | 0/0 | Limit maximum number of events sent to an AS | no 100-event cap on appservice transactions |
 | MSC3964 | ❌ ● | 0/0 | Notifications for room tags | room_tag push condition not implemented |
 | MSC3963 | ❌ ● | 0/0 | Oblivious Matrix over HTTPS | Oblivious MoH endpoints absent |
