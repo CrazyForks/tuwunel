@@ -170,19 +170,27 @@ natural follow-up.
 
 ##### In CI
 
-CI carries an `Interop (synapse)` job that reuses the homogeneous run's
-`complement-tester` and `complement-testee` images and runs them against the
-published Synapse image as `hs2`. Because the run is report-only it never gates
-the pipeline; its outcome is the per-run step summary plus the uploaded
-`complement_interop_*` artifacts. It is off by default and runs only when
-requested, either way:
+CI carries two interop jobs, both reusing the homogeneous run's
+`complement-tester` and `complement-testee` images. `Interoperability (synapse)`
+runs them against the published Synapse image as `hs2`;
+`Interoperability Inverted (synapse)` swaps the roles so Synapse drives as `hs1`
+and Tuwunel answers as `hs2`, exercising the responder side. The peer name in
+both titles comes from `complement_interop_peer`, which defaults to `synapse`.
+Because the runs are report-only they never gate the pipeline; their outcome is
+the per-run step summary plus the uploaded `complement_interop_*` artifacts.
 
-- put `[ci interop]` in the commit message of a pushed branch, or
-- dispatch the `Main` workflow with `enable_test_interop` set (and optionally
-  `interop_run` to narrow the selector).
+**Both run by default, on every pipeline.** The `Main` workflow exposes
+`enable_test_complement_interop` and `enable_test_complement_interop_inverse` as
+dispatch inputs, plus `complement_interop_run` to narrow the selector. Those two
+inputs are declared `default: false`, but the default is **inert**: they are
+consumed as `fromJSON(inputs.<name> || 'true')`, and a false boolean is falsy in
+a GitHub expression, so the `|| 'true'` branch is taken whether the box is ticked
+or not. There is no commit-message directive for interop.
 
-The job builds on the same `complement` images, so it does not run when the
-Complement stage is disabled.
+To actually skip them, disable the Complement stage: both jobs additionally
+require `enable_complement` and `enable_complement_debug`, so neither runs when
+Complement is off. The inverted job also requires the forward job's
+`enable_complement_interop`, so it cannot run alone.
 
 ##### Known limitation: blueprint construction
 
