@@ -386,68 +386,42 @@ fn handle_federation_error(mxc: &Mxc<'_>, server: Option<&ServerName>, error: Er
 	error
 }
 
+/// Fetches a thumbnail from the origin server over the legacy media API.
+///
+/// The dimension the origin is asked for is the dimension its answer is filed
+/// under, and every later lookup normalizes before it seeks, so the two have
+/// to agree or nothing cached on one request is found on the next. A request
+/// too large for any thumbnail size normalizes to the original file, which is
+/// fetched rather than asked for at a dimension that is not a size.
 #[implement(super::Service)]
-#[expect(deprecated)]
 pub async fn fetch_remote_thumbnail_legacy(
 	&self,
-	body: &media::get_content_thumbnail::v3::Request,
-) -> Result<media::get_content_thumbnail::v3::Response> {
-	use media::get_content_thumbnail::v3::Response;
+	mxc: &Mxc<'_>,
+	timeout_ms: Duration,
+	dim: &Dim,
+	animate: Animate,
+) -> Result<Media> {
+	self.check_legacy_freeze()?;
+	self.check_fetch_authorized(mxc)?;
 
-	let mxc = Mxc {
-		server_name: &body.server_name,
-		media_id: &body.media_id,
+	let dim = dim.normalized();
+
+	// both helpers cache what they fetch, so a picture the request forbids is
+	// kept beside the still derived from it rather than shadowed by it later
+	let fetched = match dim.is_original() {
+		| true =>
+			self.fetch_content_unauthenticated(mxc, None, timeout_ms)
+				.await?,
+		| false =>
+			self.fetch_thumbnail_unauthenticated(mxc, None, timeout_ms, &dim, animate)
+				.await?,
 	};
 
-	self.check_legacy_freeze()?;
-	self.check_fetch_authorized(&mxc)?;
-	let response = self
-		.services
-		.federation
-		.execute(mxc.server_name, media::get_content_thumbnail::v3::Request {
-			allow_remote: body.allow_remote,
-			height: body.height,
-			width: body.width,
-			method: body.method.clone(),
-			server_name: body.server_name.clone(),
-			media_id: body.media_id.clone(),
-			timeout_ms: body.timeout_ms,
-			allow_redirect: body.allow_redirect,
-			animated: body.animated,
-		})
-		.await?;
-
-	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
-	let animate = Animate::from(body.animated);
-
-	if animate.accepts_picture(&response.file) {
-		let content_type = stored_type(&response.file, response.content_type.as_deref());
-
-		self.upload_thumbnail(&mxc, None, content_type, &dim, &response.file)
-			.await?;
-
-		return Ok(response);
+	if animate.accepts_picture(&fetched.content) {
+		return Ok(fetched);
 	}
 
-	// this arm hands the bytes straight to the client, so a peer that ignored
-	// the parameter is repaired here rather than cached as the answer
-	let fetched = Media {
-		content: response.file,
-		content_type: response.content_type.map(Into::into),
-		content_disposition: response.content_disposition,
-	};
-
-	let still = self
-		.store_still(&mxc, &dim.normalized(), fetched)
-		.await?;
-
-	Ok(Response {
-		file: still.content,
-		content_type: still.content_type.map(Into::into),
-		content_disposition: still.content_disposition,
-		cross_origin_resource_policy: response.cross_origin_resource_policy,
-		cache_control: response.cache_control,
-	})
+	self.store_still(mxc, &dim, fetched).await
 }
 
 #[implement(super::Service)]

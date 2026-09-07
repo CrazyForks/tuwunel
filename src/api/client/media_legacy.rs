@@ -8,8 +8,9 @@ use reqwest::Url;
 use ruma::{
 	Mxc,
 	api::client::media::{
-		get_content, get_content_as_filename, get_content_thumbnail, get_media_config,
-		get_media_preview,
+		get_content, get_content_as_filename,
+		get_content_thumbnail::{self, v3::Response as ThumbnailResponse},
+		get_media_config, get_media_preview,
 	},
 };
 use tuwunel_core::{
@@ -268,9 +269,10 @@ pub(crate) async fn get_content_thumbnail_legacy_route(
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
 	let animate = Animate::from(body.animated);
+	let ours = services.globals.server_is_ours(&body.server_name);
 
 	if body.allow_redirect
-		&& services.globals.server_is_ours(&body.server_name)
+		&& ours
 		&& let Some(url) = services
 			.media
 			.redirect_url(&mxc, &dim, animate)
@@ -279,59 +281,38 @@ pub(crate) async fn get_content_thumbnail_legacy_route(
 		return Ok(Redirect::temporary(url.as_str()).into_response());
 	}
 
-	match services
+	let Media {
+		content,
+		content_type,
+		content_disposition,
+	} = match services
 		.media
 		.get_thumbnail(&mxc, &dim, animate, Some(body.timeout_ms))
 		.await
 	{
-		| Ok(Media {
-			content,
-			content_type,
-			content_disposition,
-		}) => {
-			let content_disposition = make_content_disposition(
-				content_disposition.as_ref(),
-				content_type.as_deref(),
-				None,
-			);
+		| Ok(media) => media,
+		| Err(e) if ours || !body.allow_remote => return Err(e),
+		| Err(_) => services
+			.media
+			.fetch_remote_thumbnail_legacy(&mxc, body.timeout_ms, &dim, animate)
+			.await
+			.map_err(|e| {
+				err!(Request(NotFound(debug_warn!(%mxc, ?e, "Fetching media failed"))))
+			})?,
+	};
 
-			let response = get_content_thumbnail::v3::Response {
-				file: content,
-				content_type: content_type.map(Into::into),
-				cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
-				cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
-				content_disposition: Some(content_disposition),
-			};
+	// the served type may not be the one the stored disposition was computed
+	// against, since a relabelled row is served under its container's type
+	let content_disposition =
+		make_content_disposition(content_disposition.as_ref(), content_type.as_deref(), None);
 
-			Ok(RumaResponse(response).into_response())
-		},
-		| Err(e) =>
-			if !services.globals.server_is_ours(&body.server_name) && body.allow_remote {
-				let response = services
-					.media
-					.fetch_remote_thumbnail_legacy(&body)
-					.await
-					.map_err(|e| {
-						err!(Request(NotFound(debug_warn!(%mxc, "Fetching media failed: {e:?}"))))
-					})?;
+	let response = ThumbnailResponse {
+		file: content,
+		content_type: content_type.map(Into::into),
+		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
+		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
+		content_disposition: Some(content_disposition),
+	};
 
-				let content_disposition = make_content_disposition(
-					response.content_disposition.as_ref(),
-					response.content_type.as_deref(),
-					None,
-				);
-
-				let response = get_content_thumbnail::v3::Response {
-					file: response.file,
-					content_type: response.content_type,
-					cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
-					cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
-					content_disposition: Some(content_disposition),
-				};
-
-				Ok(RumaResponse(response).into_response())
-			} else {
-				Err(e)
-			},
-	}
+	Ok(RumaResponse(response).into_response())
 }

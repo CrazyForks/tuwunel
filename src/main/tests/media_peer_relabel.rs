@@ -36,12 +36,9 @@ use axum::{
 use axum_server::{from_tcp_rustls, tls_rustls::RustlsConfig};
 use tokio::spawn;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
-// the endpoint is deprecated, and that it still writes a row is the case here
-#[expect(deprecated)]
-use tuwunel_core::ruma::api::client::media::get_content_thumbnail::v3::Request as LegacyRequest;
 use tuwunel_core::{
 	Err, Result, err,
-	ruma::{Mxc, OwnedUserId, ServerName, UInt, UserId, media::Method},
+	ruma::{Mxc, OwnedUserId, ServerName, UserId},
 };
 use tuwunel_service::{
 	Services,
@@ -92,6 +89,12 @@ const MEDIA_ID: &str = "peermislabelledthumbnailmediaid0";
 
 const LEGACY_MEDIA_ID: &str = "peermislabelledlegacythumbnailid";
 
+const LEGACY_BUCKET_MEDIA_ID: &str = "peerlegacybucketthumbnailid00000";
+
+const LEGACY_OVERSIZED_MEDIA_ID: &str = "peerlegacyoversizedthumbnailid00";
+
+const LEGACY_WITHHELD_MEDIA_ID: &str = "peerlegacywithheldmediaid0000000";
+
 const OVERSIZED_MEDIA_ID: &str = "peeroversizedthumbnailmediaid000";
 
 const WITHHELD_MEDIA_ID: &str = "peeroversizedwithheldmediaid0000";
@@ -112,8 +115,12 @@ static ANSWERED: AtomicUsize = AtomicUsize::new(0);
 /// that a request naming the original file went after one.
 static DOWNLOADED: AtomicUsize = AtomicUsize::new(0);
 
-/// Path segment the authenticated media download endpoint carries.
-const DOWNLOAD: &str = "/media/download/";
+/// Path segment a media download endpoint carries, on either API.
+///
+/// Both APIs spell the segment identically and neither thumbnail endpoint
+/// carries it, so one match tells an original apart from a thumbnail whichever
+/// half of the stub answered.
+const DOWNLOAD: &str = "/download/";
 
 /// Query the peer was last asked with.
 ///
@@ -177,12 +184,7 @@ fn a_peers_mislabelled_thumbnail_is_cached_under_its_container() -> Result {
 	let result = runtime.block_on(async {
 		let services = async_start(&server).await?;
 		let stub = spawn(serve_peer(listener, certificate, private_key));
-		let outcome = exercise(&services, &peer)
-			.await
-			.and(exercise_legacy(&services, &peer).await)
-			.and(exercise_oversized(&services, &peer).await)
-			.and(exercise_withheld(&services, &peer).await)
-			.and(exercise_bucket(&services, &peer).await);
+		let outcome = exercises(&services, &peer).await;
 
 		// a stub that never started reaches the caller only as a peer that did
 		// not answer, so its own error is reported in place of that symptom
@@ -238,15 +240,7 @@ async fn serve_peer(listener: TcpListener, certificate: PathBuf, private_key: Pa
 /// reaching anything this covers. This is the half that counts its requests,
 /// since the authenticated endpoints are the ones a repeat would return to.
 async fn authenticated(uri: Uri) -> impl IntoResponse {
-	ANSWERED.fetch_add(1, Ordering::Relaxed);
-
-	if uri.path().contains(DOWNLOAD) {
-		DOWNLOADED.fetch_add(1, Ordering::Relaxed);
-	}
-
-	if let Ok(mut asked) = ASKED_QUERY.lock() {
-		*asked = uri.query().unwrap_or_default().to_owned();
-	}
+	record(&uri);
 
 	let head = format!(
 		"\r\n--{BOUNDARY}\r\ncontent-type: \
@@ -269,9 +263,48 @@ async fn authenticated(uri: Uri) -> impl IntoResponse {
 ///
 /// The unauthenticated endpoint predates the multipart envelope, so the
 /// picture is the whole body and the type it is declared under is a header.
-async fn legacy() -> impl IntoResponse { ([(CONTENT_TYPE, DECLARED)], GIF) }
+async fn legacy(uri: Uri) -> impl IntoResponse {
+	record(&uri);
 
-async fn exercise(services: &Services, peer: &ServerName) -> Result {
+	([(CONTENT_TYPE, DECLARED)], GIF)
+}
+
+/// Records what the peer was asked for, whichever endpoint answered it.
+///
+/// The two media APIs differ in the shape of an answer but not in what a
+/// request has to prove, so one set of tallies serves both and an exercise
+/// reads its own delta against a baseline it takes first.
+fn record(uri: &Uri) {
+	ANSWERED.fetch_add(1, Ordering::Relaxed);
+
+	if uri.path().contains(DOWNLOAD) {
+		DOWNLOADED.fetch_add(1, Ordering::Relaxed);
+	}
+
+	if let Ok(mut asked) = ASKED_QUERY.lock() {
+		asked.clear();
+		asked.push_str(uri.query().unwrap_or_default());
+	}
+}
+
+/// Every exercise in order, stopping at the first one that fails.
+///
+/// A leg that runs after a failure cannot change the verdict, and each is a
+/// federation fetch carrying the full timeout, so a stub that has died would
+/// otherwise cost one timeout per remaining leg before the real error is
+/// reported.
+async fn exercises(services: &Services, peer: &ServerName) -> Result {
+	exercise_authenticated(services, peer).await?;
+	exercise_legacy(services, peer).await?;
+	exercise_legacy_bucket(services, peer).await?;
+	exercise_legacy_oversized(services, peer).await?;
+	exercise_legacy_withheld(services, peer).await?;
+	exercise_oversized(services, peer).await?;
+	exercise_withheld(services, peer).await?;
+	exercise_bucket(services, peer).await
+}
+
+async fn exercise_authenticated(services: &Services, peer: &ServerName) -> Result {
 	let mxc = Mxc { server_name: peer, media_id: MEDIA_ID };
 
 	let dim = Dim::new(96, 96, None);
@@ -312,6 +345,9 @@ async fn exercise(services: &Services, peer: &ServerName) -> Result {
 }
 
 /// Requests the peer has answered since a baseline.
+///
+/// The tallies are process-wide and every exercise adds to them, so a count
+/// means nothing except against a baseline its own caller took first.
 fn asked(before: usize) -> usize {
 	ANSWERED
 		.load(Ordering::Relaxed)
@@ -359,12 +395,12 @@ fn fixture_user(services: &Services) -> Result<OwnedUserId> {
 		.map_err(Into::into)
 }
 
-/// The same claim over the legacy endpoint, which is a second write.
+/// The same claim over the legacy endpoint, which is a second transport.
 ///
-/// This one answers the caller with the row it just stored rather than with
-/// the peer's own bytes, so the declared type is not relayed and the stored
-/// one is the only thing to assert.
-#[expect(deprecated)]
+/// The two media APIs differ in how an answer is framed rather than in what
+/// files it, since both store through the one handler. What this covers is the
+/// bare-body shape reaching that handler, so the row left behind is the whole
+/// assertion.
 async fn exercise_legacy(services: &Services, peer: &ServerName) -> Result {
 	let mxc = Mxc {
 		server_name: peer,
@@ -372,22 +408,15 @@ async fn exercise_legacy(services: &Services, peer: &ServerName) -> Result {
 	};
 
 	let dim = Dim::new(96, 96, None);
-	let request = LegacyRequest {
-		server_name: peer.to_owned(),
-		media_id: LEGACY_MEDIA_ID.to_owned(),
-		method: Some(Method::Scale),
-		width: UInt::from(96_u32),
-		height: UInt::from(96_u32),
-		allow_remote: true,
-		timeout_ms: TIMEOUT,
-		allow_redirect: false,
-		animated: Some(true),
-	};
 
 	services
 		.media
-		.fetch_remote_thumbnail_legacy(&request)
+		.fetch_remote_thumbnail_legacy(&mxc, TIMEOUT, &dim, Animate::Allowed)
 		.await?;
+
+	// the 96x96 rung crops where the request asked to scale, and the row key
+	// holds no method, so what shape the peer returns has to be ours to choose
+	asked_with(96, 96, "crop")?;
 
 	let stored = services
 		.media
@@ -401,6 +430,136 @@ async fn exercise_legacy(services: &Services, peer: &ServerName) -> Result {
 	}
 
 	Ok(())
+}
+
+/// The legacy endpoint asks at the bucket it will file the answer under.
+///
+/// This path reaches the peer only once the route's own lookup has missed, so
+/// a row filed where that lookup cannot read it is a fetch on every request
+/// rather than a slow first one. Asking at the size the client named did
+/// exactly that, and the lookup succeeding afterwards is what says it no
+/// longer does.
+async fn exercise_legacy_bucket(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: LEGACY_BUCKET_MEDIA_ID,
+	};
+
+	// 100x100 takes the 320x240 bucket, so raw and normalized differ
+	let dim = Dim::new(100, 100, None);
+
+	services
+		.media
+		.fetch_remote_thumbnail_legacy(&mxc, TIMEOUT, &dim, Animate::Allowed)
+		.await?;
+
+	asked_with(320, 240, "scale")?;
+
+	services
+		.media
+		.get_stored_thumbnail(&mxc, &dim, Animate::Allowed)
+		.await
+		.map(drop)
+}
+
+/// Fails unless the peer's last request named this bucket.
+///
+/// A lookup finding the row afterwards says the ask and the file agreed,
+/// never which one they agreed on, so this is what separates asking at the
+/// bucket from filing under it while still asking at the size a client named.
+/// The method is asserted beside the size because the row key holds neither.
+fn asked_with(width: u32, height: u32, method: &str) -> Result {
+	let Ok(asked) = ASKED_QUERY.lock() else {
+		return Err!("the query the peer was asked with is poisoned");
+	};
+
+	let named =
+		[format!("width={width}"), format!("height={height}"), format!("method={method}")]
+			.iter()
+			.all(|term| asked.contains(term));
+
+	named.then_some(()).ok_or_else(|| {
+		err!("the peer was asked with {:?}, expected {method} {width}x{height}", *asked)
+	})
+}
+
+/// The legacy endpoint for a request that forbids animation, which is most.
+///
+/// An absent parameter forbids exactly as an explicit false does, so this is
+/// the ordinary shape rather than a corner, and it is the only one reaching
+/// the re-encode arm through this transport. The peer answers every request
+/// with an animation, so the still it is served proves the repair ran.
+async fn exercise_legacy_withheld(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: LEGACY_WITHHELD_MEDIA_ID,
+	};
+
+	let dim = Dim::new(96, 96, None);
+
+	let fetched = services
+		.media
+		.fetch_remote_thumbnail_legacy(&mxc, TIMEOUT, &dim, Animate::from(None))
+		.await?;
+
+	if fetched.content == GIF {
+		return Err!("a forbidding legacy request was answered with the peer's animation");
+	}
+
+	let served = fetched
+		.content_type
+		.as_deref()
+		.unwrap_or_default();
+
+	match served == STILL {
+		| true => Ok(()),
+		| false => Err!("the legacy stand-in was served as {served}, expected {STILL}"),
+	}
+}
+
+/// A legacy request past every bucket names the original, and fetches it.
+///
+/// There is no dimension to ask a peer to thumbnail at once a request
+/// normalizes to the sentinel, so this leg asked for one at the raw size and
+/// filed the answer where nothing reads. Which endpoint the peer saw is the
+/// half a lookup cannot show, since a thumbnail cached at the sentinel key
+/// would satisfy it too.
+async fn exercise_legacy_oversized(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: LEGACY_OVERSIZED_MEDIA_ID,
+	};
+
+	let dim = Dim::new(1024, 768, None);
+	let before = DOWNLOADED.load(Ordering::Relaxed);
+
+	services
+		.media
+		.fetch_remote_thumbnail_legacy(&mxc, TIMEOUT, &dim, Animate::Allowed)
+		.await?;
+
+	let downloads = downloaded(before);
+
+	if downloads != 1 {
+		return Err!("the legacy sentinel asked for an original {downloads} times, expected 1");
+	}
+
+	services
+		.media
+		.get_stored_thumbnail(&mxc, &dim, Animate::Allowed)
+		.await
+		.map(drop)
+}
+
+/// Originals the peer has handed over since a baseline.
+///
+/// Convergence alone cannot say an original was what a request went after, so
+/// this counts which endpoint answered rather than the outcome, against a
+/// baseline its own caller took first.
+fn downloaded(before: usize) -> usize {
+	DOWNLOADED
+		.load(Ordering::Relaxed)
+		.saturating_sub(before)
 }
 
 /// A request past every bucket fetches the original, and then stops asking.
@@ -427,9 +586,7 @@ async fn exercise_oversized(services: &Services, peer: &ServerName) -> Result {
 
 	// converging proves a row was filed, not that the original was what was
 	// asked for; a thumbnail cached at the sentinel key would converge too
-	let downloads = DOWNLOADED
-		.load(Ordering::Relaxed)
-		.saturating_sub(before);
+	let downloads = downloaded(before);
 
 	match downloads == 1 {
 		| true => Ok(()),
@@ -492,14 +649,7 @@ async fn exercise_bucket(services: &Services, peer: &ServerName) -> Result {
 
 	// the cache converging says a row was filed where the lookup reads it, not
 	// that the peer was asked at the bucket, which is the change under test
-	let query = ASKED_QUERY
-		.lock()
-		.map(|asked| asked.clone())
-		.unwrap_or_default();
-
-	if !query.contains("width=320") || !query.contains("height=240") {
-		return Err!("the peer was asked with {query:?}, expected the 320x240 bucket");
-	}
+	asked_with(320, 240, "scale")?;
 
 	// 150x150 takes the same bucket, so it is the same row
 	let sibling = Dim::new(150, 150, None);
