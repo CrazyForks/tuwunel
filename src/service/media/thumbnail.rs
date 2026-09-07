@@ -110,6 +110,13 @@ impl super::Service {
 		Ok(())
 	}
 
+	/// Answers a thumbnail request, fetching from the peer when it is remote.
+	///
+	/// The dimension a fetch asks the peer for is the dimension the answer is
+	/// filed under, and every later lookup seeks the normalized one, so the
+	/// three have to agree or nothing found on one request is found on the
+	/// next. Past every bucket there is no dimension to ask at, and the request
+	/// names the original file instead.
 	#[tracing::instrument(
 		level = "debug",
 		err(level = "debug")
@@ -150,14 +157,12 @@ impl super::Service {
 			return self.get_thumbnail(mxc, dim, animate, None).await;
 		}
 
-		// the sentinel names the original file rather than a size, and asking a
-		// peer to thumbnail at it leaves nothing this lookup can find next time
 		let media = match normalized.is_original() {
 			| true =>
 				self.fetch_remote_content(mxc, None, timeout_ms)
 					.await?,
 			| false =>
-				self.fetch_remote_thumbnail(mxc, None, timeout_ms, dim, animate)
+				self.fetch_remote_thumbnail(mxc, None, timeout_ms, &normalized, animate)
 					.await?,
 		};
 

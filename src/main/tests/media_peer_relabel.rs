@@ -20,11 +20,19 @@ use std::{
 	net::TcpListener,
 	path::PathBuf,
 	process::id as process_id,
-	sync::atomic::{AtomicUsize, Ordering},
+	sync::{
+		Mutex,
+		atomic::{AtomicUsize, Ordering},
+	},
 	time::Duration,
 };
 
-use axum::{Router, http::header::CONTENT_TYPE, response::IntoResponse, routing::any};
+use axum::{
+	Router,
+	http::{Uri, header::CONTENT_TYPE},
+	response::IntoResponse,
+	routing::any,
+};
 use axum_server::{from_tcp_rustls, tls_rustls::RustlsConfig};
 use tokio::spawn;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
@@ -37,7 +45,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::{
 	Services,
-	media::{Animate, Dim},
+	media::{Animate, Dim, Media},
 };
 
 /// A one-by-one GIF carrying two frames.
@@ -88,12 +96,31 @@ const OVERSIZED_MEDIA_ID: &str = "peeroversizedthumbnailmediaid000";
 
 const WITHHELD_MEDIA_ID: &str = "peeroversizedwithheldmediaid0000";
 
+const BUCKET_MEDIA_ID: &str = "peerbucketthumbnailmediaid000000";
+
 /// Requests the peer has answered.
 ///
 /// A request past every bucket has to stop reaching the peer once the original
 /// is cached, and nothing about the answer itself would show that; only the
 /// count the peer keeps can.
 static ANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Requests the peer has answered for an original rather than a thumbnail.
+///
+/// Convergence alone cannot tell the two apart, since a thumbnail cached at the
+/// sentinel key converges just as well; only which endpoint was asked shows
+/// that a request naming the original file went after one.
+static DOWNLOADED: AtomicUsize = AtomicUsize::new(0);
+
+/// Path segment the authenticated media download endpoint carries.
+const DOWNLOAD: &str = "/media/download/";
+
+/// Query the peer was last asked with.
+///
+/// The dimension reaching the peer is the half of this that a converging cache
+/// cannot show: filing under the bucket while still asking at the size the
+/// client named would converge just as well and be the wrong fix.
+static ASKED_QUERY: Mutex<String> = Mutex::new(String::new());
 
 const CERTIFICATE: &str = "../../nix/pkgs/complement/certificate.crt";
 
@@ -150,10 +177,12 @@ fn a_peers_mislabelled_thumbnail_is_cached_under_its_container() -> Result {
 	let result = runtime.block_on(async {
 		let services = async_start(&server).await?;
 		let stub = spawn(serve_peer(listener, certificate, private_key));
-		let outcome = exercise(&services, &peer).await;
-		let outcome = outcome.and(exercise_legacy(&services, &peer).await);
-		let outcome = outcome.and(exercise_oversized(&services, &peer).await);
-		let outcome = outcome.and(exercise_withheld(&services, &peer).await);
+		let outcome = exercise(&services, &peer)
+			.await
+			.and(exercise_legacy(&services, &peer).await)
+			.and(exercise_oversized(&services, &peer).await)
+			.and(exercise_withheld(&services, &peer).await)
+			.and(exercise_bucket(&services, &peer).await);
 
 		// a stub that never started reaches the caller only as a peer that did
 		// not answer, so its own error is reported in place of that symptom
@@ -208,8 +237,16 @@ async fn serve_peer(listener: TcpListener, certificate: PathBuf, private_key: Pa
 /// writes, so a body assembled any other way would fail to parse before
 /// reaching anything this covers. This is the half that counts its requests,
 /// since the authenticated endpoints are the ones a repeat would return to.
-async fn authenticated() -> impl IntoResponse {
+async fn authenticated(uri: Uri) -> impl IntoResponse {
 	ANSWERED.fetch_add(1, Ordering::Relaxed);
+
+	if uri.path().contains(DOWNLOAD) {
+		DOWNLOADED.fetch_add(1, Ordering::Relaxed);
+	}
+
+	if let Ok(mut asked) = ASKED_QUERY.lock() {
+		*asked = uri.query().unwrap_or_default().to_owned();
+	}
 
 	let head = format!(
 		"\r\n--{BOUNDARY}\r\ncontent-type: \
@@ -272,6 +309,48 @@ async fn exercise(services: &Services, peer: &ServerName) -> Result {
 	}
 
 	Ok(())
+}
+
+/// Requests the peer has answered since a baseline.
+fn asked(before: usize) -> usize {
+	ANSWERED
+		.load(Ordering::Relaxed)
+		.saturating_sub(before)
+}
+
+/// Fetches twice, answering what the first fetch returned.
+///
+/// A row filed where the lookup reads it is what stops the second fetch
+/// reaching the peer, so every exercise wants both halves asserted and only
+/// the picture differs between them.
+async fn fetched_once(
+	services: &Services,
+	mxc: &Mxc<'_>,
+	dim: &Dim,
+	animate: Animate,
+	user: &UserId,
+) -> Result<Media> {
+	let before = ANSWERED.load(Ordering::Relaxed);
+
+	let fetch = || {
+		services
+			.media
+			.get_or_fetch_thumbnail(mxc, dim, animate, TIMEOUT, user)
+	};
+
+	let fetched = fetch().await?;
+
+	if asked(before) != 1 {
+		return Err!("the first request reached the peer {} times, expected 1", asked(before));
+	}
+
+	fetch().await?;
+
+	if asked(before) != 1 {
+		return Err!("the repeat went back to the peer, {} requests in total", asked(before));
+	}
+
+	Ok(fetched)
 }
 
 /// The local user every exercise fetches as.
@@ -339,37 +418,23 @@ async fn exercise_oversized(services: &Services, peer: &ServerName) -> Result {
 
 	let dim = Dim::new(1024, 768, None);
 	let user = fixture_user(services)?;
-	let before = ANSWERED.load(Ordering::Relaxed);
-
-	let fetch = || {
-		services
-			.media
-			.get_or_fetch_thumbnail(&mxc, &dim, Animate::Allowed, TIMEOUT, &user)
-	};
-
-	let asked = || {
-		ANSWERED
-			.load(Ordering::Relaxed)
-			.saturating_sub(before)
-	};
-
-	let fetched = fetch().await?;
+	let before = DOWNLOADED.load(Ordering::Relaxed);
+	let fetched = fetched_once(services, &mxc, &dim, Animate::Allowed, &user).await?;
 
 	if fetched.content != GIF {
 		return Err!("the original did not reach the caller");
 	}
 
-	if asked() != 1 {
-		return Err!("the first request reached the peer {} times, expected 1", asked());
+	// converging proves a row was filed, not that the original was what was
+	// asked for; a thumbnail cached at the sentinel key would converge too
+	let downloads = DOWNLOADED
+		.load(Ordering::Relaxed)
+		.saturating_sub(before);
+
+	match downloads == 1 {
+		| true => Ok(()),
+		| false => Err!("the sentinel asked for an original {downloads} times, expected 1"),
 	}
-
-	fetch().await?;
-
-	if asked() != 1 {
-		return Err!("the repeat went back to the peer, {} requests in total", asked());
-	}
-
-	Ok(())
 }
 
 /// The same fetch for a request that forbids animation, which is most of them.
@@ -386,21 +451,7 @@ async fn exercise_withheld(services: &Services, peer: &ServerName) -> Result {
 
 	let dim = Dim::new(1024, 768, None);
 	let user = fixture_user(services)?;
-	let before = ANSWERED.load(Ordering::Relaxed);
-
-	let fetch = || {
-		services
-			.media
-			.get_or_fetch_thumbnail(&mxc, &dim, Animate::from(None), TIMEOUT, &user)
-	};
-
-	let asked = || {
-		ANSWERED
-			.load(Ordering::Relaxed)
-			.saturating_sub(before)
-	};
-
-	let fetched = fetch().await?;
+	let fetched = fetched_once(services, &mxc, &dim, Animate::from(None), &user).await?;
 
 	if fetched.content == GIF {
 		return Err!("a forbidding request was answered with the peer's animation");
@@ -411,19 +462,56 @@ async fn exercise_withheld(services: &Services, peer: &ServerName) -> Result {
 		.as_deref()
 		.unwrap_or_default();
 
-	if served != STILL {
-		return Err!("the stand-in was served as {served}, expected {STILL}");
+	match served == STILL {
+		| true => Ok(()),
+		| false => Err!("the stand-in was served as {served}, expected {STILL}"),
+	}
+}
+
+/// A size that is not a bucket is asked for, and cached, at the bucket it
+/// takes.
+///
+/// The dimension a fetch asks the peer for is the dimension it files the answer
+/// under, and every later lookup seeks the normalized one, so asking at the
+/// size the client named left a row nothing could find and sent every repeat
+/// back over federation. Asking at the bucket makes the two agree, and also
+/// keeps the row count per media on the ladder rather than one row per distinct
+/// size a client happens to name.
+async fn exercise_bucket(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: BUCKET_MEDIA_ID,
+	};
+
+	// 100x100 takes the 320x240 bucket, so raw and normalized differ
+	let dim = Dim::new(100, 100, None);
+	let user = fixture_user(services)?;
+	let before = ANSWERED.load(Ordering::Relaxed);
+
+	fetched_once(services, &mxc, &dim, Animate::Allowed, &user).await?;
+
+	// the cache converging says a row was filed where the lookup reads it, not
+	// that the peer was asked at the bucket, which is the change under test
+	let query = ASKED_QUERY
+		.lock()
+		.map(|asked| asked.clone())
+		.unwrap_or_default();
+
+	if !query.contains("width=320") || !query.contains("height=240") {
+		return Err!("the peer was asked with {query:?}, expected the 320x240 bucket");
 	}
 
-	if asked() != 1 {
-		return Err!("the first request reached the peer {} times, expected 1", asked());
+	// 150x150 takes the same bucket, so it is the same row
+	let sibling = Dim::new(150, 150, None);
+
+	services
+		.media
+		.get_or_fetch_thumbnail(&mxc, &sibling, Animate::Allowed, TIMEOUT, &user)
+		.await?;
+
+	match asked(before) == 1 {
+		| true => Ok(()),
+		| false =>
+			Err!("a sibling size in the same bucket refetched, {} in total", asked(before)),
 	}
-
-	fetch().await?;
-
-	if asked() != 1 {
-		return Err!("the repeat went back to the peer, {} requests in total", asked());
-	}
-
-	Ok(())
 }
