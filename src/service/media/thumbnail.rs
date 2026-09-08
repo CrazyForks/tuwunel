@@ -30,6 +30,8 @@ use super::{Fetched, Media, data::Metadata};
 pub(super) mod animate;
 mod sniff;
 
+#[cfg(feature = "media_thumbnail")]
+use sniff::Sequence;
 pub(super) use sniff::{animated_type, animates, sequence};
 
 /// Content type of every thumbnail tuwunel generates.
@@ -560,8 +562,14 @@ async fn get_thumbnail_generate(
 ) -> Result<Media> {
 	let bytes = self.fetch_bytes(&data.key).await?;
 
-	let encoded = self
-		.animates_at(dim, &bytes)?
+	// the gates below read this walk too, so it is taken at most once
+	let walk = self
+		.services
+		.config
+		.media_thumbnail_animated
+		.then(|| sequence(&bytes));
+
+	let encoded = animates_at(dim, walk, &bytes)?
 		.then_async(async || {
 			self.store_animated(mxc, dim, bytes.clone())
 				.await
@@ -592,7 +600,9 @@ async fn get_thumbnail_generate(
 		// no still can be derived from a picture that will not decode, and the
 		// original answers in its place unless it is the animation the request
 		// forbade
-		return match animate.accepts_fallback(&media.content) {
+		let named = walk.map(Sequence::names_animation);
+
+		return match animate.accepts_fallback_walk(named, &media.content) {
 			| true => Ok(media),
 			| false => Err!(Request(NotFound("Media thumbnail not found."))),
 		};
@@ -603,7 +613,12 @@ async fn get_thumbnail_generate(
 	// a video is never servable in place of its own thumbnail, so its frame is
 	// re-encoded however small it is
 	let source = Dim::new(image.width(), image.height(), None);
-	if !from_video && dim.is_passthrough(&source)? && animate.accepts_picture(&media.content) {
+	let animates = walk.map(Sequence::animates);
+
+	if !from_video
+		&& dim.is_passthrough(&source)?
+		&& animate.accepts_walk(animates, &media.content)
+	{
 		return Ok(media);
 	}
 
@@ -639,11 +654,12 @@ async fn get_thumbnail_generate(
 /// encoder, so a still never pays a decode that would yield one frame and be
 /// thrown away, and a video is excluded by the same test since its container is
 /// none of the three that hold frames. A size the request cannot improve on is
-/// passed through whole below rather than re-encoded.
+/// passed through whole below rather than re-encoded. The caller takes the
+/// walk and reads it again at that passthrough, and hands `None` where the
+/// feature is off.
 #[cfg(feature = "media_thumbnail")]
-#[implement(super::Service)]
-fn animates_at(&self, dim: &Dim, content: &[u8]) -> Result<bool> {
-	if !self.services.config.media_thumbnail_animated || !animates(content) {
+fn animates_at(dim: &Dim, walk: Option<Sequence>, content: &[u8]) -> Result<bool> {
+	if !walk.is_some_and(Sequence::animates) {
 		return Ok(false);
 	}
 
@@ -850,10 +866,7 @@ impl Animate {
 	/// walk that was skipped there happens here for the one caller that asks.
 	#[must_use]
 	pub fn accepts_fetched(self, fetched: &Fetched) -> bool {
-		fetched.animates.map_or_else(
-			|| self.accepts_picture(&fetched.media.content),
-			|animates| self.accepts_animation(animates),
-		)
+		self.accepts_walk(fetched.animates, &fetched.media.content)
 	}
 
 	/// Returns true when this picture may answer in a thumbnail's place.
@@ -867,6 +880,33 @@ impl Animate {
 	#[must_use]
 	pub fn accepts_fallback(self, bytes: &[u8]) -> bool {
 		self.allowed() || animated_type(bytes).is_none()
+	}
+
+	/// Returns true when this picture may answer, walking it if nobody has.
+	///
+	/// A caller already holding a walk of these bytes states what it settled
+	/// rather than paying for a second one over them, and where none was taken
+	/// this is [`Self::accepts_picture`] exactly.
+	#[inline]
+	#[must_use]
+	pub(super) fn accepts_walk(self, animates: Option<bool>, bytes: &[u8]) -> bool {
+		animates.map_or_else(
+			|| self.accepts_picture(bytes),
+			|animates| self.accepts_animation(animates),
+		)
+	}
+
+	/// Returns true when this picture may answer in a thumbnail's place,
+	/// walking it if nobody has.
+	///
+	/// The settled-only rule of [`Self::accepts_fallback`] holds here too, so
+	/// what the caller states is whether its walk *named* an animation rather
+	/// than whether it withheld one.
+	#[cfg(feature = "media_thumbnail")]
+	#[inline]
+	#[must_use]
+	pub(super) fn accepts_fallback_walk(self, names: Option<bool>, bytes: &[u8]) -> bool {
+		names.map_or_else(|| self.accepts_fallback(bytes), |names| self.allowed() || !names)
 	}
 }
 

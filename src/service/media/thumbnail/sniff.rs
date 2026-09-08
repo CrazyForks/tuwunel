@@ -90,6 +90,16 @@ pub(in super::super) fn animates(bytes: &[u8]) -> bool { sequence(bytes).animate
 #[inline]
 pub(in super::super) fn animates(self) -> bool { !matches!(self, Self::Absent) }
 
+/// Whether the walk settled on an animation rather than merely allowing one.
+///
+/// This is the narrower half of [`Self::animates`], which withholds an
+/// unsettled walk too: naming a picture takes proof where refusing to serve one
+/// does not.
+#[cfg(feature = "media_thumbnail")]
+#[implement(Sequence)]
+#[inline]
+pub(in super::super) fn names_animation(self) -> bool { self.animated_type().is_some() }
+
 /// The container type a picture's own bytes name.
 ///
 /// Walks the container first, for a caller holding no walk of its own.

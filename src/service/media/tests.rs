@@ -188,6 +188,8 @@ mod animate {
 }
 
 mod container {
+	#[cfg(feature = "media_thumbnail")]
+	use super::super::thumbnail::sequence;
 	use super::super::{
 		Animate,
 		thumbnail::{animated_type, animates},
@@ -283,6 +285,82 @@ mod container {
 		let chain = SUB_BLOCK.repeat(MANY_SUB_BLOCKS);
 
 		[head, &chain, PICTURE_END].concat()
+	}
+
+	/// A walk stated to a gate answers exactly as reading the bytes does.
+	///
+	/// The generate path states a walk it already holds and hands `None` where
+	/// the feature took none, so the two spellings have to agree on every
+	/// container here. The unstated arms are the ones no suite reaches, since
+	/// nothing flips the knob that produces them.
+	#[cfg(feature = "media_thumbnail")]
+	#[test]
+	fn a_stated_walk_answers_as_reading_the_bytes_does() {
+		let cut = ANIMATED_GIF
+			.get(..NAMED_BYTES)
+			.unwrap_or(ANIMATED_GIF);
+
+		let containers = [
+			STILL_PNG,
+			ANIMATED_PNG,
+			STILL_WEBP,
+			ANIMATED_WEBP,
+			EXTENDED_STILL_WEBP,
+			STILL_GIF,
+			ANIMATED_GIF,
+			cut,
+		];
+
+		// the two gates part company only where a walk settled nothing, so a
+		// set without one would agree for the wrong reason
+		let unsettled = containers
+			.iter()
+			.any(|bytes| animates(bytes) && animated_type(bytes).is_none());
+
+		assert!(unsettled, "no container here left the walk unsettled");
+
+		for bytes in containers {
+			for animate in [Animate::Never, Animate::Allowed] {
+				gates_agree(animate, bytes);
+			}
+		}
+	}
+
+	/// Both gates answer the same whether handed a walk or the bytes.
+	///
+	/// Four arms meet here: each gate reads the walk its caller states, or
+	/// takes its own where none was stated, and both forms have to agree with
+	/// the byte-reading spelling they replaced.
+	#[cfg(feature = "media_thumbnail")]
+	fn gates_agree(animate: Animate, bytes: &[u8]) {
+		let walk = sequence(bytes);
+		let len = bytes.len();
+		let picture = animate.accepts_picture(bytes);
+		let fallback = animate.accepts_fallback(bytes);
+
+		assert_eq!(
+			animate.accepts_walk(None, bytes),
+			picture,
+			"an unstated walk disagreed ({animate:?}, {len} bytes)"
+		);
+
+		assert_eq!(
+			animate.accepts_walk(Some(walk.animates()), bytes),
+			picture,
+			"a stated walk disagreed ({animate:?}, {len} bytes)"
+		);
+
+		assert_eq!(
+			animate.accepts_fallback_walk(None, bytes),
+			fallback,
+			"an unstated walk disagreed at the fallback ({animate:?}, {len} bytes)"
+		);
+
+		assert_eq!(
+			animate.accepts_fallback_walk(Some(walk.names_animation()), bytes),
+			fallback,
+			"a stated walk disagreed at the fallback ({animate:?}, {len} bytes)"
+		);
 	}
 
 	/// A container whose opening chunk names no known form is withheld.
