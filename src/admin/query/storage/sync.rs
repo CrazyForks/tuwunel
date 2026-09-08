@@ -14,28 +14,27 @@ pub(super) async fn query_storage_sync(&self, src: String, dst: String) -> Resul
 
 	let dst_p = self.services.storage.provider(&dst)?;
 
-	let src = src_p
+	let src_objects = src_p
 		.list(None)
 		.map_ok(|meta| meta.location)
 		.try_collect::<HashSet<_>>();
 
-	let dst = dst_p
+	let dst_objects = dst_p
 		.list(None)
 		.map_ok(|meta| meta.location)
 		.try_collect::<HashSet<_>>();
 
-	let (src, dst) = try_join(src, dst).await?;
+	let (src_objects, dst_objects) = try_join(src_objects, dst_objects).await?;
 
-	src.difference(&dst)
+	let copied = src_objects
+		.difference(&dst_objects)
 		.try_stream()
 		.broadn_and_then(2, async |item| {
 			let data = src_p.get(item.as_ref()).await?;
-			let put = dst_p.put_one(item.as_ref(), data).await?;
+			dst_p.put_one(item.as_ref(), data).await
+		})
+		.try_fold(0_usize, async |count, _| Ok(count.saturating_add(1)))
+		.await?;
 
-			Ok((item, put))
-		})
-		.try_for_each(|(item, put)| {
-			writeln!(&self, "Moved {item} from {src:?} to {dst:?}; {put:?}")
-		})
-		.await
+	writeln!(self, "Copied {copied} objects from {src:?} to {dst:?}.").await
 }
