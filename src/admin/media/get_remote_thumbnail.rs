@@ -22,7 +22,8 @@ pub(super) async fn get_remote_thumbnail(
 		.services
 		.media
 		.fetch_remote_thumbnail(&mxc, server.as_deref(), timeout, &dim, Animate::Allowed)
-		.await?;
+		.await?
+		.media;
 
 	let len = result.content.len();
 	result.content.clear();

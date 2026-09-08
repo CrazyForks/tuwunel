@@ -40,7 +40,7 @@ use url::Url;
 
 #[cfg(feature = "media_thumbnail")]
 use self::video::{FAILURES, Failures, sweep_staging_dir};
-use self::{data::Data, preview::Agent, remote::Fetch, thumbnail::stored_type};
+use self::{data::Data, preview::Agent, remote::Fetch, thumbnail::sequence};
 pub use self::{
 	data::Metadata,
 	preview::UrlPreviewData,
@@ -53,6 +53,22 @@ pub struct Media {
 	pub content: Vec<u8>,
 	pub content_type: Option<String>,
 	pub content_disposition: Option<ContentDisposition>,
+}
+
+/// A picture fetched from a peer, and what a walk of its container settled.
+///
+/// The walk picking the type a fetched row is filed under settles the same
+/// question a caller asks before serving the picture, so the answer travels
+/// with the bytes rather than being read out of them a second time. A redirect
+/// files no row and so walks nothing, which is what an absent answer means.
+#[derive(Debug)]
+pub struct Fetched {
+	pub media: Media,
+	/// Whether the bytes carry a frame sequence, where storing them settled it.
+	///
+	/// Private to the crate so nobody outside it can pair an answer with bytes
+	/// it was not walked from, which would defeat the gate reading it.
+	pub(crate) animates: Option<bool>,
 }
 
 /// One row of a user's uploaded media, holding only the fields tuwunel can
@@ -258,7 +274,7 @@ impl Service {
 		Ok(())
 	}
 
-	/// Uploads a file.
+	/// Uploads a file and reports whether its own bytes carry a sequence.
 	///
 	/// The declared type is whoever uploaded it saying so, and a picture that
 	/// animates is stored under the type its own container names instead. That
@@ -272,8 +288,8 @@ impl Service {
 		content_disposition: Option<&ContentDisposition>,
 		content_type: Option<&str>,
 		file: &[u8],
-	) -> Result {
-		let content_type = stored_type(file, content_type);
+	) -> Result<bool> {
+		let walk = sequence(file);
 
 		// Width, Height = 0 if it's not a thumbnail
 		let key = self.db.create_file_metadata(
@@ -281,11 +297,13 @@ impl Service {
 			user,
 			&Dim::default(),
 			content_disposition,
-			content_type,
+			walk.stored_type(content_type),
 		)?;
 
 		//TODO: Dangling metadata in database if creation fails
-		self.create_media_file(&key, file).await
+		self.create_media_file(&key, file)
+			.map_ok(|()| walk.animates())
+			.await
 	}
 
 	/// Deletes a file in the database and from the media directory via an MXC
@@ -393,6 +411,7 @@ impl Service {
 		}
 
 		self.fetch_remote_content(mxc, None, timeout_ms)
+			.map_ok(|fetched| fetched.media)
 			.await
 	}
 

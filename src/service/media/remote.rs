@@ -10,6 +10,7 @@ use ruma::{
 		federation,
 		federation::authenticated_media::{Content, FileOrLocation},
 	},
+	http_headers::ContentDisposition,
 };
 use tuwunel_core::{
 	Err, Error, Result, debug_warn, err, implement,
@@ -17,7 +18,7 @@ use tuwunel_core::{
 };
 use url::Url;
 
-use super::{Animate, Dim, Media, preview::Agent, thumbnail::stored_type};
+use super::{Animate, Dim, Fetched, Media, preview::Agent, thumbnail::sequence};
 use crate::{
 	client::read_response_capped,
 	federation::scheme::{FedAuth, FedPath},
@@ -33,6 +34,12 @@ pub(super) enum Fetch {
 	Preview(Agent),
 }
 
+/// Fetches a thumbnail at this dimension from the origin server.
+///
+/// The authenticated endpoint is asked first, falling back to the legacy one
+/// only where the peer answers no such media and this server is configured to
+/// ask. What the walk filing the answer settled travels back with it, so a
+/// caller deciding whether the picture may be served reads no bytes again.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn fetch_remote_thumbnail(
@@ -42,7 +49,7 @@ pub async fn fetch_remote_thumbnail(
 	timeout_ms: Duration,
 	dim: &Dim,
 	animate: Animate,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
@@ -60,6 +67,12 @@ pub async fn fetch_remote_thumbnail(
 	result
 }
 
+/// Fetches the original file from the origin server.
+///
+/// The authenticated endpoint is asked first, falling back to the legacy one
+/// only where the peer answers no such media and this server is configured to
+/// ask. What the walk filing the answer settled travels back with it, so a
+/// caller deciding whether the picture may be served reads no bytes again.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn fetch_remote_content(
@@ -67,7 +80,7 @@ pub async fn fetch_remote_content(
 	mxc: &Mxc<'_>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
@@ -93,7 +106,7 @@ async fn fetch_thumbnail_authenticated(
 	timeout_ms: Duration,
 	dim: &Dim,
 	animate: Animate,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	use federation::authenticated_media::get_content_thumbnail::v1::{Request, Response};
 
 	let request = Request {
@@ -123,7 +136,7 @@ async fn fetch_content_authenticated(
 	mxc: &Mxc<'_>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	use federation::authenticated_media::get_content::v1::{Request, Response};
 
 	let request = Request {
@@ -150,7 +163,7 @@ async fn fetch_thumbnail_unauthenticated(
 	timeout_ms: Duration,
 	dim: &Dim,
 	animate: Animate,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	use media::get_content_thumbnail::v3::{Request, Response};
 
 	let request = Request {
@@ -184,7 +197,7 @@ async fn fetch_content_unauthenticated(
 	mxc: &Mxc<'_>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	use media::get_content::v3::{Request, Response};
 
 	let request = Request {
@@ -212,58 +225,78 @@ async fn handle_thumbnail_file(
 	mxc: &Mxc<'_>,
 	dim: &Dim,
 	content: Content,
-) -> Result<Media> {
+) -> Result<Fetched> {
 	let content_disposition = make_content_disposition(
 		content.content_disposition.as_ref(),
 		content.content_type.as_deref(),
 		None,
 	);
 
-	let content_type = stored_type(&content.file, content.content_type.as_deref());
+	let walk = sequence(&content.file);
+	let content_type = walk.stored_type(content.content_type.as_deref());
 
 	self.upload_thumbnail(mxc, Some(&content_disposition), content_type, dim, &content.file)
-		.await
-		.map(|()| Media {
-			content: content.file,
-			content_type: content.content_type.map(Into::into),
-			content_disposition: Some(content_disposition),
-		})
+		.await?;
+
+	let animates = Some(walk.animates());
+	let media = fetched_media(content, content_disposition);
+
+	Ok(Fetched { media, animates })
 }
 
 #[implement(super::Service)]
-async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<Media> {
+async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<Fetched> {
 	let content_disposition = make_content_disposition(
 		content.content_disposition.as_ref(),
 		content.content_type.as_deref(),
 		None,
 	);
 
-	self.create(
-		mxc,
-		None,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		&content.file,
-	)
-	.await
-	.map(|()| Media {
-		content: content.file,
-		content_type: content.content_type.map(Into::into),
-		content_disposition: Some(content_disposition),
-	})
+	let animates = self
+		.create(
+			mxc,
+			None,
+			Some(&content_disposition),
+			content.content_type.as_deref(),
+			&content.file,
+		)
+		.await
+		.map(Some)?;
+
+	let media = fetched_media(content, content_disposition);
+
+	Ok(Fetched { media, animates })
 }
 
 #[implement(super::Service)]
-async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Media> {
+async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Fetched> {
 	let limit = self.services.server.config.max_response_size;
 
-	self.location_request(Fetch::Extern, location, limit)
+	let media = self
+		.location_request(Fetch::Extern, location, limit)
 		.await
 		.map_err(|error| {
 			err!(Request(NotFound(
 				debug_warn!(%mxc, ?location, ?error, "Fetching media from location failed")
 			)))
-		})
+		})?;
+
+	// nothing files a redirected object, so no walk of it has happened and the
+	// one caller that asks pays for its own
+	Ok(Fetched { media, animates: None })
+}
+
+/// Assembles what a peer answered into media under the disposition it was
+/// filed with.
+///
+/// The type reported is the one the peer declared, where the row it was filed
+/// under carries whatever its own container named instead.
+fn fetched_media(content: Content, content_disposition: ContentDisposition) -> Media {
+	Media {
+		content: content.file,
+		content_type: content.content_type.map(Into::into),
+		content_disposition: Some(content_disposition),
+	}
 }
 
 #[implement(super::Service)]
@@ -417,11 +450,11 @@ pub async fn fetch_remote_thumbnail_legacy(
 				.await?,
 	};
 
-	if animate.accepts_picture(&fetched.content) {
-		return Ok(fetched);
+	if animate.accepts_fetched(&fetched) {
+		return Ok(fetched.media);
 	}
 
-	self.store_still(mxc, &dim, fetched).await
+	self.store_still(mxc, &dim, fetched.media).await
 }
 
 #[implement(super::Service)]

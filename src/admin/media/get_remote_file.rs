@@ -18,7 +18,8 @@ pub(super) async fn get_remote_file(
 		.services
 		.media
 		.fetch_remote_content(&mxc, server.as_deref(), timeout)
-		.await?;
+		.await?
+		.media;
 
 	let len = result.content.len();
 	result.content.clear();

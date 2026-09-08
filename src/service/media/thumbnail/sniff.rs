@@ -12,7 +12,7 @@
 //! rather than a violation; what a picture is names nothing the walk did not
 //! settle, since a guess there would be written down as fact.
 
-use tuwunel_core::utils::math::checked_ops;
+use tuwunel_core::{implement, utils::math::checked_ops};
 
 use super::{APNG, GIF, WEBP};
 
@@ -63,7 +63,8 @@ const GIF_HEADER_LEN: usize = 13;
 ///
 /// The two questions a caller asks of it want opposite defaults, so an
 /// unsettled walk is its own answer rather than being folded into either.
-enum Sequence {
+#[derive(Clone, Copy)]
+pub(in super::super) enum Sequence {
 	/// This picture holds no sequence, either because its container cannot or
 	/// because the walk reached the end of one.
 	Absent,
@@ -77,35 +78,49 @@ enum Sequence {
 
 /// Whether these bytes may carry more than one frame.
 ///
+/// Walks the container first, for a caller holding no walk of its own.
+#[inline]
+pub(in super::super) fn animates(bytes: &[u8]) -> bool { sequence(bytes).animates() }
+
+/// Whether the walked picture may carry more than one frame.
+///
 /// Only a settled walk answers false, so a truncated or unrecognized picture is
 /// withheld from a request that forbade animation rather than served to it.
-pub(in super::super) fn animates(bytes: &[u8]) -> bool {
-	!matches!(sequence(bytes), Sequence::Absent)
+#[implement(Sequence)]
+#[inline]
+pub(in super::super) fn animates(self) -> bool { !matches!(self, Self::Absent) }
+
+/// The container type a picture's own bytes name.
+///
+/// Walks the container first, for a caller holding no walk of its own.
+#[inline]
+pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
+	sequence(bytes).animated_type()
 }
 
-/// The content type a picture ought to be stored under.
+/// The content type the walked picture ought to be stored under.
 ///
 /// A settled walk names the container itself, and the declared type stands
 /// where the walk settled nothing. The label is what a lookup goes on wherever
 /// the picture is not in hand: choosing between the rows at a size walks keys
 /// alone, and a redirect hands the object over without reading it.
-pub(in super::super) fn stored_type<'a>(
-	bytes: &[u8],
-	declared: Option<&'a str>,
-) -> Option<&'a str> {
-	animated_type(bytes).or(declared)
+#[implement(Sequence)]
+#[inline]
+pub(in super::super) fn stored_type(self, declared: Option<&str>) -> Option<&str> {
+	self.animated_type().or(declared)
 }
 
-/// The container type a picture's own bytes name.
+/// The container type the walked picture's own bytes name.
 ///
 /// Only a settled walk answers `Some`, since this names what a picture is
 /// rather than deciding what may be served, and a guess would be recorded as
-/// fact. `stored_type` is where an unsettled walk falls back to the type the
-/// picture was declared under.
-pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
-	match sequence(bytes) {
-		| Sequence::Present(content_type) => Some(content_type),
-		| Sequence::Absent | Sequence::Unsettled => None,
+/// fact.
+#[implement(Sequence)]
+#[inline]
+fn animated_type(self) -> Option<&'static str> {
+	match self {
+		| Self::Present(content_type) => Some(content_type),
+		| Self::Absent | Self::Unsettled => None,
 	}
 }
 
@@ -115,7 +130,7 @@ pub(in super::super) fn animated_type(bytes: &[u8]) -> Option<&'static str> {
 /// whose walk reaches the end of its blocks without finding a second frame. A
 /// walk that runs out of picture, or meets a structure it does not know,
 /// answers `Unsettled` instead of guessing either way.
-fn sequence(bytes: &[u8]) -> Sequence {
+pub(in super::super) fn sequence(bytes: &[u8]) -> Sequence {
 	let is_gif = GIF_MAGIC
 		.iter()
 		.any(|magic| bytes.starts_with(magic));

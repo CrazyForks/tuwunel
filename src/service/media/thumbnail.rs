@@ -24,13 +24,13 @@ use tuwunel_core::{
 	utils::{result::LogDebugErr, stream::IterStream},
 };
 
-use super::{Media, data::Metadata};
+use super::{Fetched, Media, data::Metadata};
 
 #[cfg(feature = "media_thumbnail")]
 pub(super) mod animate;
 mod sniff;
 
-pub(super) use sniff::{animated_type, animates, stored_type};
+pub(super) use sniff::{animated_type, animates, sequence};
 
 /// Content type of every thumbnail tuwunel generates.
 #[cfg(feature = "media_thumbnail")]
@@ -157,7 +157,7 @@ impl super::Service {
 			return self.get_thumbnail(mxc, dim, animate, None).await;
 		}
 
-		let media = match normalized.is_original() {
+		let fetched = match normalized.is_original() {
 			| true =>
 				self.fetch_remote_content(mxc, None, timeout_ms)
 					.await?,
@@ -168,11 +168,12 @@ impl super::Service {
 
 		// a peer may ignore the parameter and this answers the caller directly,
 		// so the variant is repaired before it leaves rather than one request on
-		if animate.accepts_picture(&media.content) {
-			return Ok(media);
+		if animate.accepts_fetched(&fetched) {
+			return Ok(fetched.media);
 		}
 
-		self.store_still(mxc, &normalized, media).await
+		self.store_still(mxc, &normalized, fetched.media)
+			.await
 	}
 
 	/// Download a thumbnail and wait up to a timeout_ms if it is pending.
@@ -830,6 +831,30 @@ impl Animate {
 	#[inline]
 	#[must_use]
 	pub fn accepts_picture(self, bytes: &[u8]) -> bool { self.allowed() || !animates(bytes) }
+
+	/// Returns true when a picture may answer, given what a walk settled about
+	/// it.
+	///
+	/// The walk that settles this is the same one picking the type a fetched
+	/// row is filed under, so a caller already holding its answer states it
+	/// here rather than reading the same bytes again through
+	/// [`Self::accepts_picture`].
+	#[inline]
+	#[must_use]
+	fn accepts_animation(self, animates: bool) -> bool { self.allowed() || !animates }
+
+	/// Returns true when a fetched picture may answer, walking it if nobody
+	/// has.
+	///
+	/// Filing a row settles this on the way, and a redirect files none, so the
+	/// walk that was skipped there happens here for the one caller that asks.
+	#[must_use]
+	pub fn accepts_fetched(self, fetched: &Fetched) -> bool {
+		fetched.animates.map_or_else(
+			|| self.accepts_picture(&fetched.media.content),
+			|animates| self.accepts_animation(animates),
+		)
+	}
 
 	/// Returns true when this picture may answer in a thumbnail's place.
 	///
