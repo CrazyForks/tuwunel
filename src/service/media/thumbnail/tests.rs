@@ -34,7 +34,7 @@ use tuwunel_core::{
 	ruma::Mxc,
 };
 
-use super::{Animate, Dim, Metadata};
+use super::{super::data::Metadata, Animate, Dim};
 use crate::Services;
 
 const SOURCE: &[u8] = b"not a picture";

@@ -1,4 +1,4 @@
-//! Container animation sniffing
+//! Sniffs containers for animation.
 //!
 //! A picture names its own format in its first bytes and carries its frame
 //! sequence, if it has one, at a place each format fixes. Reading those is what
@@ -14,42 +14,42 @@
 
 use tuwunel_core::{implement, utils::math::checked_ops};
 
-use super::{APNG, GIF, WEBP};
+use super::animate::{APNG, GIF, WEBP};
 
-/// Leading signatures of the three animating containers.
+// Leading signatures of the three animating containers.
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 const RIFF_MAGIC: &[u8] = b"RIFF";
 const WEBP_MAGIC: &[u8] = b"WEBP";
 const GIF_MAGIC: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
 
-/// Chunk names that settle a PNG.
-///
-/// The animation control is required to precede the pixel data, so meeting
-/// the data first settles the question without reading any of it.
+// Chunk names that settle a PNG.
+//
+// The animation control is required to precede the pixel data, so meeting
+// the data first settles the question without reading any of it.
 const PNG_ANIMATION: &[u8] = b"acTL";
 const PNG_DATA: &[u8] = b"IDAT";
 
-/// Chunk names a WebP can open with, and the animation flag's own bit.
-///
-/// Only the extended form can hold a frame sequence, so a file opening with a
-/// plain lossy or lossless chunk is a still without reading further.
+// Chunk names a WebP can open with, and the animation flag's own bit.
+//
+// Only the extended form can hold a frame sequence, so a file opening with a
+// plain lossy or lossless chunk is a still without reading further.
 const WEBP_EXTENDED: &[u8] = b"VP8X";
 const WEBP_LOSSY: &[u8] = b"VP8 ";
 const WEBP_LOSSLESS: &[u8] = b"VP8L";
 const WEBP_ANIMATION: u8 = 0x02;
 
-/// Leading byte of each block in a GIF body.
-///
-/// A body is a flat sequence of these, ending at the trailer, and animation
-/// is the presence of a second image rather than anything the format states.
+// Leading byte of each block in a GIF body.
+//
+// A body is a flat sequence of these, ending at the trailer, and animation
+// is the presence of a second image rather than anything the format states.
 const GIF_EXTENSION: u8 = 0x21;
 const GIF_IMAGE: u8 = 0x2C;
 const GIF_TRAILER: u8 = 0x3B;
 
-/// GIF colour-table flag and size bits.
-///
-/// The flag says whether one follows and the size field holds the exponent of
-/// its entry count, each entry being a three byte colour.
+// GIF colour-table flag and size bits.
+//
+// The flag says whether one follows and the size field holds the exponent of
+// its entry count, each entry being a three byte colour.
 const GIF_COLOR_TABLE: u8 = 0x80;
 const GIF_TABLE_SIZE: u8 = 0x07;
 
