@@ -1,7 +1,7 @@
 use std::{collections::HashSet, iter::once, num::NonZeroUsize};
 
 use futures::{
-	FutureExt, StreamExt,
+	FutureExt, StreamExt, TryFutureExt,
 	future::{join, try_join, try_join4},
 };
 use rand::seq::SliceRandom;
@@ -12,8 +12,9 @@ use ruma::{
 use serde::Deserialize;
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Result, at, debug, debug_warn, implement, is_false,
+	Err, Result, at, debug, debug_warn, implement, is_false,
 	matrix::{
+		PduEvent,
 		event::Event,
 		pdu::{PduCount, PduId, RawPduId},
 	},
@@ -219,6 +220,11 @@ async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
 }
 
 #[implement(super::Service)]
+/// Find the nearest visible event to the requested timestamp.
+///
+/// The local answer is retained unless a closer remote claim can be ingested.
+/// Its event must be readable in this room with the claimed timestamp on the
+/// requested side of the query.
 pub async fn get_event_id_near_ts_with_fallback(
 	&self,
 	room_id: &RoomId,
@@ -227,7 +233,6 @@ pub async fn get_event_id_near_ts_with_fallback(
 ) -> Result<(MilliSecondsSinceUnixEpoch, OwnedEventId)> {
 	let local = self.get_event_id_near_ts(room_id, ts, dir).await;
 
-	// Federate on a local miss, or a forward hit at the start edge of our history.
 	let federate = match &local {
 		| Err(_) => true,
 		| Ok((_, event_id)) =>
@@ -239,6 +244,7 @@ pub async fn get_event_id_near_ts_with_fallback(
 	}
 
 	let candidates = self.backfill_candidates(room_id).await;
+
 	if candidates.is_empty() {
 		return local;
 	}
@@ -258,7 +264,6 @@ pub async fn get_event_id_near_ts_with_fallback(
 		return local;
 	};
 
-	// Keep the local hit when it is no farther from the timestamp than the remote.
 	if let Ok((local_ts, local_id)) = &local
 		&& !nearer(dir, origin_server_ts, *local_ts)
 	{
@@ -266,15 +271,34 @@ pub async fn get_event_id_near_ts_with_fallback(
 	}
 
 	// Fail closed: an un-ingested event can't be visibility-checked, so keep local.
-	let Ok(()) = self
+	let Ok(pdu) = self
 		.backfill_event(room_id, &event_id, &outcome.origin)
+		.inspect_err(|e| debug_warn!(%room_id, error = ?e, "timestamp fallback backfill failed"))
 		.await
-		.inspect_err(|e| debug_warn!(%room_id, "timestamp fallback backfill failed: {e}"))
 	else {
 		return local;
 	};
 
-	Ok((origin_server_ts, event_id))
+	let actual_ts = pdu.origin_server_ts();
+	let matches_direction = match dir {
+		| Direction::Forward => actual_ts >= ts,
+		| Direction::Backward => actual_ts <= ts,
+	};
+
+	if actual_ts != origin_server_ts || !matches_direction {
+		debug_warn!(
+			%room_id,
+			%event_id,
+			?dir,
+			?ts,
+			?origin_server_ts,
+			?actual_ts,
+			"timestamp fallback claim was inconsistent with the ingested event"
+		);
+		return local;
+	}
+
+	Ok((actual_ts, event_id))
 }
 
 #[implement(super::Service)]
@@ -286,7 +310,6 @@ async fn is_start_edge_hit(&self, room_id: &RoomId, event_id: &EventId) -> bool 
 		})
 }
 
-/// Whether `a` is nearer the queried timestamp than `b` for a search in `dir`.
 fn nearer(dir: Direction, a: MilliSecondsSinceUnixEpoch, b: MilliSecondsSinceUnixEpoch) -> bool {
 	match dir {
 		| Direction::Forward => a < b,
@@ -300,7 +323,7 @@ async fn backfill_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 	origin: &ServerName,
-) -> Result {
+) -> Result<PduEvent> {
 	let opts = Opts::new(Op::Backfill, room_id.to_owned())
 		.event_id(event_id.to_owned())
 		.candidates([origin.to_owned()])
@@ -310,17 +333,36 @@ async fn backfill_event(
 
 	let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
 
-	pdus.into_iter()
+	let ingestion = pdus
+		.into_iter()
 		.stream()
-		.for_each(async |pdu| {
-			self.backfill_pdu(room_id, &outcome.origin, pdu)
-				.await
-				.inspect_err(|e| debug_warn!(%room_id, "Failed to add backfilled pdu: {e}"))
-				.ok();
+		.fold(Ok(()), async |prior, pdu| {
+			let current = self
+				.backfill_pdu(room_id, &outcome.origin, pdu)
+				.map_ok(|_| ())
+				.inspect_err(
+					|e| debug_warn!(%room_id, error = ?e, "Failed to add backfilled pdu"),
+				)
+				.await;
+
+			prior.and(current)
 		})
 		.await;
 
-	Ok(())
+	match self.get_pdu_count(event_id).await {
+		| Err(error) => ingestion.and(Err(error)),
+		| Ok(_) => {
+			let pdu = self.get_pdu(event_id).await?;
+
+			if pdu.room_id() != room_id {
+				return Err!(Request(NotFound(
+					"Timestamp fallback target belongs to another room."
+				)));
+			}
+
+			Ok(pdu)
+		},
+	}
 }
 
 /// Fetch a single event we have not received over federation and persist it via
