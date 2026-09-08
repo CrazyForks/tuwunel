@@ -176,6 +176,7 @@ fn encode_sequence(frames: Frames<'_>, dim: &Dim, limit: usize) -> Result<(Vec<u
 				let image = DynamicImage::ImageRgba8(frame.into_buffer());
 				let scaled = thumbnail_generate(&image, dim)?;
 
+				drop(image);
 				encoder
 					.encode_frame(Frame::from_parts(scaled.into_rgba8(), 0, 0, delay))
 					.map_err(|error| err!(debug_warn!(?error, "Failed to encode a frame.")))?;
