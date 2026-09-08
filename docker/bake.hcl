@@ -873,7 +873,6 @@ target "integ" {
         input = elem("target:build-tests", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
     }
     args = {
-        TUWUNEL_DATABASE_PATH = "/tmp/integration.test.db"
         cargo_cmd = (cargo_profile == "bench"? "bench": "test")
         cargo_args = (cargo_profile == "bench"?
             "--no-fail-fast --bench=*": "--no-fail-fast --test=*"
