@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use std::{env, process, sync::Arc};
+use std::{env::var, process::id as process_id, sync::Arc};
 
 use tuwunel::{Args, Runtime, Server};
 use tuwunel_core::{Err, Result, utils::time::now};
@@ -30,7 +30,8 @@ fn storage_s3_upload_download() -> Result {
 		return Ok(());
 	};
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"]).with_test_database("storage-s3");
+
 	args.maintenance = true;
 	args.option.extend(options);
 
@@ -72,8 +73,8 @@ async fn roundtrip(services: &Arc<Services>) -> Result {
 	Ok(())
 }
 
-fn collect_options() -> Option<Vec<String>> {
-	let env_var = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
+fn collect_options() -> Option<impl Iterator<Item = String>> {
+	let env_var = |name: &str| var(name).ok().filter(|s| !s.is_empty());
 
 	env_var(ENV_BUCKET).or_else(|| env_var(ENV_URL))?;
 
@@ -103,7 +104,6 @@ fn collect_options() -> Option<Vec<String>> {
 	]
 	.into_iter()
 	.flatten()
-	.collect::<Vec<_>>()
 	.into()
 }
 
@@ -111,7 +111,7 @@ fn escape_toml(value: &str) -> String { value.replace('\\', "\\\\").replace('"',
 
 fn unique_path() -> String {
 	let nanos = now().as_nanos();
-	let pid = process::id();
+	let pid = process_id();
 
 	format!("tuwunel-integration-test/{nanos}-{pid}.bin")
 }

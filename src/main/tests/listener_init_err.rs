@@ -15,8 +15,9 @@ fn listener_init_err() {
 		description => "Listener Initialization Err",
 		snapshot_suffix => "listener_init_err",
 	}, {
-		let mut args = Args::default_test(&["fresh", "cleanup"]);
-		args.option.push("unix_socket_path=\"/non/existent/path\"".into());
+		let args = Args::default_test(&["fresh", "cleanup"])
+			.with_test_database("listener-init-err")
+			.with_option("unix_socket_path=\"/non/existent/path\"");
 
 		let runtime = Runtime::new(Some(&args)).unwrap();
 		let server = Server::new(Some(&args), Some(&runtime)).unwrap();

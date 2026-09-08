@@ -1,6 +1,6 @@
 //! Integration with `clap`
 
-use std::path::PathBuf;
+use std::{env::var, path::PathBuf, process::id as process_id};
 
 use clap::{ArgAction, Parser, builder::RangedU64ValueParser};
 use tuwunel_core::{
@@ -315,6 +315,27 @@ pub fn default_test(name: &[&str]) -> Self {
 	Self::default()
 		.with_tests(name)
 		.with_option("server_name=\"localhost\"")
+}
+
+/// Returns these arguments with a database path isolated to this test.
+///
+/// Cargo compiles every integration test into its own binary and runs those
+/// binaries in parallel, so a shared path is a lock conflict rather than a slow
+/// test. The root is taken from `TMPDIR`, which a sandboxed or remote build
+/// sets to the directory it can actually write. The option is read back as a
+/// line of TOML, so the path is escaped and quoted as a basic string rather
+/// than rendered through `Debug`.
+#[implement(Args)]
+#[must_use]
+pub fn with_test_database(self, name: &str) -> Self {
+	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
+	let path = PathBuf::from(root).join(format!("tuwunel-{name}-{}", process_id()));
+	let escaped = path
+		.to_string_lossy()
+		.replace('\\', "\\\\")
+		.replace('"', "\\\"");
+
+	self.with_option(format!("database_path=\"{escaped}\""))
 }
 
 /// Returns these arguments with more test harnesses appended.

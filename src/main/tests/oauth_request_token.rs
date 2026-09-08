@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use std::{env, sync::Arc};
+use std::{env::var, sync::Arc};
 
 use tuwunel::{Args, Runtime, Server};
 use tuwunel_core::{Err, Result};
@@ -22,7 +22,7 @@ const ENV_CODE_VERIFIER: &str = "TUWUNEL_TEST_OAUTH_CODE_VERIFIER";
 
 #[test]
 fn oauth_request_token() -> Result {
-	let env_var = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
+	let env_var = |name: &str| var(name).ok().filter(|s| !s.is_empty());
 
 	let (Some(client_id), Some(code), Some(options)) =
 		(env_var(ENV_CLIENT_ID), env_var(ENV_CODE), collect_options())
@@ -35,7 +35,9 @@ fn oauth_request_token() -> Result {
 		return Ok(());
 	};
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args =
+		Args::default_test(&["fresh", "cleanup"]).with_test_database("oauth-request-token");
+
 	args.maintenance = true;
 	args.option.extend(options);
 
@@ -61,7 +63,7 @@ fn oauth_request_token() -> Result {
 }
 
 async fn exchange(services: &Arc<Services>, client_id: &str, code: &str) -> Result {
-	let env_var = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
+	let env_var = |name: &str| var(name).ok().filter(|s| !s.is_empty());
 
 	let provider = services.oauth.providers.get(client_id).await?;
 
@@ -82,8 +84,8 @@ async fn exchange(services: &Arc<Services>, client_id: &str, code: &str) -> Resu
 	Ok(())
 }
 
-fn collect_options() -> Option<Vec<String>> {
-	let env_var = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
+fn collect_options() -> Option<impl Iterator<Item = String>> {
+	let env_var = |name: &str| var(name).ok().filter(|s| !s.is_empty());
 
 	env_var(ENV_BRAND)?;
 	env_var(ENV_CLIENT_ID)?;
@@ -113,7 +115,6 @@ fn collect_options() -> Option<Vec<String>> {
 	]
 	.into_iter()
 	.flatten()
-	.collect::<Vec<_>>()
 	.into()
 }
 
