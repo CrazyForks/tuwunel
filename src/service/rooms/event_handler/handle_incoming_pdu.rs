@@ -367,11 +367,18 @@ async fn handle_prev_events(
 			})
 		});
 
+	let concurrency = usize::from(
+		self.services
+			.server
+			.config
+			.prev_events_concurrency,
+	);
+
 	extremities
 		.into_iter()
 		.try_stream()
 		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.widen_and_then(MAX_PREV_EVENTS, async |(info, prev_id)| {
+		.widen_and_then(concurrency, async |(info, prev_id)| {
 			self.upgrade_prev_event(
 				origin,
 				room_id,

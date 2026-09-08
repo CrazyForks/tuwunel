@@ -59,7 +59,9 @@ use self::{
 	proxy::ProxyConfig,
 };
 use crate::{
-	Err, Result, err, implement, redacted_debug,
+	Err, Result, err, implement,
+	matrix::pdu::MAX_PREV_EVENTS,
+	redacted_debug,
 	utils::{self, bytes::deserialize_bytesize_usize, hash::Cost, sys},
 };
 
@@ -667,6 +669,16 @@ pub struct Config {
 	/// it increases recovery work; it is not a count of network requests.
 	#[serde(default = "default_max_fetch_prev_events")]
 	pub max_fetch_prev_events: u16,
+
+	/// Simultaneous backward-extremity upgrades during incoming-event recovery.
+	///
+	/// Lower values reduce recovery load at the cost of latency. This does not
+	/// change the protocol `prev_events` bound or the traversal budget above.
+	///
+	/// reloadable: yes
+	/// default: 20
+	#[serde(default = "default_prev_events_concurrency")]
+	pub prev_events_concurrency: u16,
 
 	/// Maximum time, in milliseconds, to wait for the missing prev_events of an
 	/// incoming timeline event to arrive on their own before fetching them over
@@ -5542,6 +5554,10 @@ fn default_appservice_idle_timeout() -> u64 { 300 }
 fn default_pusher_idle_timeout() -> u64 { 15 }
 
 fn default_max_fetch_prev_events() -> u16 { 1024_u16 }
+
+fn default_prev_events_concurrency() -> u16 {
+	u16::try_from(MAX_PREV_EVENTS).expect("MAX_PREV_EVENTS exceeds u16")
+}
 
 fn default_fetch_prev_wait_ms() -> u64 { 750 }
 

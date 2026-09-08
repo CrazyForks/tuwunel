@@ -146,6 +146,19 @@ fn legacy_state_local_switch_is_reloadable() {
 }
 
 #[test]
+fn prev_events_concurrency_is_nonzero_and_reloadable() {
+	let default = config_from_toml("[global]\n").unwrap();
+	let zero = config_from_toml("[global]\nprev_events_concurrency = 0\n").unwrap();
+	let one = config_from_toml("[global]\nprev_events_concurrency = 1\n").unwrap();
+
+	assert_eq!(default.prev_events_concurrency, u16::try_from(MAX_PREV_EVENTS).unwrap());
+	assert!(check(&default).is_ok(), "default concurrency should pass validation");
+	assert!(check(&zero).is_err(), "zero concurrency should fail validation");
+	assert!(check(&one).is_ok(), "one recovery slot should pass validation");
+	reload(&default, &one).expect("previous-event concurrency should reload");
+}
+
+#[test]
 fn malformed_legacy_state_local_switch_is_rejected() {
 	let result = config_from_toml(
 		r#"[global]

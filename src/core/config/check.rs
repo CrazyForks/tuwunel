@@ -169,6 +169,14 @@ fn check_network(config: &Config) -> Result {
 		warn!("Configuration item `listening` is set to `false`. Cannot hear anyone.");
 	}
 
+	if config.prev_events_concurrency == 0 {
+		return Err!(Config(
+			"prev_events_concurrency",
+			"Previous-event recovery concurrency must be at least one; zero stalls every \
+			 incoming event with a backward extremity."
+		));
+	}
+
 	if config.unix_socket_path.is_none() {
 		config
 			.get_bind_addrs()

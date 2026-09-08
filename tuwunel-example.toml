@@ -494,6 +494,15 @@
 #
 #max_fetch_prev_events = 1024
 
+# Simultaneous backward-extremity upgrades during incoming-event recovery.
+#
+# Lower values reduce recovery load at the cost of latency. This does not
+# change the protocol `prev_events` bound or the traversal budget above.
+#
+# reloadable: yes
+#
+#prev_events_concurrency = 20
+
 # Maximum time, in milliseconds, to wait for the missing prev_events of an
 # incoming timeline event to arrive on their own before fetching them over
 # federation. A gap that closes within this window skips the fetch. The
