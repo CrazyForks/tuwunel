@@ -50,7 +50,6 @@ pub struct Service {
 /// coalesced result, deferring the reply under backpressure until a slot frees.
 struct Msg {
 	key: Key,
-	opts: Opts,
 	reply: oneshot::Sender<Subscription>,
 }
 
@@ -102,12 +101,12 @@ impl crate::Service for Service {
 	),
 )]
 pub async fn fetch(&self, opts: Opts) -> Result<Arc<Outcome>> {
-	let key = Key::new(&opts);
+	let key = Key::new(opts);
 	let (reply, reply_rx) = channel();
 
 	self.channel
 		.0
-		.send(Msg { key, opts, reply })
+		.send(Msg { key, reply })
 		.map_err(|_| Failure::Cancelled)?;
 
 	// Hold the strong interest token across the wait; its drop cancels the fetch.

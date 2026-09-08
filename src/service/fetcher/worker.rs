@@ -108,7 +108,7 @@ fn dispatch<'a>(
 	inflight: &mut HashMap<Key, Inflight>,
 	futures: &FetchFutures<'a>,
 ) {
-	let Msg { key, opts, reply } = msg;
+	let Msg { key, reply } = msg;
 	let interest = Arc::new(());
 	let (tx, rx) = channel(None);
 
@@ -117,7 +117,7 @@ fn dispatch<'a>(
 		return;
 	}
 
-	let opts = Arc::new(opts);
+	let opts = key.opts();
 	let weak = Arc::downgrade(&interest);
 	inflight.insert(key.clone(), Inflight {
 		tx,

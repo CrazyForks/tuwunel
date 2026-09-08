@@ -8,57 +8,53 @@
 use std::{
 	collections::hash_map::DefaultHasher,
 	hash::{Hash, Hasher},
+	num::NonZeroUsize,
 	sync::{Arc, Weak},
 };
 
-use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, api::Direction};
+use ruma::{
+	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedServerName, RoomVersionId,
+	api::Direction,
+};
 use tokio::sync::watch::{Receiver, Sender};
-use tuwunel_core::smallvec::SmallVec;
+use tuwunel_core::implement;
 
-use super::{Failure, Op, Opts, Outcome};
+use super::{Failure, FanoutGrowth, Op, Opts, Outcome};
 
-/// Borrowed window ids gathered for sorting before hashing; inline-sized for
-/// the common single-prev case.
-type WindowRefs<'a> = SmallVec<[&'a OwnedEventId; 1]>;
-
-/// Single-flight dedup key. `MissingEvents` keys on a content hash of its
-/// request window instead of a single event_id, so two callers asking for the
-/// same window coalesce regardless of event order; see [`window_hash`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Single-flight dedup key for a request and its complete caller policy.
+///
+/// Missing-event windows are sorted into collision-safe, order-independent
+/// identities. Every other caller option compares exactly, so a joiner never
+/// inherits a different request, candidate, retry, fan-out, or validation
+/// policy from the flight owner.
+#[derive(Clone, Debug)]
 pub(super) struct Key {
-	/// Endpoint class; two ops over the same event do not coalesce.
-	pub(super) op: Op,
-
-	/// Room the event belongs to, or `None` for an unscoped fetch.
-	pub(super) room_id: Option<OwnedRoomId>,
-
-	/// Sought event, or `None` for ops that do not key on one.
-	pub(super) event_id: Option<OwnedEventId>,
-
-	/// Content hash of the [`Op::MissingEvents`] window; `None` for every other
-	/// op, so their coalescing is byte-identical to before.
-	pub(super) window_hash: Option<u64>,
-
-	/// [`Op::TimestampToEvent`] search timestamp; `None` for every other op, so
-	/// distinct-timestamp queries for one room do not coalesce.
-	pub(super) ts: Option<MilliSecondsSinceUnixEpoch>,
-
-	/// [`Op::TimestampToEvent`] search direction; `None` for every other op, so
-	/// opposite-direction queries for one room do not coalesce.
-	pub(super) dir: Option<Direction>,
+	fingerprint: u64,
+	opts: Arc<Opts>,
 }
 
-impl Hash for Key {
-	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.op.hash(state);
-		self.room_id.hash(state);
-		self.event_id.hash(state);
-		self.window_hash.hash(state);
-		self.ts.hash(state);
-		self.dir
-			.map(|dir| matches!(dir, Direction::Forward))
-			.hash(state);
-	}
+#[derive(Eq, Hash, PartialEq)]
+struct Identity<'a> {
+	op: Op,
+	room_id: &'a Option<OwnedRoomId>,
+	event_id: &'a Option<OwnedEventId>,
+	earliest_events: &'a [OwnedEventId],
+	latest_events: &'a [OwnedEventId],
+	ts: &'a Option<MilliSecondsSinceUnixEpoch>,
+	dir: Option<bool>,
+	hint: &'a Option<OwnedServerName>,
+	candidates: &'a [OwnedServerName],
+	room_version: &'a Option<RoomVersionId>,
+	attempt_limit: &'a Option<NonZeroUsize>,
+	backfill_limit: &'a Option<NonZeroUsize>,
+	fanout_growth: &'a FanoutGrowth,
+	fanout_max_width: &'a Option<NonZeroUsize>,
+	fanout_rounds: &'a Option<NonZeroUsize>,
+	check_event_id: bool,
+	check_conforms: bool,
+	check_hashes: bool,
+	authoritative_redaction: bool,
+	check_signature: bool,
 }
 
 /// Outcome shared by every caller coalesced onto one fetch. Cheap to clone so
@@ -83,34 +79,78 @@ pub(super) struct Inflight {
 	pub(super) opts: Arc<Opts>,
 }
 
-impl Key {
-	/// Derive the single-flight key from a request's [`Opts`].
-	pub(super) fn new(opts: &Opts) -> Self {
-		Self {
-			op: opts.op,
-			room_id: opts.room_id.clone(),
-			event_id: opts.event_id.clone(),
-			window_hash: matches!(opts.op, Op::MissingEvents).then(|| window_hash(opts)),
-			ts: opts.ts,
-			dir: opts.dir,
-		}
+impl PartialEq for Key {
+	fn eq(&self, other: &Self) -> bool {
+		self.fingerprint == other.fingerprint
+			&& (Arc::ptr_eq(&self.opts, &other.opts)
+				|| identity(&self.opts) == identity(&other.opts))
 	}
 }
 
-/// Order-independent content hash of an [`Op::MissingEvents`] window: the
-/// sorted `latest_events` and `earliest_events` sets plus the batch limit.
-/// Sorting before hashing folds request-order permutations onto one key; the
-/// two sets hash as distinct sequences so swapping them does not collide.
-fn window_hash(opts: &Opts) -> u64 {
-	let mut latest: WindowRefs<'_> = opts.latest_events.iter().collect();
-	let mut earliest: WindowRefs<'_> = opts.earliest_events.iter().collect();
-	latest.sort_unstable();
-	earliest.sort_unstable();
+impl Eq for Key {}
 
-	let mut hasher = DefaultHasher::new();
-	latest.hash(&mut hasher);
-	earliest.hash(&mut hasher);
-	opts.backfill_limit.hash(&mut hasher);
+impl Hash for Key {
+	fn hash<H: Hasher>(&self, state: &mut H) { self.fingerprint.hash(state); }
+}
 
-	hasher.finish()
+/// Derive the single-flight key from a request's [`Opts`].
+#[implement(Key)]
+pub(super) fn new(mut opts: Opts) -> Self {
+	if matches!(opts.op, Op::MissingEvents) {
+		opts.earliest_events.sort_unstable();
+		opts.latest_events.sort_unstable();
+	}
+
+	let opts = Arc::new(opts);
+	let fingerprint = fingerprint(&identity(&opts));
+
+	Self { fingerprint, opts }
+}
+
+/// Share the canonical request with the fetch worker.
+///
+/// Only the `Arc` is cloned; the option fields and event windows remain shared.
+#[implement(Key)]
+#[inline]
+pub(super) fn opts(&self) -> Arc<Opts> { self.opts.clone() }
+
+fn identity(opts: &Opts) -> Identity<'_> {
+	let windows = matches!(opts.op, Op::MissingEvents)
+		.then_some((opts.earliest_events.as_slice(), opts.latest_events.as_slice()))
+		.unwrap_or_default();
+
+	let (earliest_events, latest_events) = windows;
+	let dir = opts
+		.dir
+		.map(|dir| matches!(dir, Direction::Forward));
+
+	Identity {
+		op: opts.op,
+		room_id: &opts.room_id,
+		event_id: &opts.event_id,
+		earliest_events,
+		latest_events,
+		ts: &opts.ts,
+		dir,
+		hint: &opts.hint,
+		candidates: &opts.candidates,
+		room_version: &opts.room_version,
+		attempt_limit: &opts.attempt_limit,
+		backfill_limit: &opts.backfill_limit,
+		fanout_growth: &opts.fanout_growth,
+		fanout_max_width: &opts.fanout_max_width,
+		fanout_rounds: &opts.fanout_rounds,
+		check_event_id: opts.check_event_id,
+		check_conforms: opts.check_conforms,
+		check_hashes: opts.check_hashes,
+		authoritative_redaction: opts.authoritative_redaction,
+		check_signature: opts.check_signature,
+	}
+}
+
+fn fingerprint(identity: &Identity<'_>) -> u64 {
+	let mut state = DefaultHasher::new();
+
+	identity.hash(&mut state);
+	state.finish()
 }

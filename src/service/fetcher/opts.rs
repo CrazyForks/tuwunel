@@ -51,7 +51,7 @@ pub enum Op {
 /// The worker clamps each computed width to its per-round ceiling and remaining
 /// attempt budget. `Fixed(1)`, the `Opts::new` default, makes attempts strictly
 /// sequential.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FanoutGrowth {
 	/// Every round races the same width.
 	Fixed(NonZeroUsize),

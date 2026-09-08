@@ -3,8 +3,8 @@ use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ruma::{
-	OwnedEventId, OwnedRoomId, OwnedServerName, RoomVersionId, ServerName, event_id, room_id,
-	server_name,
+	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedServerName, RoomVersionId,
+	ServerName, UInt, api::Direction, event_id, room_id, server_name,
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::{
@@ -330,6 +330,47 @@ async fn coalesces_concurrent_fetches() {
 	assert_eq!(b.origin, server);
 	assert!(Arc::ptr_eq(&a, &b), "coalesced callers share one outcome");
 	assert_eq!(mock.call_count(), 1, "one network attempt for two callers");
+}
+
+#[tokio::test]
+async fn incompatible_validation_options_do_not_coalesce() {
+	let server = server_name!("a.test.local").to_owned();
+	let event = event_id!("$ev:test.local").to_owned();
+
+	let mock = Arc::new(MockTransport::new([(server.clone(), Behavior::BlockGarbage)]));
+	let select = Arc::new(MockSelect::new([(event.clone(), vec![server.clone()])]));
+	let svc = Service::test_spawn(mock.clone(), select, 4);
+
+	let strict = {
+		let svc = svc.clone();
+		let opts = test_opts(&event);
+
+		spawn(async move { svc.fetch(opts).await })
+	};
+
+	wait_for(|| mock.call_count() == 1).await;
+
+	let relaxed = {
+		let svc = svc.clone();
+		let opts = test_opts(&event).checks(false);
+
+		spawn(async move { svc.fetch(opts).await })
+	};
+
+	wait_for(|| mock.call_count() == 2).await;
+	settle().await;
+	mock.release(&server);
+	mock.release(&server);
+
+	strict
+		.await
+		.expect("join strict fetch")
+		.expect_err("strict validation accepts garbage");
+
+	relaxed
+		.await
+		.expect("join relaxed fetch")
+		.expect("relaxed validation rejects garbage");
 }
 
 #[tokio::test]
@@ -873,14 +914,32 @@ async fn backfill_empty_batches_respect_attempt_limit() {
 fn missing_events_key_folds_order_and_separates_window() {
 	let a = event_id!("$a:test.local").to_owned();
 	let b = event_id!("$b:test.local").to_owned();
-	let key = |opts: &Opts| Key::new(opts);
+	let key = |opts: &Opts| Key::new(opts.clone());
 
 	let forward = Opts::new(Op::MissingEvents, room()).latest_events([a.clone(), b.clone()]);
 	let reverse = Opts::new(Op::MissingEvents, room()).latest_events([b.clone(), a.clone()]);
+
 	assert_eq!(key(&forward), key(&reverse), "the window key folds request order");
+	let earliest_forward =
+		Opts::new(Op::MissingEvents, room()).earliest_events([a.clone(), b.clone()]);
+
+	let earliest_reverse =
+		Opts::new(Op::MissingEvents, room()).earliest_events([b.clone(), a.clone()]);
+
+	assert_eq!(
+		key(&earliest_forward),
+		key(&earliest_reverse),
+		"the earliest window key folds request order"
+	);
 
 	let a_only = Opts::new(Op::MissingEvents, room()).latest_events([a.clone()]);
+
 	assert_ne!(key(&forward), key(&a_only), "a different window is a different key");
+
+	let duplicate =
+		Opts::new(Op::MissingEvents, room()).latest_events([a.clone(), a.clone(), b.clone()]);
+
+	assert_ne!(key(&forward), key(&duplicate), "window multiplicity is significant");
 
 	let latest_a = Opts::new(Op::MissingEvents, room())
 		.latest_events([a.clone()])
@@ -889,6 +948,95 @@ fn missing_events_key_folds_order_and_separates_window() {
 		.latest_events([b])
 		.earliest_events([a]);
 	assert_ne!(key(&latest_a), key(&latest_b), "earliest and latest do not commute");
+
+	let short = forward.clone().backfill_limit(nz(10));
+	let long = forward.backfill_limit(nz(20));
+
+	assert_ne!(key(&short), key(&long), "batch limits do not coalesce");
+}
+
+#[test]
+fn key_separates_incompatible_options() {
+	let event = event_id!("$ev:test.local").to_owned();
+	let other_event = event_id!("$other:test.local").to_owned();
+	let other_room = room_id!("!other:test.local").to_owned();
+	let server = server_name!("a.test.local").to_owned();
+	let other = server_name!("b.test.local").to_owned();
+	let ts = MilliSecondsSinceUnixEpoch(UInt::from(1_u32));
+	let later_ts = MilliSecondsSinceUnixEpoch(UInt::from(2_u32));
+	let base = test_opts(&event);
+	let differs = |opts: &Opts, field| {
+		assert_ne!(
+			Key::new(base.clone()),
+			Key::new(opts.clone()),
+			"different {field} must not coalesce"
+		);
+	};
+
+	differs(&Opts { op: Op::AuthEvent, ..base.clone() }, "operation");
+	let other_room_opts = Opts {
+		room_id: Some(other_room),
+		..base.clone()
+	};
+
+	differs(&other_room_opts, "room");
+
+	let other_event_opts = Opts {
+		event_id: Some(other_event),
+		..base.clone()
+	};
+
+	differs(&other_event_opts, "event");
+
+	differs(&Opts { ts: Some(ts), ..base.clone() }, "timestamp");
+
+	let forward_opts = Opts {
+		dir: Some(Direction::Forward),
+		..base.clone()
+	};
+
+	differs(&forward_opts, "direction");
+
+	differs(&base.clone().hint(server.clone()), "hint");
+	differs(&base.clone().candidates([server.clone()]), "candidate scope");
+	let ordered = base
+		.clone()
+		.candidates([server.clone(), other.clone()]);
+
+	let reversed = base.clone().candidates([other, server]);
+
+	assert_ne!(
+		Key::new(ordered),
+		Key::new(reversed),
+		"different candidate order must not coalesce"
+	);
+	differs(&base.clone().room_version(RoomVersionId::V1), "room version");
+	differs(&base.clone().attempt_limit(nz(2)), "attempt limit");
+	differs(&base.clone().backfill_limit(nz(20)), "batch limit");
+	differs(&base.clone().fanout(FanoutGrowth::Fixed(nz(2))), "fan-out growth");
+	differs(&base.clone().fanout_max_width(nz(2)), "fan-out width");
+	differs(&base.clone().fanout_rounds(nz(2)), "fan-out rounds");
+	differs(&Opts { check_event_id: true, ..base.clone() }, "event-id check");
+	differs(&Opts { check_conforms: false, ..base.clone() }, "conformance check");
+	differs(&Opts { check_hashes: true, ..base.clone() }, "content-hash check");
+	let non_authoritative_opts = Opts {
+		authoritative_redaction: false,
+		..base.clone()
+	};
+
+	differs(&non_authoritative_opts, "redaction policy");
+
+	differs(&Opts { check_signature: true, ..base.clone() }, "signature check");
+
+	let timestamp = Opts::new(Op::TimestampToEvent, room())
+		.ts(ts)
+		.dir(Direction::Forward);
+
+	let later = timestamp.clone().ts(later_ts);
+	let backward = timestamp.clone().dir(Direction::Backward);
+
+	assert_ne!(Key::new(timestamp.clone()), Key::new(later), "timestamps do not coalesce");
+	assert_ne!(Key::new(timestamp), Key::new(backward), "opposite directions do not coalesce");
 }
 
 #[tokio::test]
