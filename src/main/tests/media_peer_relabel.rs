@@ -21,7 +21,7 @@ use std::{
 	path::PathBuf,
 	process::id as process_id,
 	sync::{
-		Mutex,
+		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
 	},
 	time::Duration,
@@ -29,6 +29,7 @@ use std::{
 
 use axum::{
 	Router,
+	extract::State,
 	http::{Uri, header::CONTENT_TYPE},
 	response::IntoResponse,
 	routing::any,
@@ -100,6 +101,20 @@ const OVERSIZED_MEDIA_ID: &str = "peeroversizedthumbnailmediaid000";
 const WITHHELD_MEDIA_ID: &str = "peeroversizedwithheldmediaid0000";
 
 const BUCKET_MEDIA_ID: &str = "peerbucketthumbnailmediaid000000";
+
+/// Media the peer answers by pointing at a location rather than sending it.
+///
+/// A redirected object is filed by nobody, so nothing walks the picture on the
+/// way through and the gate that withholds an animation has to walk it itself.
+/// Every other exercise here reaches the arm where filing the row settled it.
+const LOCATION_MEDIA_ID: &str = "peerredirectedthumbnailmediaid00";
+
+/// Path the peer's redirect points at.
+///
+/// The stub's fallback serves it like any other request, which is what a real
+/// peer's separate media host would do, and it carries no download segment so
+/// the tallies read it as neither an original nor a thumbnail.
+const REDIRECT: &str = "/redirected-media";
 
 /// Requests the peer has answered.
 ///
@@ -183,7 +198,7 @@ fn a_peers_mislabelled_thumbnail_is_cached_under_its_container() -> Result {
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	let result = runtime.block_on(async {
 		let services = async_start(&server).await?;
-		let stub = spawn(serve_peer(listener, certificate, private_key));
+		let stub = spawn(serve_peer(listener, address, certificate, private_key));
 		let outcome = exercises(&services, &peer).await;
 
 		// a stub that never started reaches the caller only as a peer that did
@@ -220,11 +235,17 @@ fn a_peers_mislabelled_thumbnail_is_cached_under_its_container() -> Result {
 /// listens on, which federation resolves without a lookup. Nothing here
 /// verifies the request's signature, since what is under test is what the
 /// answer is cached as rather than how it was asked for.
-async fn serve_peer(listener: TcpListener, certificate: PathBuf, private_key: PathBuf) -> Result {
+async fn serve_peer(
+	listener: TcpListener,
+	address: String,
+	certificate: PathBuf,
+	private_key: PathBuf,
+) -> Result {
 	let config = RustlsConfig::from_pem_file(certificate, private_key).await?;
 	let app = Router::new()
 		.route("/_matrix/federation/{*rest}", any(authenticated))
-		.fallback(any(legacy));
+		.fallback(any(legacy))
+		.with_state(Arc::from(address));
 
 	from_tcp_rustls(listener, config)?
 		.serve(app.into_make_service())
@@ -239,24 +260,51 @@ async fn serve_peer(listener: TcpListener, certificate: PathBuf, private_key: Pa
 /// writes, so a body assembled any other way would fail to parse before
 /// reaching anything this covers. This is the half that counts its requests,
 /// since the authenticated endpoints are the ones a repeat would return to.
-async fn authenticated(uri: Uri) -> impl IntoResponse {
+async fn authenticated(uri: Uri, State(address): State<Arc<str>>) -> impl IntoResponse {
 	record(&uri);
 
+	let body = match uri.path().contains(LOCATION_MEDIA_ID) {
+		| true => redirect_body(&address),
+		| false => picture_body(),
+	};
+
+	([(CONTENT_TYPE, format!("multipart/mixed; boundary={BOUNDARY}"))], body)
+}
+
+/// The envelope carrying the picture itself.
+///
+/// The parts and their separators are the shape the client half of the API
+/// writes, so a body assembled any other way would fail to parse before
+/// reaching anything this covers.
+fn picture_body() -> Vec<u8> {
 	let head = format!(
 		"\r\n--{BOUNDARY}\r\ncontent-type: \
 		 application/json\r\n\r\n{{}}\r\n--{BOUNDARY}\r\ncontent-type: {DECLARED}\r\n\r\n"
 	);
 
-	let body = [
+	[
 		head.as_bytes(),
 		GIF,
 		b"\r\n--".as_slice(),
 		BOUNDARY.as_bytes(),
 		b"--".as_slice(),
 	]
-	.concat();
+	.concat()
+}
 
-	([(CONTENT_TYPE, format!("multipart/mixed; boundary={BOUNDARY}"))], body)
+/// The same envelope carrying a location in place of the picture.
+///
+/// The second part is a bare `location` header and no body, which is the shape
+/// the client half parses as a redirect. The address is the stub's own, handed
+/// in because this side of the request carries no host to recover it from: the
+/// federation client speaks HTTP/2, whose authority is a pseudo-header.
+fn redirect_body(address: &str) -> Vec<u8> {
+	format!(
+		"\r\n--{BOUNDARY}\r\ncontent-type: \
+		 application/json\r\n\r\n{{}}\r\n--{BOUNDARY}\r\nlocation: \
+		 https://{address}{REDIRECT}\r\n\r\n\r\n--{BOUNDARY}--"
+	)
+	.into_bytes()
 }
 
 /// The bare body a legacy media answer carries.
@@ -301,6 +349,7 @@ async fn exercises(services: &Services, peer: &ServerName) -> Result {
 	exercise_legacy_withheld(services, peer).await?;
 	exercise_oversized(services, peer).await?;
 	exercise_withheld(services, peer).await?;
+	exercise_location(services, peer).await?;
 	exercise_bucket(services, peer).await
 }
 
@@ -502,19 +551,7 @@ async fn exercise_legacy_withheld(services: &Services, peer: &ServerName) -> Res
 		.fetch_remote_thumbnail_legacy(&mxc, TIMEOUT, &dim, Animate::from(None))
 		.await?;
 
-	if fetched.content == GIF {
-		return Err!("a forbidding legacy request was answered with the peer's animation");
-	}
-
-	let served = fetched
-		.content_type
-		.as_deref()
-		.unwrap_or_default();
-
-	match served == STILL {
-		| true => Ok(()),
-		| false => Err!("the legacy stand-in was served as {served}, expected {STILL}"),
-	}
+	stood_in_for_the_animation(&fetched, "legacy")
 }
 
 /// A legacy request past every bucket names the original, and fetches it.
@@ -610,19 +647,48 @@ async fn exercise_withheld(services: &Services, peer: &ServerName) -> Result {
 	let user = fixture_user(services)?;
 	let fetched = fetched_once(services, &mxc, &dim, Animate::from(None), &user).await?;
 
-	if fetched.content == GIF {
-		return Err!("a forbidding request was answered with the peer's animation");
+	stood_in_for_the_animation(&fetched, "sentinel")
+}
+
+/// A picture the peer only points at is walked by the gate that withholds it.
+///
+/// Nothing files a redirected object, so the answer carries no walk of its own
+/// and a forbidding request has to take one. This is the only exercise that
+/// reaches that arm, every other one being answered with the picture itself.
+async fn exercise_location(services: &Services, peer: &ServerName) -> Result {
+	let mxc = Mxc {
+		server_name: peer,
+		media_id: LOCATION_MEDIA_ID,
+	};
+
+	let dim = Dim::new(320, 240, None);
+	let user = fixture_user(services)?;
+	let before = ANSWERED.load(Ordering::Relaxed);
+
+	let fetch = || {
+		services
+			.media
+			.get_or_fetch_thumbnail(&mxc, &dim, Animate::from(None), TIMEOUT, &user)
+	};
+
+	let fetched = fetch().await?;
+
+	// one redirected object costs two requests, the location and what it points
+	// at, where every other leg answers in one
+	if asked(before) != 2 {
+		return Err!(
+			"the redirected request reached the peer {} times, expected 2",
+			asked(before)
+		);
 	}
 
-	let served = fetched
-		.content_type
-		.as_deref()
-		.unwrap_or_default();
+	fetch().await?;
 
-	match served == STILL {
-		| true => Ok(()),
-		| false => Err!("the stand-in was served as {served}, expected {STILL}"),
+	if asked(before) != 2 {
+		return Err!("the redirected repeat went back to the peer, {} in total", asked(before));
 	}
+
+	stood_in_for_the_animation(&fetched, "redirected")
 }
 
 /// A size that is not a bucket is asked for, and cached, at the bucket it
@@ -663,5 +729,26 @@ async fn exercise_bucket(services: &Services, peer: &ServerName) -> Result {
 		| true => Ok(()),
 		| false =>
 			Err!("a sibling size in the same bucket refetched, {} in total", asked(before)),
+	}
+}
+
+/// The answer is a generated still rather than the picture the peer holds.
+///
+/// Every forbidding request asserts the same two things, that the animation did
+/// not reach the caller and that what did is a thumbnail this server encoded,
+/// so the leg names itself and the rest is shared.
+fn stood_in_for_the_animation(fetched: &Media, leg: &str) -> Result {
+	if fetched.content == GIF {
+		return Err!("a forbidding {leg} request was answered with the peer's animation");
+	}
+
+	let served = fetched
+		.content_type
+		.as_deref()
+		.unwrap_or_default();
+
+	match served == STILL {
+		| true => Ok(()),
+		| false => Err!("the {leg} stand-in was served as {served}, expected {STILL}"),
 	}
 }
