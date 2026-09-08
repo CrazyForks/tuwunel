@@ -114,8 +114,8 @@ pub(crate) enum StorageCommand {
 		verbose: bool,
 	},
 
-	/// Transfer objects from a source provider which do not exist on a
-	/// destination provider.
+	/// Copy objects from a source provider which do not exist on a
+	/// destination provider, then report the number copied.
 	Sync {
 		/// Use source configured provider by name.
 		src: String,
