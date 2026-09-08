@@ -9,7 +9,11 @@
 //! The caps that bound the work live here rather than at either call site, so
 //! a source reaches no decoder before what it would cost is known.
 
-use std::{cmp::min, io::Cursor};
+use std::{
+	cmp::min,
+	io::Cursor,
+	panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use bytes::Bytes;
 use image::{
@@ -21,7 +25,8 @@ use image::{
 	},
 };
 use ruma::Mxc;
-use tuwunel_core::{Err, Result, defer, err, implement};
+use tokio::sync::OwnedSemaphorePermit;
+use tuwunel_core::{Err, Error, Result, defer, err, implement};
 
 use super::{ANIMATED_NAME, BYTES_PER_PIXEL, Dim, GIF, Media, reader, thumbnail_generate};
 
@@ -32,6 +37,11 @@ use super::{ANIMATED_NAME, BYTES_PER_PIXEL, Dim, GIF, Media, reader, thumbnail_g
 /// that for an encode that ends.
 const GIF_SPEED: i32 = 10;
 
+pub(super) struct Output {
+	pub(super) media: Result<Media>,
+	pub(super) admission: OwnedSemaphorePermit,
+}
+
 /// Encode this picture's frames as an animated GIF thumbnail and store it.
 ///
 /// Quantization runs per frame on a palette of its own, which is far more work
@@ -39,36 +49,54 @@ const GIF_SPEED: i32 = 10;
 /// run on the async runtime. A source whose frames will not decode answers an
 /// error and the caller falls through to the still it would have produced.
 #[implement(super::super::Service)]
-#[tracing::instrument(name = "animate", level = "debug", skip(self, source))]
+#[tracing::instrument(
+	name = "animate",
+	level = "debug",
+	skip(self, source, admission)
+)]
 pub(super) async fn store_animated(
 	&self,
 	mxc: &Mxc<'_>,
 	dim: &Dim,
 	source: Bytes,
-) -> Result<Media> {
+	admission: OwnedSemaphorePermit,
+) -> Result<Output> {
 	let config = &self.services.config;
 	let max_frames = config.media_thumbnail_max_frames;
 	let budget = config.media_thumbnail_max_pixels;
 	let requested = Dim::new(dim.width, dim.height, Some(dim.method.clone()));
 
-	// waiting here rather than inside the worker keeps the queue off the pool
-	let slots = self.animated_thumbnail_slots.clone();
-
-	let Ok(slot) = slots.acquire_owned().await else {
-		return Err!(debug_warn!("The animated thumbnail semaphore is closed."));
-	};
+	#[cfg(test)]
+	super::tests::before_animation_submit().await;
+	#[cfg(test)]
+	let control = super::tests::animation_control();
 
 	let encode = self
 		.services
 		.server
 		.runtime()
 		.spawn_blocking(move || {
-			// the permit rides into the worker, since a cancelled request drops
-			// this future but never the encode it already started
-			let _slot = slot;
+			#[cfg(test)]
+			if let Some(control) = control.as_ref() {
+				control.worker_started();
+			}
 
-			encode_frames(&source, &requested, max_frames, budget)
+			let content = catch_unwind(AssertUnwindSafe(|| {
+				encode_frames(&source, &requested, max_frames, budget)
+			}))
+			.map_err(Error::from_panic)
+			.unwrap_or_else(Err);
+
+			#[cfg(test)]
+			if let Some(control) = control.as_ref() {
+				control.worker_finished();
+			}
+
+			(content, admission)
 		});
+
+	#[cfg(test)]
+	super::tests::animation_submitted();
 
 	// a started worker runs to completion, but one still queued is dropped, so
 	// a cancelled request must not leave it to reach the pool
@@ -76,10 +104,15 @@ pub(super) async fn store_animated(
 
 	defer! {{ abort.abort(); }}
 
-	let content = encode.await??;
+	let (content, admission) = encode.await?;
+	let media = match content {
+		| Err(error) => Err(error),
+		| Ok(content) =>
+			self.store_encoded(mxc, dim, content, GIF, ANIMATED_NAME)
+				.await,
+	};
 
-	self.store_encoded(mxc, dim, content, GIF, ANIMATED_NAME)
-		.await
+	Ok(Output { media, admission })
 }
 
 /// Encode a picture's frames as a GIF scaled to these dimensions.

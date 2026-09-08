@@ -29,10 +29,14 @@ use super::{Fetched, Media, data::Metadata};
 #[cfg(feature = "media_thumbnail")]
 pub(super) mod animate;
 mod sniff;
+#[cfg(all(test, feature = "media_thumbnail"))]
+mod tests;
 
 #[cfg(feature = "media_thumbnail")]
 use sniff::Sequence;
 pub(super) use sniff::{animated_type, animates, sequence};
+#[cfg(all(test, feature = "media_thumbnail"))]
+use tests::{caller_after_animation, source_fetched};
 
 /// Content type of every thumbnail tuwunel generates.
 #[cfg(feature = "media_thumbnail")]
@@ -387,6 +391,9 @@ async fn answer_promoted(&self, mxc: &Mxc<'_>, animate: Animate) -> Result<Media
 #[implement(super::Service)]
 #[tracing::instrument(name = "fetch", level = "debug", skip_all)]
 async fn fetch_bytes(&self, key: &[u8]) -> Result<Bytes> {
+	#[cfg(all(test, feature = "media_thumbnail"))]
+	source_fetched();
+
 	let path = self.get_media_name_sha256(key);
 	let fetch = self
 		.storage_providers()
@@ -560,23 +567,37 @@ async fn get_thumbnail_generate(
 	animate: Animate,
 	data: Metadata,
 ) -> Result<Media> {
+	let animation_enabled = self.services.config.media_thumbnail_animated;
+	let admission = animation_enabled
+		.then_async(async || {
+			let slots = self.animated_thumbnail_slots.clone();
+			let Ok(admission) = slots.acquire_owned().await else {
+				return Err!(debug_warn!("The animated thumbnail semaphore is closed."));
+			};
+
+			Ok(admission)
+		})
+		.await
+		.transpose()?;
+
 	let bytes = self.fetch_bytes(&data.key).await?;
 
 	// the gates below read this walk too, so it is taken at most once
-	let walk = self
-		.services
-		.config
-		.media_thumbnail_animated
-		.then(|| sequence(&bytes));
+	let walk = animation_enabled.then(|| sequence(&bytes));
 
-	let encoded = animates_at(dim, walk, &bytes)?
-		.then_async(async || {
-			self.store_animated(mxc, dim, bytes.clone())
-				.await
-				.ok()
-		})
-		.await
-		.flatten();
+	let (encoded, admission) = if animates_at(dim, walk, &bytes)? {
+		let permit = admission.expect("animation work has source admission");
+		let output = self
+			.store_animated(mxc, dim, bytes.clone(), permit)
+			.await?;
+
+		#[cfg(test)]
+		caller_after_animation().await;
+
+		(output.media.ok(), Some(output.admission))
+	} else {
+		(None, admission)
+	};
 
 	// the variant this request did not ask for is left stored rather than held,
 	// so its buffer is not carried across the still encode below
@@ -627,6 +648,8 @@ async fn get_thumbnail_generate(
 	drop(media);
 
 	let still = self.store_thumbnail(mxc, dim, image).await?;
+
+	drop(admission);
 
 	Ok(animated.unwrap_or(still))
 }

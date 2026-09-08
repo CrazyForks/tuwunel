@@ -42,7 +42,7 @@ than an upscale.
 | `media_thumbnail_max_pixels` | `50000000` | Largest picture the thumbnailer will decode, in pixels. Anything larger is served without a thumbnail. Applies to uploaded pictures and to frames extracted from video. |
 | `media_thumbnail_animated` | `true` | Whether an animated thumbnail is generated for a picture that carries a frame sequence. Disabled, none is generated; a source served whole in a thumbnail's place, one cached while it was on, or a peer's own answer can still animate. |
 | `media_thumbnail_max_frames` | `50` | Frames an animated thumbnail carries at most. A longer source is truncated and loops short rather than being refused one. |
-| `media_thumbnail_animated_concurrency` | `4` | Animated encodes permitted to run at once. Quantizing a palette per frame costs far more than scaling a still, so an encode past this waits for a slot. A restart is required to apply a change. |
+| `media_thumbnail_animated_concurrency` | `4` | Source jobs admitted for animated thumbnail generation. A job waits for a slot before reading the complete source. On a live request, it remains occupied through source I/O, animated storage, and subsequent still or video work until generation returns. A running blocking worker retains it after request cancellation. Static images and videos enter the same limit because their bytes determine whether animation work is needed. A restart is required to apply a change. |
 
 A still thumbnail is a PNG, and is served as `image/png` under the filename
 `thumbnail.png` rather than the content type or name of the file it came from.

@@ -2800,14 +2800,14 @@ pub struct Config {
 	#[serde(default = "default_media_thumbnail_max_frames")]
 	pub media_thumbnail_max_frames: usize,
 
-	/// Animated thumbnail encodes permitted to run at once.
+	/// Source jobs admitted for animated thumbnail generation.
 	///
-	/// Quantizing a palette per frame costs far more than scaling a still, and
-	/// any remote server can ask for one, so an encode past this limit waits
-	/// for a slot rather than piling load onto the host. The still beside it is
-	/// generated after the animation, so a wait here delays both variants of
-	/// the request that triggered them. A restart is required to apply a
-	/// change.
+	/// A job acquires a slot before reading the complete source. On a live
+	/// request, it remains occupied through source I/O, animated storage, and
+	/// subsequent still or video work until generation returns. A running
+	/// blocking worker retains it after request cancellation. Static images and
+	/// videos are admitted too because their bytes determine whether animation
+	/// work is needed. A restart is required to apply a change.
 	///
 	/// default: 4
 	#[serde(default = "default_media_thumbnail_animated_concurrency")]

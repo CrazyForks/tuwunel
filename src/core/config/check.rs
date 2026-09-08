@@ -479,8 +479,8 @@ fn check_thumbnails(config: &Config) -> Result {
 	if unusable_concurrency(config.media_thumbnail_animated_concurrency) {
 		return Err!(Config(
 			"media_thumbnail_animated_concurrency",
-			"Animated thumbnail encodes permitted at once must be between 1 and \
-			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every encode waiting for a slot that \
+			"Animated thumbnail source jobs permitted at once must be between 1 and \
+			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every source read waiting for a slot that \
 			 never frees, and the ceiling is far past any useful degree of parallelism."
 		));
 	}
